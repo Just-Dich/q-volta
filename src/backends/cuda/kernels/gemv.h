@@ -20,4 +20,6 @@ struct Q8Buf {
 void quantize_q8(const float* x, int K, Q8Buf& out, cudaStream_t s);
 GemvCfg gemv_q8_default_cfg(const QMat& W);
 void gemv_q8(const QMat& W, const Q8Vec& x, float* y, const float* residual, cudaStream_t s, GemvCfg cfg = {});
+// nt token vectors stored back to back (quantize_q8 over nt*K elements produces exactly this layout); y: [nt][N]
+void gemv_q8_multi(const QMat& W, const Q8Vec& x, int nt, float* y, const float* residual, cudaStream_t s);
 }  // namespace qv::cuda

@@ -129,6 +129,111 @@ void gemv_q8(const QMat& W, const Q8Vec& x, float* y, const float* residual, cud
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Multi-token GEMV (MTP verification / short prefill): NT activation vectors share every weight load.
+// x: NT Q8 vectors, token t at q + t*K/4 ints, d/sum/qsum + t*K/32; y/residual: [NT][N].
+template <int BITS, int R, int WARPS, int NT>
+__global__ void __launch_bounds__(WARPS * 32) gemv_q8_multi_kernel(QMat W, Q8Vec xv, float* __restrict__ y,
+                                                                   const float* __restrict__ residual) {
+    __shared__ float red[WARPS][NT][R];
+    constexpr int ZP = 1 << (BITS - 1);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row0 = blockIdx.x * R;
+    const int C = W.K >> 5, G = W.K >> 6;
+    float acc[NT][R];
+#pragma unroll
+    for (int t = 0; t < NT; ++t)
+#pragma unroll
+        for (int r = 0; r < R; ++r) acc[t][r] = 0.f;
+
+    for (int c = warp * 32 + lane; c < C; c += WARPS * 32) {
+        uint32_t qw[R][8];  // bit-plane decode done once per chunk, reused by all NT tokens
+        float2 sm[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const int row = min(row0 + r, W.N - 1);
+            const uint32_t* wp = W.q + ((size_t)row * C + c) * BITS;
+            uint32_t w[BITS];
+#pragma unroll
+            for (int b = 0; b < BITS; ++b) w[b] = __ldg(wp + b);
+#pragma unroll
+            for (int b = 0; b < 8; ++b) qw[r][b] = qword<BITS>(w, b);
+            sm[r] = __half22float2(W.sm[(size_t)row * G + (c >> 1)]);
+        }
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            const int4* xp = reinterpret_cast<const int4*>(xv.q + (size_t)t * (W.K >> 2) + c * 8);
+            const int4 x0 = __ldg(xp), x1 = __ldg(xp + 1);
+            const int xw[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+            const size_t o = (size_t)t * C + c;
+            const float dx = __ldg(xv.d + o), xs = __ldg(xv.sum + o);
+            const int qs = __ldg(xv.qsum + o);
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                int d = 0;
+#pragma unroll
+                for (int b = 0; b < 8; ++b) d = dp4a_us(qw[r][b], xw[b], d);
+                d -= ZP * qs;
+                acc[t][r] = fmaf(sm[r].x * dx, (float)d, fmaf(fmaf(sm[r].x, (float)ZP, sm[r].y), xs, acc[t][r]));
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < NT; ++t)
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            float v = warp_sum(acc[t][r]);
+            if (lane == 0) red[warp][t][r] = v;
+        }
+    __syncthreads();
+    if (threadIdx.x < NT * R) {
+        const int t = threadIdx.x / R, r = threadIdx.x % R, row = row0 + r;
+        float v = 0.f;
+#pragma unroll
+        for (int w = 0; w < WARPS; ++w) v += red[w][t][r];
+        if (row < W.N) {
+            const size_t o = (size_t)t * W.N + row;
+            y[o] = v + (residual ? residual[o] : 0.f);
+        }
+    }
+}
+
+template <int BITS, int NT>
+static void multi_bits(const QMat& W, const Q8Vec& x, float* y, const float* res, cudaStream_t s) {
+    // rows per block: reuse each token's x loads across R rows (x traffic is NT x the weight bytes)
+    static int Rsel = [] { const char* e = std::getenv("QV_MULTI_R"); return e ? std::atoi(e) : 0; }();
+    int R = Rsel ? Rsel : (NT <= 2 ? 2 : 4);
+    if (R == 1) gemv_q8_multi_kernel<BITS, 1, 4, NT><<<W.N, 128, 0, s>>>(W, x, y, res);
+    else if (R == 2) gemv_q8_multi_kernel<BITS, 2, 4, NT><<<(W.N + 1) / 2, 128, 0, s>>>(W, x, y, res);
+    else gemv_q8_multi_kernel<BITS, 4, 4, NT><<<(W.N + 3) / 4, 128, 0, s>>>(W, x, y, res);
+}
+
+template <int NT>
+static void multi_nt(const QMat& W, const Q8Vec& x, float* y, const float* res, cudaStream_t s) {
+    switch (W.bits) {
+        case 2: multi_bits<2, NT>(W, x, y, res, s); break;
+        case 3: multi_bits<3, NT>(W, x, y, res, s); break;
+        case 4: multi_bits<4, NT>(W, x, y, res, s); break;
+        case 5: multi_bits<5, NT>(W, x, y, res, s); break;
+        case 6: multi_bits<6, NT>(W, x, y, res, s); break;
+        case 8: multi_bits<8, NT>(W, x, y, res, s); break;
+        default: std::fprintf(stderr, "gemv_q8_multi: unsupported bits %d\n", W.bits); std::abort();
+    }
+}
+
+void gemv_q8_multi(const QMat& W, const Q8Vec& x, int nt, float* y, const float* residual, cudaStream_t s) {
+    switch (nt) {
+        case 1: return gemv_q8(W, x, y, residual, s);
+        case 2: return multi_nt<2>(W, x, y, residual, s);
+        case 3: return multi_nt<3>(W, x, y, residual, s);
+        case 4: return multi_nt<4>(W, x, y, residual, s);
+        case 5: return multi_nt<5>(W, x, y, residual, s);
+        case 6: return multi_nt<6>(W, x, y, residual, s);
+        case 8: return multi_nt<8>(W, x, y, residual, s);
+        default: std::fprintf(stderr, "gemv_q8_multi: nt=%d not compiled\n", nt); std::abort();
+    }
+}
+
 // warp per 32-chunk: int8 symmetric quantization in the canonical permutation + exact fp32 chunk sum.
 __global__ void quantize_q8_kernel(const float* __restrict__ x, int C, int8_t* __restrict__ q, float* __restrict__ d,
                                    float* __restrict__ sum, int* __restrict__ qsum) {
