@@ -17,7 +17,9 @@ bit-plane packed, asymmetric group-64 RTN; E0 bit plan mlp 3-bit, gdn/attn 4-bit
 ## Last completed milestone
 - E0 converter + reference pass (BF16 ref + simulated-quant golden activations) — see logs/convert-e0.log
 - GEMV: dp4a int8-activation path at 720–880 GB/s (81–99 % of 890 GB/s measured HBM read peak)
-- CUDA-graph greedy decode path (H1) implemented — measurement pending
+- Real E0 model built (12.63 GiB), GOLDEN PASS on real weights (engine vs qsim KL 5.7e-4, top1 96.8%)
+- Real decode 51.1 tok/s (51.6 graph), VRAM 13.58 GiB, vs NInfer 45.4 plain (quality NOT yet compared: ours ppl 8.47->9.51, KL 0.122)
+- pi-adapter merged build running: logs/convert-pi-e0.log
 
 ## MANDATORY: pi adapter (harness-hub/Qwen3.8-27B-pi-adapted)
 LoRA r=32 alpha=64 on MLP (64 layers) + attn q/k/v/o (16 layers); files in /workspace/q-volta-models/pi-adapter.
@@ -47,8 +49,8 @@ Env switches: `QV_GEMV=fp32` (A/B the fp32 GEMV path), `QV_GEMV_CFG=R,W` (force 
 - Baseline to beat (NInfer, IQ3_S, same GPU, pre-existing run): 45.4 tok/s plain, 100.4 tok/s MTP-3
 
 ## Current bottlenecks / next step
-1. Run golden test → fix any mismatch.  2. Bench plain decode (graph vs no graph) vs NInfer re-run.
-3. Then: fuse norm→q8-quant, KV fp16, attention split-K for long context, batched prefill (WMMA), MTP.
+1. Verify pi-adapted build (KL, generation). 2. Batched prefill (52 tok/s now, token-by-token; goal 1200) = biggest gap.
+3. Quality: GPTQ/bit allocation (KL 0.12 is weak); measure NInfer quality on same eval. 4. MTP, KV quant, long context, server.
 
 ## Rules
 - Every optimisation: test_gemv / check_golden must pass; log in ~/autoresearch-runs/q-volta/EXPERIMENTS.md.
