@@ -25,6 +25,12 @@ Build: `python3 -I tools/convert.py --lora /workspace/q-volta-models/pi-adapter 
 (merges W+2BA in bf16 before quantization; zero decode cost). Must verify: KL(pi-merged BF16 || pi-quant), generation sanity,
 adapter chat template in server, MTP acceptance with unadapted MTP head. Fallback if 3-bit loses the delta: runtime LoRA.
 
+## MANDATORY (Stage B design constraint): ARM / Snapdragon 8 Gen 2
+CPU backend must be fast on ARM as well as x86. Still gated: no CPU backend code before the GPU completion gate.
+Constraints to honour now: keep the .qv format layout-agnostic (CPU backend repacks at load or converter emits an ARM tile
+layout); dispatch at runtime on HWCAP (NEON, dotprod, i8mm, bf16; SVE only if exposed); weights stay quantized (no fp16 expand).
+No aarch64 toolchain/qemu/device in this environment (2026-11-19) -> ARM numbers cannot be claimed until one is available.
+
 ## Commands
 ```
 cmake -S . -B build -G Ninja -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc && ninja -C build
