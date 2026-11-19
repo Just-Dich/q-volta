@@ -1,5 +1,6 @@
 #pragma once
 #include "../common.cuh"
+#include "../kernels/gemv.h"
 
 namespace qv::cuda {
 
@@ -15,6 +16,7 @@ struct GdnStepArgs {
     float* out;               // [Hv*dv]
     int n_k_heads, n_v_heads, dk, dv;
     float eps;
+    Q8Buf q8;  // if q8.q: also emit the out_proj int8 input
 };
 
 void conv_step(const float* in, const float* w, float* state, float* out, int C, cudaStream_t s);

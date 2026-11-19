@@ -159,6 +159,32 @@ __global__ void gemv_f16_kernel(DMat16 W, const float* __restrict__ x, float* __
     if (lane == 0) y[warp] = acc;
 }
 
+// Two small dense fp16 matrices (GDN in_proj_a / in_proj_b, N=48 rows each) in one launch: block per row, the whole
+// block splits K (latency-bound shape: 96 rows only, so each row needs many threads in flight).
+__global__ void __launch_bounds__(256) gemv_f16_dual_kernel(DMat16 A, DMat16 B, const float* __restrict__ x,
+                                                            float* __restrict__ ya, float* __restrict__ yb) {
+    __shared__ float red[32];
+    const bool first = blockIdx.x < A.N;
+    const DMat16& W = first ? A : B;
+    const int row = first ? blockIdx.x : blockIdx.x - A.N;
+    const uint2* w = reinterpret_cast<const uint2*>(W.w + (size_t)row * W.K);  // 4 halves per load
+    const float4* xv = reinterpret_cast<const float4*>(x);
+    float acc = 0.f;
+    for (int k = threadIdx.x; k < W.K / 4; k += blockDim.x) {
+        uint2 p = __ldg(w + k);
+        float2 a = __half22float2(*reinterpret_cast<__half2*>(&p.x));
+        float2 b = __half22float2(*reinterpret_cast<__half2*>(&p.y));
+        float4 xx = __ldg(xv + k);
+        acc = fmaf(a.x, xx.x, fmaf(a.y, xx.y, fmaf(b.x, xx.z, fmaf(b.y, xx.w, acc))));
+    }
+    acc = block_sum(acc, red);
+    if (threadIdx.x == 0) (first ? ya : yb)[row] = acc;
+}
+
+void gemv_f16_dual(const DMat16& A, const DMat16& B, const float* x, float* ya, float* yb, cudaStream_t s) {
+    gemv_f16_dual_kernel<<<A.N + B.N, 256, 0, s>>>(A, B, x, ya, yb);
+}
+
 void gemv_f16(const DMat16& W, const float* x, float* y, cudaStream_t s) {
     int threads = 128;
     int blocks = (W.N * 32 + threads - 1) / threads;

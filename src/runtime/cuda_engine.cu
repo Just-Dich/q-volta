@@ -99,21 +99,19 @@ class CudaEngine final : public Engine {
         embed(embed_, d_tok_, x_, s);
         if (opt_.dump_hidden) dump();
         for (const Layer& L : layers_) {
-            rmsnorm(x_, L.in_norm, xn_, xs_, c.hidden, c.eps, s);
-            prep(xn_, c.hidden, true);
+            rmsnorm(x_, L.in_norm, xn_, xs_, c.hidden, c.eps, s, q8_ ? &xq_ : nullptr);
             if (!L.attn) {
                 const GdnLayer& g = L.g;
                 mv(g.qkv, xn_, qkv_, nullptr);
                 mv(g.z, xn_, z_, nullptr);
-                gemv_f16(g.a, xn_, alpha_, s);
-                gemv_f16(g.b, xn_, beta_, s);
+                gemv_f16_dual(g.a, g.b, xn_, alpha_, beta_, s);
                 const int C = g.qkv.N;
                 conv_step(qkv_, g.conv_w, conv_state_ + (size_t)L.idx_kind * C * 3, conv_out_, C, s);
                 GdnStepArgs a{conv_out_, alpha_, beta_, g.A_neg, g.dt_bias, z_, g.norm_w,
                               gdn_state_ + (size_t)L.idx_kind * c.lin_v_heads * c.lin_k_dim * c.lin_v_dim, mix_,
-                              c.lin_k_heads, c.lin_v_heads, c.lin_k_dim, c.lin_v_dim, c.eps};
+                              c.lin_k_heads, c.lin_v_heads, c.lin_k_dim, c.lin_v_dim, c.eps, q8_ ? xq_ : Q8Buf{}};
                 gdn_step(a, s);
-                prep(mix_, g.out.K, false);
+                if (!q8_) prep(mix_, g.out.K, false);
                 mv(g.out, mix_, x_, x_);  // residual add in place
             } else {
                 const AttnLayer& at = L.at;
@@ -126,22 +124,20 @@ class CudaEngine final : public Engine {
                 AttnPrepArgs p{qg_, kb_, vb_, at.q_norm, at.k_norm, inv_freq_, qr_, kc, vc,
                                c.n_heads, c.n_kv_heads, c.head_dim, c.rope_dim, opt_.max_ctx, d_pos_, c.eps};
                 attn_prep(p, s);
-                AttnDecodeArgs d{qr_, qg_, kc, vc, scores_, mix_, c.n_heads, c.n_kv_heads, opt_.max_ctx, d_pos_};
+                AttnDecodeArgs d{qr_, qg_, kc, vc, scores_, mix_, c.n_heads, c.n_kv_heads, opt_.max_ctx, d_pos_,
+                                 q8_ ? xq_ : Q8Buf{}};
                 attn_decode(d, s);
-                prep(mix_, at.o.K, false);
+                if (!q8_) prep(mix_, at.o.K, false);
                 mv(at.o, mix_, x_, x_);
             }
-            rmsnorm(x_, L.post_norm, xn_, xs_, c.hidden, c.eps, s);
-            prep(xn_, c.hidden, true);
+            rmsnorm(x_, L.post_norm, xn_, xs_, c.hidden, c.eps, s, q8_ ? &xq_ : nullptr);
             mv(L.gate, xn_, g_, nullptr);
             mv(L.up, xn_, u_, nullptr);
-            silu_mul(g_, u_, act_, xs_, c.inter, s);
-            prep(act_, c.inter, true);
+            silu_mul(g_, u_, act_, xs_, c.inter, s, q8_ ? &xq_ : nullptr);
             mv(L.down, act_, x_, x_);
             if (opt_.dump_hidden) dump();
         }
-        rmsnorm(x_, final_norm_, xn_, xs_, c.hidden, c.eps, s);
-        prep(xn_, c.hidden, true);
+        rmsnorm(x_, final_norm_, xn_, xs_, c.hidden, c.eps, s, q8_ ? &xq_ : nullptr);
         mv(head_, xn_, logits_, nullptr);
     }
 

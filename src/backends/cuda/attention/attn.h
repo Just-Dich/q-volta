@@ -1,5 +1,6 @@
 #pragma once
 #include "../common.cuh"
+#include "../kernels/gemv.h"
 
 namespace qv::cuda {
 
@@ -27,6 +28,7 @@ struct AttnDecodeArgs {
     float* out;      // [Hq*D]
     int n_heads, n_kv_heads, max_ctx;
     const int* pos;  // device scalar
+    Q8Buf q8;        // if q8.q: also emit the o_proj int8 input
 };
 
 void attn_prep(const AttnPrepArgs& a, cudaStream_t s);

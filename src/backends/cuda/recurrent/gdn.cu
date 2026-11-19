@@ -2,6 +2,7 @@
 // Semantics follow transformers torch_recurrent_gated_delta_rule + Qwen3_5RMSNormGated exactly.
 #include "../common.cuh"
 #include "gdn.h"
+#include "../kernels/q8.cuh"
 
 namespace qv::cuda {
 
@@ -72,7 +73,9 @@ __global__ void __launch_bounds__(DV) gdn_step_kernel(GdnStepArgs a) {
     float oss = block_sum(o * o, red);
     float r = rsqrtf(oss / DV + a.eps);
     float z = a.z[h * DV + t];
-    a.out[h * DV + t] = (o * r) * a.norm_w[t] * silu(z);
+    const float y = (o * r) * a.norm_w[t] * silu(z);
+    a.out[h * DV + t] = y;
+    if (a.q8.q) q8_store_chunk(y, (h * DV + t) >> 5, a.q8);
 }
 
 void gdn_step(const GdnStepArgs& a, cudaStream_t s) {

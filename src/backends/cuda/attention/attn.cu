@@ -2,6 +2,7 @@
 // zero-centred q/k RMSNorm, partial rotate-half RoPE on the first rope_dim dims, output * sigmoid(gate)).
 #include "../common.cuh"
 #include "attn.h"
+#include "../kernels/q8.cuh"
 
 namespace qv::cuda {
 
@@ -90,7 +91,9 @@ __global__ void __launch_bounds__(D) attn_decode_kernel(AttnDecodeArgs a) {
     for (int j = 0; j < n; ++j) acc = fmaf(sc[j], V[(size_t)j * D + t], acc);
     float o = acc / sum;
     float gate = a.qg[h * 2 * D + D + t];
-    a.out[h * D + t] = o * (1.f / (1.f + expf(-gate)));
+    const float y = o * (1.f / (1.f + expf(-gate)));
+    a.out[h * D + t] = y;
+    if (a.q8.q) q8_store_chunk(y, (h * D + t) >> 5, a.q8);
 }
 
 void attn_decode(const AttnDecodeArgs& a, cudaStream_t s) {

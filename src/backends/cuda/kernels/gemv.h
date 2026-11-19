@@ -9,6 +9,7 @@ void gemv_q(const QMat& W, const float* x, const float* xsum32, float* y, const 
             GemvCfg cfg = {});
 void xsum32(const float* x, float* out, int K, cudaStream_t s);
 void gemv_f16(const DMat16& W, const float* x, float* y, cudaStream_t s);
+void gemv_f16_dual(const DMat16& A, const DMat16& B, const float* x, float* ya, float* yb, cudaStream_t s);
 
 // int8 activation vector for gemv_q8 (canonical chunk permutation, see gemv_q8.cu)
 struct Q8Vec { const int* q; const float* d; const float* sum; const int* qsum; };
