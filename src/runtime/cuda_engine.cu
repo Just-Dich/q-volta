@@ -1,5 +1,6 @@
 // CUDA backend: decode-step executor for Qwen3.5-family hybrid (GDN + gated attention) models.
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -46,6 +47,8 @@ class CudaEngine final : public Engine {
         reset();
     }
     ~CudaEngine() override {
+        if (graph_exec_) cudaGraphExecDestroy(graph_exec_);
+        if (h_tp_) cudaFreeHost(h_tp_);
         for (void* p : allocs_) cudaFree(p);
         cudaFree(weights_);
         cudaStreamDestroy(stream_);
@@ -53,17 +56,55 @@ class CudaEngine final : public Engine {
 
     void step(int token, int pos) override {
         if (pos >= opt_.max_ctx) throw std::runtime_error("context overflow");
+        h_tp_[0] = token;
+        h_tp_[1] = pos;
+        QV_CUDA_CHECK(cudaMemcpyAsync(d_tok_, h_tp_, 2 * sizeof(int), cudaMemcpyHostToDevice, stream_));
+        forward();
+    }
+
+    // Greedy decode of n tokens after the context [0, start_pos) has been processed with step().
+    // first = argmax of the current logits (token at start_pos). With use_graph the whole step (forward + argmax +
+    // feedback) is one CUDA graph and no host synchronisation happens until the end.
+    void decode_greedy(int first, int start_pos, int n, std::vector<int>& out, bool use_graph) override {
+        if (start_pos + n > opt_.max_ctx) throw std::runtime_error("context overflow");
+        h_tp_[0] = first;
+        h_tp_[1] = start_pos;
+        QV_CUDA_CHECK(cudaMemcpyAsync(d_tok_, h_tp_, 2 * sizeof(int), cudaMemcpyHostToDevice, stream_));
+        if (use_graph && !graph_exec_) {
+            QV_CUDA_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
+            forward();
+            argmax_advance(logits_, cfg_.vocab, d_tok_, d_pos_, d_gen_, stream_);
+            cudaGraph_t g;
+            QV_CUDA_CHECK(cudaStreamEndCapture(stream_, &g));
+            QV_CUDA_CHECK(cudaGraphInstantiate(&graph_exec_, g, 0));
+            QV_CUDA_CHECK(cudaGraphDestroy(g));
+        }
+        for (int i = 0; i < n; ++i) {
+            if (use_graph) {
+                QV_CUDA_CHECK(cudaGraphLaunch(graph_exec_, stream_));
+            } else {
+                forward();
+                argmax_advance(logits_, cfg_.vocab, d_tok_, d_pos_, d_gen_, stream_);
+            }
+        }
+        out.resize(n);
+        QV_CUDA_CHECK(cudaMemcpyAsync(out.data(), d_gen_ + start_pos, n * sizeof(int), cudaMemcpyDeviceToHost, stream_));
+        QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
+    }
+
+    // Enqueue one full forward for the token/position held in device memory (d_tok_, d_pos_).
+    void forward() {
         const Config& c = cfg_;
         cudaStream_t s = stream_;
-        QV_CUDA_CHECK(cudaMemcpyAsync(d_tok_, &token, sizeof(int), cudaMemcpyHostToDevice, s));
         embed(embed_, d_tok_, x_, s);
         if (opt_.dump_hidden) dump();
         for (const Layer& L : layers_) {
             rmsnorm(x_, L.in_norm, xn_, xs_, c.hidden, c.eps, s);
+            prep(xn_, c.hidden, true);
             if (!L.attn) {
                 const GdnLayer& g = L.g;
-                gemv_q(g.qkv, xn_, xs_, qkv_, nullptr, s);
-                gemv_q(g.z, xn_, xs_, z_, nullptr, s);
+                mv(g.qkv, xn_, qkv_, nullptr);
+                mv(g.z, xn_, z_, nullptr);
                 gemv_f16(g.a, xn_, alpha_, s);
                 gemv_f16(g.b, xn_, beta_, s);
                 const int C = g.qkv.N;
@@ -72,33 +113,36 @@ class CudaEngine final : public Engine {
                               gdn_state_ + (size_t)L.idx_kind * c.lin_v_heads * c.lin_k_dim * c.lin_v_dim, mix_,
                               c.lin_k_heads, c.lin_v_heads, c.lin_k_dim, c.lin_v_dim, c.eps};
                 gdn_step(a, s);
-                xsum32(mix_, xs_, g.out.K, s);
-                gemv_q(g.out, mix_, xs_, x_, x_, s);  // residual add in place
+                prep(mix_, g.out.K, false);
+                mv(g.out, mix_, x_, x_);  // residual add in place
             } else {
                 const AttnLayer& at = L.at;
-                gemv_q(at.q, xn_, xs_, qg_, nullptr, s);
-                gemv_q(at.k, xn_, xs_, kb_, nullptr, s);
-                gemv_q(at.v, xn_, xs_, vb_, nullptr, s);
+                mv(at.q, xn_, qg_, nullptr);
+                mv(at.k, xn_, kb_, nullptr);
+                mv(at.v, xn_, vb_, nullptr);
                 const size_t kv_layer = (size_t)c.n_kv_heads * opt_.max_ctx * c.head_dim;
                 float* kc = k_cache_ + L.idx_kind * kv_layer;
                 float* vc = v_cache_ + L.idx_kind * kv_layer;
                 AttnPrepArgs p{qg_, kb_, vb_, at.q_norm, at.k_norm, inv_freq_, qr_, kc, vc,
-                               c.n_heads, c.n_kv_heads, c.head_dim, c.rope_dim, opt_.max_ctx, pos, c.eps};
+                               c.n_heads, c.n_kv_heads, c.head_dim, c.rope_dim, opt_.max_ctx, d_pos_, c.eps};
                 attn_prep(p, s);
-                AttnDecodeArgs d{qr_, qg_, kc, vc, scores_, mix_, c.n_heads, c.n_kv_heads, opt_.max_ctx, pos};
+                AttnDecodeArgs d{qr_, qg_, kc, vc, scores_, mix_, c.n_heads, c.n_kv_heads, opt_.max_ctx, d_pos_};
                 attn_decode(d, s);
-                xsum32(mix_, xs_, at.o.K, s);
-                gemv_q(at.o, mix_, xs_, x_, x_, s);
+                prep(mix_, at.o.K, false);
+                mv(at.o, mix_, x_, x_);
             }
             rmsnorm(x_, L.post_norm, xn_, xs_, c.hidden, c.eps, s);
-            gemv_q(L.gate, xn_, xs_, g_, nullptr, s);
-            gemv_q(L.up, xn_, xs_, u_, nullptr, s);
+            prep(xn_, c.hidden, true);
+            mv(L.gate, xn_, g_, nullptr);
+            mv(L.up, xn_, u_, nullptr);
             silu_mul(g_, u_, act_, xs_, c.inter, s);
-            gemv_q(L.down, act_, xs_, x_, x_, s);
+            prep(act_, c.inter, true);
+            mv(L.down, act_, x_, x_);
             if (opt_.dump_hidden) dump();
         }
         rmsnorm(x_, final_norm_, xn_, xs_, c.hidden, c.eps, s);
-        gemv_q(head_, xn_, xs_, logits_, nullptr, s);
+        prep(xn_, c.hidden, true);
+        mv(head_, xn_, logits_, nullptr);
     }
 
     int argmax() override {
@@ -139,7 +183,8 @@ class CudaEngine final : public Engine {
     // scratch
     float *x_, *xn_, *xs_, *qkv_, *z_, *alpha_, *beta_, *conv_out_, *mix_, *qg_, *kb_, *vb_, *qr_, *scores_, *g_, *u_,
         *act_, *logits_, *inv_freq_;
-    int *d_tok_, *d_arg_;
+    int *d_tok_, *d_arg_, *d_pos_, *d_gen_, *h_tp_ = nullptr;
+    cudaGraphExec_t graph_exec_ = nullptr;
     std::vector<float> hidden_;
 
     template <class T>
@@ -150,6 +195,18 @@ class CudaEngine final : public Engine {
         allocs_.push_back(p);
         state_bytes_ += n * sizeof(T);
         return (T*)p;
+    }
+
+    // GEMV input preparation + dispatch (H2: int8/dp4a path by default; QV_GEMV=fp32 selects the fp32 path)
+    bool q8_ = true;
+    Q8Buf xq_{};
+    void prep(const float* x, int K, bool have_xsum) {
+        if (q8_) quantize_q8(x, K, xq_, stream_);
+        else if (!have_xsum) xsum32(x, xs_, K, stream_);
+    }
+    void mv(const QMat& W, const float* x, float* y, const float* res) {
+        if (q8_) gemv_q8(W, xq_, y, res, stream_);
+        else gemv_q(W, x, xs_, y, res, stream_);
     }
 
     void dump() {
@@ -272,8 +329,20 @@ class CudaEngine final : public Engine {
         u_ = dalloc<float>(c.inter);
         act_ = dalloc<float>(c.inter);
         logits_ = dalloc<float>(c.vocab);
-        d_tok_ = dalloc<int>(1);
+        d_tok_ = dalloc<int>(2);  // [token, pos] contiguous: one H2D copy per step
+        d_pos_ = d_tok_ + 1;
+        d_gen_ = dalloc<int>(opt_.max_ctx + 1);
+        QV_CUDA_CHECK(cudaMallocHost(&h_tp_, 2 * sizeof(int)));
         d_arg_ = dalloc<int>(1);
+        {
+            const int Kmax = std::max(c.inter, 2 * c.n_heads * c.head_dim);
+            xq_.q = dalloc<int>(Kmax / 4);
+            xq_.d = dalloc<float>(Kmax / 32);
+            xq_.sum = dalloc<float>(Kmax / 32);
+            xq_.qsum = dalloc<int>(Kmax / 32);
+            const char* e = std::getenv("QV_GEMV");
+            q8_ = !(e && std::string(e) == "fp32");
+        }
         // inv_freq computed in fp32 exactly like torch: 1 / base ** (arange(0, dim, 2) / dim)
         std::vector<float> inv(c.rope_dim / 2);
         for (int i = 0; i < c.rope_dim / 2; ++i)

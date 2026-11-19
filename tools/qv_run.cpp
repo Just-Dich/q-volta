@@ -24,7 +24,7 @@ static std::vector<int> read_i32(const std::string& p) {
 
 int main(int argc, char** argv) {
     std::string model, golden, out, prompt;
-    bool bench = false;
+    bool bench = false, graph = false;
     int n = 128, max_ctx = 4096, warm = 8;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -34,6 +34,7 @@ int main(int argc, char** argv) {
         else if (a == "--out") out = next();
         else if (a == "--prompt") prompt = next();
         else if (a == "--bench") bench = true;
+        else if (a == "--graph") graph = true;
         else if (a == "--n") n = std::stoi(next());
         else if (a == "--max-ctx") max_ctx = std::stoi(next());
         else if (a == "--warmup") warm = std::stoi(next());
@@ -80,13 +81,18 @@ int main(int argc, char** argv) {
         for (; pos < (int)toks.size(); ++pos) eng->step(toks[pos], pos);
         int next = eng->argmax();
         cudaEventRecord(e1);
-        std::vector<int> gen{next};
+        std::vector<int> gen{next}, rest;
         auto td0 = std::chrono::steady_clock::now();
-        for (int i = 1; i < n; ++i) {
-            eng->step(next, pos++);
-            next = eng->argmax();
-            gen.push_back(next);
+        if (graph) {  // capture outside the timed region: one untimed decode, then restore by re-running the prompt
+            eng->decode_greedy(next, pos, 1, rest, true);
+            eng->reset();
+            for (int p = 0; p < (int)toks.size(); ++p) eng->step(toks[p], p);
+            eng->sync();
+            cudaEventRecord(e1);
+            td0 = std::chrono::steady_clock::now();
         }
+        eng->decode_greedy(next, pos, n - 1, rest, graph);
+        gen.insert(gen.end(), rest.begin(), rest.end());
         cudaEventRecord(e2);
         cudaEventSynchronize(e2);
         double td = std::chrono::duration<double>(std::chrono::steady_clock::now() - td0).count();

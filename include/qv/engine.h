@@ -19,6 +19,8 @@ class Engine {
     virtual ~Engine() = default;
     // Process one token at position `pos` (== number of tokens already in the context).
     virtual void step(int token, int pos) = 0;
+    // Greedy decode n tokens; first = token at start_pos (argmax of the logits after the context).
+    virtual void decode_greedy(int first, int start_pos, int n, std::vector<int>& out, bool use_graph) = 0;
     virtual int argmax() = 0;                         // greedy next token from the last step's logits
     virtual void logits(std::vector<float>& out) = 0; // copy last logits to host
     virtual void reset() = 0;                         // clear recurrent/KV state

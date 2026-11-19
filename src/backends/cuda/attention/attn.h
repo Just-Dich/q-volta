@@ -13,7 +13,8 @@ struct AttnPrepArgs {
     float* q_out;           // [Hq*D]
     float* k_cache;         // [Hkv][max_ctx][D]
     float* v_cache;
-    int n_heads, n_kv_heads, head_dim, rope_dim, max_ctx, pos;
+    int n_heads, n_kv_heads, head_dim, rope_dim, max_ctx;
+    const int* pos;  // device scalar (graph-capturable)
     float eps;
 };
 
@@ -24,7 +25,8 @@ struct AttnDecodeArgs {
     const float* v_cache;
     float* scores;   // scratch [Hq][max_ctx]
     float* out;      // [Hq*D]
-    int n_heads, n_kv_heads, max_ctx, pos;
+    int n_heads, n_kv_heads, max_ctx;
+    const int* pos;  // device scalar
 };
 
 void attn_prep(const AttnPrepArgs& a, cudaStream_t s);

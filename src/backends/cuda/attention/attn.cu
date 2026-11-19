@@ -19,17 +19,18 @@ __global__ void __launch_bounds__(D) qk_prep_kernel(AttnPrepArgs a) {
     float y = x * rsqrtf(ss / D + a.eps) * w[t];
     buf[t] = y;
     __syncthreads();
+    const int pos = *a.pos;
     const int half = a.rope_dim / 2;
     if (t < a.rope_dim) {
         int i = t < half ? t : t - half;
-        float f = (float)a.pos * a.inv_freq[i];
+        float f = (float)pos * a.inv_freq[i];
         float c = cosf(f), s = sinf(f);
         y = t < half ? y * c - buf[t + half] * s : y * c + buf[t - half] * s;
     }
     if (is_q) {
         a.q_out[h * D + t] = y;
     } else {
-        size_t off = ((size_t)h * a.max_ctx + a.pos) * D + t;
+        size_t off = ((size_t)h * a.max_ctx + pos) * D + t;
         a.k_cache[off] = y;
         a.v_cache[off] = a.v[h * D + t];
     }
@@ -47,7 +48,7 @@ __global__ void __launch_bounds__(D) attn_decode_kernel(AttnDecodeArgs a) {
     __shared__ float red[32];
     const int h = blockIdx.x, t = threadIdx.x, lane = t & 31, warp = t >> 5, nwarp = D / 32;
     const int kvh = h / (a.n_heads / a.n_kv_heads);
-    const int n = a.pos + 1;
+    const int n = *a.pos + 1;
     qs[t] = a.q[h * D + t];
     __syncthreads();
     const float* K = a.k_cache + (size_t)kvh * a.max_ctx * D;

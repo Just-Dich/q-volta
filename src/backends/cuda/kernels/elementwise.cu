@@ -100,6 +100,50 @@ __global__ void argmax_kernel(const float* __restrict__ x, int n, int* __restric
     }
 }
 
+// Greedy feedback for graph decode: tok = argmax(logits); gen[pos] = tok; pos += 1.
+__global__ void argmax_advance_kernel(const float* __restrict__ x, int n, int* tok, int* pos, int* gen) {
+    __shared__ int res;
+    // reuse argmax body via a nested launch-free call: single block does the reduction
+    __shared__ float sv[32];
+    __shared__ int si[32];
+    float best = -INFINITY;
+    int bi = 0x7fffffff;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = x[i];
+        if (v > best || (v == best && i < bi)) { best = v; bi = i; }
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        float ov = __shfl_xor_sync(0xffffffffu, best, o);
+        int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+        if (ov > best || (ov == best && oi < bi)) { best = ov; bi = oi; }
+    }
+    int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    if (lane == 0) { sv[w] = best; si[w] = bi; }
+    __syncthreads();
+    if (w == 0) {
+        int nw = blockDim.x >> 5;
+        best = lane < nw ? sv[lane] : -INFINITY;
+        bi = lane < nw ? si[lane] : 0x7fffffff;
+        for (int o = 16; o > 0; o >>= 1) {
+            float ov = __shfl_xor_sync(0xffffffffu, best, o);
+            int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+            if (ov > best || (ov == best && oi < bi)) { best = ov; bi = oi; }
+        }
+        if (lane == 0) res = bi;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int p = *pos;
+        *tok = res;
+        gen[p] = res;
+        *pos = p + 1;
+    }
+}
+
+void argmax_advance(const float* x, int n, int* tok, int* pos, int* gen, cudaStream_t s) {
+    argmax_advance_kernel<<<1, 1024, 0, s>>>(x, n, tok, pos, gen);
+}
+
 void argmax(const float* x, int n, int* out, cudaStream_t s) { argmax_kernel<<<1, 1024, 0, s>>>(x, n, out); }
 
 }  // namespace qv::cuda
