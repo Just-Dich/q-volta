@@ -19,6 +19,12 @@ bit-plane packed, asymmetric group-64 RTN; E0 bit plan mlp 3-bit, gdn/attn 4-bit
 - GEMV: dp4a int8-activation path at 720–880 GB/s (81–99 % of 890 GB/s measured HBM read peak)
 - CUDA-graph greedy decode path (H1) implemented — measurement pending
 
+## MANDATORY: pi adapter (harness-hub/Qwen3.8-27B-pi-adapted)
+LoRA r=32 alpha=64 on MLP (64 layers) + attn q/k/v/o (16 layers); files in /workspace/q-volta-models/pi-adapter.
+Build: `python3 -I tools/convert.py --lora /workspace/q-volta-models/pi-adapter --out .../qv/qwen38-27b-pi-e0 --eval-dir .../qv/eval-pi-e0`
+(merges W+2BA in bf16 before quantization; zero decode cost). Must verify: KL(pi-merged BF16 || pi-quant), generation sanity,
+adapter chat template in server, MTP acceptance with unadapted MTP head. Fallback if 3-bit loses the delta: runtime LoRA.
+
 ## Commands
 ```
 cmake -S . -B build -G Ninja -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc && ninja -C build

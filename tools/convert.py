@@ -50,7 +50,34 @@ class Remote:
             self.headers[shard] = (8 + n, h)
         return self.headers[shard]
 
+    # ---- optional LoRA merge (PEFT semantics: W' = W + (alpha/r) * B @ A, rounded to bf16 like merge_and_unload)
+    lora = None  # (dir-loaded dict name->tensor, scale)
+
+    def load_lora(self, d):
+        from safetensors.torch import load_file
+        cfg = json.load(open(os.path.join(d, "adapter_config.json")))
+        assert cfg["peft_type"] == "LORA" and not cfg.get("use_dora") and not cfg.get("use_rslora")
+        assert not cfg.get("rank_pattern") and not cfg.get("alpha_pattern") and cfg.get("bias") == "none"
+        sd = load_file(os.path.join(d, "adapter_model.safetensors"))
+        pre = "base_model.model."
+        self.lora = ({k[len(pre):]: v for k, v in sd.items()}, cfg["lora_alpha"] / cfg["r"])
+        self.lora_used = set()
+        print(f"LoRA: {len(sd)//2} modules, r={cfg['r']} alpha={cfg['lora_alpha']} scale={self.lora[1]}", flush=True)
+
     def fetch(self, name) -> torch.Tensor:
+        t = self.fetch_base(name)
+        if self.lora and name.endswith(".weight"):
+            sd, scale = self.lora
+            a = name[:-len("weight")] + "lora_A.weight"
+            if a in sd:
+                A = sd[a].cuda().float()
+                B = sd[name[:-len("weight")] + "lora_B.weight"].cuda().float()
+                assert B.shape[0] == t.shape[0] and A.shape[1] == t.shape[1], (name, A.shape, B.shape, t.shape)
+                t = (t.cuda().float() + scale * (B @ A)).to(torch.bfloat16).cpu()
+                self.lora_used.add(a)
+        return t
+
+    def fetch_base(self, name) -> torch.Tensor:
         shard = self.wmap[name]
         if self.local_dir:  # local shard present (downloaded by scripts/download_bf16.sh)
             from safetensors import safe_open
@@ -158,6 +185,7 @@ def main():
     ap.add_argument("--nseq", type=int, default=8)
     ap.add_argument("--seqlen", type=int, default=512)
     ap.add_argument("--dbg-tokens", type=int, default=64)
+    ap.add_argument("--lora", default=None, help="PEFT LoRA adapter dir to merge into the BF16 weights before quantization")
     ap.add_argument("--bits", default="mlp_gu=3,mlp_down=3,gdn=4,attn=4,embed=4,head=6")
     args = ap.parse_args()
     bp = {k: int(v) for k, v in (kv.split("=") for kv in args.bits.split(","))}
@@ -186,6 +214,8 @@ def main():
     np.save(os.path.join(args.eval_dir, "tokens.npy"), toks.numpy().astype(np.int32))
 
     R = Remote(args.hf_dir)
+    if args.lora:
+        R.load_lora(args.lora)
     W = F.Writer(args.out)
     total = {"bytes": 0}
 
@@ -314,6 +344,11 @@ def main():
     W.close(cfg_out)
     torch.save(dict(ref=torch.stack(dbg_ref), q=torch.stack(dbg_q), logits_q=dbg_logits,
                     logits_ref=dbg_logits_ref), os.path.join(args.eval_dir, "golden_seq0.pt"))
+    if args.lora:  # every adapter module must have been merged exactly once; otherwise names did not match
+        n_a = sum(k.endswith("lora_A.weight") for k in R.lora[0])
+        assert len(R.lora_used) == n_a, f"LoRA merged {len(R.lora_used)}/{n_a} modules"
+        metrics["lora"] = {"dir": args.lora, "modules": n_a, "scale": R.lora[1]}
+        print(f"LoRA merged into {n_a}/{n_a} modules", flush=True)
     json.dump(metrics, open(os.path.join(args.eval_dir, "metrics.json"), "w"), indent=1)
     print(f"[{time.time()-t0:6.0f}s] DONE total {total['bytes']/2**30:.2f} GiB", flush=True)
 
