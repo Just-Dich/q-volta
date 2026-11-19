@@ -1,0 +1,23 @@
+#pragma once
+#include "../common.cuh"
+
+namespace qv::cuda {
+
+struct GdnStepArgs {
+    const float* conv_out;    // [q(Hk*dk) | k(Hk*dk) | v(Hv*dv)] after conv+silu
+    const float* alpha;       // in_proj_a output [Hv]
+    const float* beta_logit;  // in_proj_b output [Hv]
+    const float* A_neg;       // -exp(A_log) [Hv]
+    const float* dt_bias;     // [Hv]
+    const float* z;           // in_proj_z output [Hv*dv]
+    const float* norm_w;      // [dv]
+    float* state;             // [Hv][dk][dv] fp32, updated in place
+    float* out;               // [Hv*dv]
+    int n_k_heads, n_v_heads, dk, dv;
+    float eps;
+};
+
+void conv_step(const float* in, const float* w, float* state, float* out, int C, cudaStream_t s);
+void gdn_step(const GdnStepArgs& a, cudaStream_t s);
+
+}  // namespace qv::cuda

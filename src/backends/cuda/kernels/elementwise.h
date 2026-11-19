@@ -1,0 +1,9 @@
+#pragma once
+#include "../common.cuh"
+
+namespace qv::cuda {
+void rmsnorm(const float* x, const float* w, float* out, float* xs32, int n, float eps, cudaStream_t s);
+void embed(const QMat& E, const int* tok, float* out, cudaStream_t s);
+void silu_mul(const float* g, const float* u, float* out, float* xs32, int n, cudaStream_t s);
+void argmax(const float* x, int n, int* out, cudaStream_t s);
+}  // namespace qv::cuda
