@@ -49,7 +49,7 @@ Env switches: `QV_GEMV=fp32` (A/B the fp32 GEMV path), `QV_GEMV_CFG=R,W` (force 
 - Baseline to beat (NInfer, IQ3_S, same GPU, pre-existing run): 45.4 tok/s plain, 100.4 tok/s MTP-3
 
 ## Current bottlenecks / next step
-1. Verify pi-adapted build (KL, generation). 2. Batched prefill (52 tok/s now, token-by-token; goal 1200) = biggest gap.
+1. Agentic eval for pi adapter (real trajectories from harness-hub datasets): KL(pi_ref‖pi_q) vs KL(pi_ref‖base_q); fallback runtime LoRA if delta lost. 2. Batched prefill (52 tok/s now, token-by-token; goal 1200) = biggest gap.
 3. Quality: GPTQ/bit allocation (KL 0.12 is weak); measure NInfer quality on same eval. 4. MTP, KV quant, long context, server.
 
 ## Rules
