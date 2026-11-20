@@ -1,23 +1,68 @@
 # Q-Volta
 
-An original C++20/CUDA inference engine for **Qwen3.8-27B** on a single **NVIDIA Tesla V100-SXM2-16GB** (sm_70), built GPU-first.
-A native CPU backend (x86 AVX2, later ARM/NEON) is planned and deliberately **not started** until the GPU stage is complete.
+An original C++20/CUDA inference engine for **Qwen3.8-27B**: one fast engine for a single **Tesla V100-16GB** (sm_70) and a native **CPU backend** (x86 AVX2 today; ARM/NEON is a design constraint, not yet ported), with **exact** MTP speculative decoding, a single-file model format and an OpenAI-compatible server.
 
-**Status: early research code, Stage A (GPU) in progress. Not a release.** All numbers are measured on one V100 machine; see
-[docs/PERFORMANCE.md](docs/PERFORMANCE.md) for methodology, caveats and the comparison with NInfer, and
-[docs/PROGRESS.md](docs/PROGRESS.md) for the log.
+**Status: research code, not a release.** Every number below was measured on one machine, on the date shown, with the raw results in
+[`benchmarks/results/`](benchmarks/results). Caveats are listed next to the numbers and in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
-## What works (tested)
-- Quantizer/converter (`tools/convert.py`): streams BF16 weights, writes the Q-Volta bit-plane format (asymmetric group-64, 2-8 bit), optional PEFT LoRA merge (`--lora`).
-- Full-model CUDA forward: step (decode, int8-activation dp4a GEMV at 81-99% of HBM peak, CUDA-graph) and batched prefill (dequant slab + cuBLAS HGEMM, in-kernel GDN recurrence, causal attention). Golden tests against a simulated-quantization reference pass on real weights.
-- Measured on V100: plain decode 52 tok/s (E0 quantization, 12.6 GiB); cold prefill 1013 / 1205 / 1143 tok/s at 512 / 2048 / 4088 tokens (NInfer on the same GPU: 837 / 1010 / 1013).
+## Headline results
 
-## Known limitations (read before comparing)
-- **Quality is behind the strongest baseline**: E0 is plain round-to-nearest (+12% wikitext perplexity vs BF16); the comparison engine is +0.3%. Part of our decode lead is simply fewer bytes read. Improving quantization is the next big item.
-- No MTP/speculative decoding yet; KV cache is fp32 (about 20K tokens fit); long-context (128K/256K) is untested.
-- OpenAI-compatible server `qv_server` (CPU backend tested; CUDA backend compiles, not run in the server tests): see docs/SERVER.md. No tool calling, no n>1, no vision. One request at a time.
-- Tokenizer matches the `tokenizers` library on 509/509 test strings (498/509 vs transformers AutoTokenizer: combining-mark cases differ, documented).
-- The pi LoRA adapter's effect is partly blurred by 3-bit rounding; runtime LoRA is planned.
+### GPU - Tesla V100-SXM2-16GB, greedy decode, tok/s (higher is better)
+![GPU decode](docs/img/gpu_decode.svg)
+
+| prompt | NInfer plain | NInfer MTP-3 | **Q-Volta plain** | **Q-Volta MTP** (best depth) | MTP vs plain | acceptance (d1 / d2 / d3) |
+|---|---:|---:|---:|---:|---:|---|
+| code chat, ctx 37 | 45.3 | 106.5 | 52.2 | **129.5** (depth 3) | 2.48x | 1.00 / 0.96 / 0.91 |
+| prose chat, ctx 47 | 45.3 | 69.0 | 52.2 | **84.3** (depth 3) | 1.61x | 0.83 / 0.56 / 0.47 |
+| wikitext, ctx 512 | - | - | 52.0 | 134.5 (depth 3) | 2.58x | 0.98 / 0.96 / 0.96 |
+| wikitext, ctx 2048 | - | - | 50.8 | 76.7 (depth 2) | 1.51x | 0.69 / 0.52 / 0.41 |
+| wikitext, ctx 4088 | - | - | 48.6 | 82.4 (depth 2) | 1.69x | 0.75 / 0.67 / 0.55 |
+
+- MTP output is **bit-identical** to plain greedy decoding (checked on all 60 benchmark runs; `test_cuda_mtp` also compares final logits for depth 1-3).
+- Verifying 2 / 3 / 4 tokens costs 1.11x / 1.14x / 1.25x of a single decode step (decode is memory-bandwidth-bound), so accepted drafts are almost free.
+- Q-Volta runs 3 repeats per cell, spread < 1% (except plain at ctx 4088: 47.7-50.0). NInfer numbers are from an earlier run the same day, not re-run, timed through its server (ours: `qv_run` decode window).
+
+### GPU - cold prefill, tok/s
+![GPU prefill](docs/img/gpu_prefill.svg)
+
+| prompt tokens | NInfer | **Q-Volta** | gain |
+|---:|---:|---:|---:|
+| 512 | 837 | **1010** | +21% |
+| 2048 | 1010 | **1207** | +19% |
+| 4088 | 1013 | **1136** | +12% |
+
+### CPU - 1x Xeon E5-2683 v4 (AVX2, 32 threads), shared host
+![CPU decode](docs/img/cpu_decode.svg)
+
+| | llama.cpp Q4_K_M (15.8 GiB) | llama.cpp Q3_K_M (12.8 GiB) | **Q-Volta** (12.6 GiB) | **Q-Volta + MTP** |
+|---|---:|---:|---:|---:|
+| decode, tok/s | 2.16 | 1.86 | 2.6-2.8 today (3.9 on a quieter run) | **3.8-4.5** (1.43-1.60x, acceptance 0.78-0.94) |
+| prefill pp512, tok/s | 23.5 | 23.0 | 30.4 | |
+| prefill pp2048, tok/s | 20.1 | 19.9 | 26.6 | |
+
+![CPU prefill](docs/img/cpu_prefill.svg)
+
+CPU decode is bound by DRAM bandwidth (about 54 GB/s here, 13.6 GB read per token). MTP reads the weights once for two tokens, which is the main lever.
+
+## Honest caveats (read before comparing)
+- **Quality is behind the strongest baseline.** Our E0 weights are plain round-to-nearest (3-bit MLP, 4-bit attention/GDN): wikitext perplexity +12% vs BF16 (8.468 -> 9.508, top-1 agreement 84.6%). NInfer's mixed-precision file is +0.3%. Part of our decode lead is simply fewer bytes read (12.6 vs 14.0 GiB). Better quantization (GPTQ-style, bit allocation) is the next big item; speed gained at worse quality is not a clean win.
+- The CPU comparison is **not** load-matched: the host was shared (load average 0.1-33), runs are single, and the llama.cpp quants were produced from a Q8_0 intermediate without an importance matrix. Plain-vs-MTP ratios come from back-to-back runs and are the more reliable numbers. Quality (KL) was not compared on CPU.
+- Today's plain CPU decode (2.6-2.8) is below an earlier 3.93 run; the cause (DRAM contention from other tenants) is suspected, not confirmed.
+- **Context length**: the GPU path stores KV in fp32 (about 20K tokens fit without MTP, ~10K with depth-3 MTP). Beyond ~8K tokens is untested and **256K is not reached yet** (needs int4 KV and ~2.5 GiB less weight/scratch).
+- MTP only speculates exact greedy decoding; no sampling, no adaptive depth, and it is not yet wired into the server. MTP with the pi-merged model was not measured.
+- Prefill attention is fp32 CUDA-core; the lead is expected to shrink for prompts above 4K.
+
+## What works
+- **Single-file model format `.qv`**: header + JSON index + bit-plane data in one file (base weights, MTP head). Legacy `.qv.json` + `.qv.bin` pairs still load. `tools/qv_pack.py` merges a pair into one file. Bit-plane, asymmetric group-64 quantization, 2-8 bits per tensor.
+- **Converter** `tools/convert.py` (streams BF16 -> Q-Volta, optional PEFT LoRA merge, so the pi adapter works as a merged model; runtime LoRA is planned).
+- **CUDA backend**: int8-activation dp4a GEMV decode at 81-99% of HBM peak with CUDA graphs; batched prefill (dequant slab + cuBLAS HGEMM, in-kernel GDN recurrence); split-K decode attention; exact multi-token verify for MTP.
+- **CPU backend**: AVX2 int8 kernels, pinned spin-barrier thread pool, huge-page weights, batched prefill, exact MTP.
+- **OpenAI-compatible server** `qv_server` (chat completions, streaming, stop strings, seed, logprobs, API key): see [docs/SERVER.md](docs/SERVER.md). No tool calling, no n>1, no vision, one request at a time. The CPU path is tested; the CUDA server path compiles but was not run in the server tests.
+- Tokenizer matches the `tokenizers` library on 509/509 test strings (498/509 vs transformers `AutoTokenizer`; combining-mark cases differ, documented). Chat template matches 31/31 conversations.
+- Tests: 12/12 ctest on the GPU build; full-model golden test passes (KL 6.5e-4 vs the simulated-quantization reference).
+
+## Roadmap
+Better quantization (smaller file at equal quality), runtime LoRA inside the model file, 256K context (int4 KV), adaptive MTP depth and a restricted draft vocabulary, server MTP, CPU prefill (fp32 scale overhead), ARM/NEON.
 
 ## Build and test
 ```

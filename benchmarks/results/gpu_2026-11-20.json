@@ -3278,5 +3278,13 @@
   ],
   "golden": "PASS (T=64: worst layer rel 0.033, final logits rel 0.012, KL(qsim||engine) 6.5e-4, top1 vs qsim 0.984)",
   "test_cuda_mtp": "PASS depth 1,2,3 x 4 prompts x 97 tokens, ids and final logits bit-identical"
+ },
+ "ninfer_prefill_reference_not_rerun_today": {
+  "source": "docs/PERFORMANCE.md (measured earlier on this V100, chunk 1024)",
+  "tok_s": {
+   "512": 837,
+   "2048": 1010,
+   "4088": 1013
+  }
  }
 }

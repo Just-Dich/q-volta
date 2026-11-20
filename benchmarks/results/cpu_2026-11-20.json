@@ -1,0 +1,23 @@
+{
+  "host": "1x Xeon E5-2683 v4, 64 logical CPUs, AVX2, DRAM-bandwidth ceiling ~54 GB/s",
+  "date": "2026-11-20",
+  "notes": "Machine was shared; load average was 0.1-33 during runs. Single runs per cell. Plain-vs-MTP ratios come from back-to-back runs. llama.cpp quants were made from a Q8_0 GGUF intermediate without imatrix (see benchmarks/baselines/CPU_B0.md); loads were not equal, quality (KL) was not compared.",
+  "qvolta": {
+    "model": "e0 (12.63 GiB, ~4.0 bpw avg)", "threads": 32,
+    "decode_plain_short_ctx_tok_s": 3.93,
+    "prefill_tok_s": {"512": 30.4, "2048": 26.6},
+    "decode_after_prompt_plain_tok_s": {"512": 2.80, "2048": 2.70},
+    "mtp": [
+      {"ctx": 39,   "plain": 2.78, "mtp": 4.46, "accept": 0.94},
+      {"ctx": 128,  "plain": 2.78, "mtp": 4.09, "accept": 0.83},
+      {"ctx": 512,  "plain": 2.67, "mtp": 4.15, "accept": 0.88},
+      {"ctx": 1536, "plain": 2.65, "mtp": 3.86, "accept": 0.79},
+      {"ctx": 1880, "plain": 2.63, "mtp": 3.75, "accept": 0.78}
+    ]
+  },
+  "llamacpp": {
+    "commit": "9d6f04f", "threads": 32,
+    "Q3_K_M": {"gib": 12.76, "decode": 1.86, "pp512": 22.97, "pp2048": 19.87},
+    "Q4_K_M": {"gib": 15.83, "decode": 2.16, "pp512": 23.47, "pp2048": 20.09}
+  }
+}
