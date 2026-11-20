@@ -16,7 +16,8 @@ g = torch.load(os.path.join(eval_dir, "golden_seq0.pt"))
 with tempfile.TemporaryDirectory() as td:
     tf, of = os.path.join(td, "t.i32"), os.path.join(td, "out.bin")
     toks.tofile(tf)
-    r = subprocess.run([qv_run, "--model", prefix, "--golden", tf, "--out", of], capture_output=True, text=True)
+    extra = os.environ.get("QV_RUN_ARGS", "").split()
+    r = subprocess.run([qv_run, "--model", prefix, "--golden", tf, "--out", of] + extra, capture_output=True, text=True)
     print(r.stderr.strip())
     if r.returncode:
         sys.exit("qv_run failed")

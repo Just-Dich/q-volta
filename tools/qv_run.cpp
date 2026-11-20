@@ -24,7 +24,7 @@ static std::vector<int> read_i32(const std::string& p) {
 
 int main(int argc, char** argv) {
     std::string model, golden, out, prompt;
-    bool bench = false, graph = false;
+    bool bench = false, graph = false, use_prefill = false;
     int n = 128, max_ctx = 4096, warm = 8;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -34,6 +34,7 @@ int main(int argc, char** argv) {
         else if (a == "--out") out = next();
         else if (a == "--prompt") prompt = next();
         else if (a == "--bench") bench = true;
+        else if (a == "--prefill") use_prefill = true;
         else if (a == "--graph") graph = true;
         else if (a == "--n") n = std::stoi(next());
         else if (a == "--max-ctx") max_ctx = std::stoi(next());
@@ -58,6 +59,11 @@ int main(int argc, char** argv) {
         std::vector<int> toks = read_i32(golden);
         std::ofstream o(out, std::ios::binary);
         std::vector<float> lg;
+        if (use_prefill) {
+            eng->prefill(toks.data(), (int)toks.size(), 0);
+            const auto& la = eng->logits_dump();
+            o.write((const char*)la.data(), la.size() * 4);
+        } else
         for (size_t p = 0; p < toks.size(); ++p) {
             eng->step(toks[p], (int)p);
             eng->logits(lg);
@@ -72,23 +78,27 @@ int main(int argc, char** argv) {
         std::vector<int> toks = prompt.empty() ? std::vector<int>{9707} : read_i32(prompt);
         // warmup (not timed), then reset
         for (int i = 0; i < warm; ++i) eng->step(toks[0], i);
+        if (use_prefill) eng->prefill(toks.data(), (int)toks.size(), 0);  // warm: allocates prefill scratch + cuBLAS
         eng->sync();
         eng->reset();
-        cudaEvent_t e0, e1, e2;
-        cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventCreate(&e2);
+        cudaEvent_t e0, e1, e1b, e2;
+        cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventCreate(&e1b); cudaEventCreate(&e2);
         cudaEventRecord(e0);
         int pos = 0;
-        for (; pos < (int)toks.size(); ++pos) eng->step(toks[pos], pos);
+        if (use_prefill) { eng->prefill(toks.data(), (int)toks.size(), 0); pos = (int)toks.size(); }
+        else for (; pos < (int)toks.size(); ++pos) eng->step(toks[pos], pos);
         int next = eng->argmax();
         cudaEventRecord(e1);
+        cudaEventRecord(e1b);  // decode window starts here (re-recorded after the untimed graph-capture re-run)
         std::vector<int> gen{next}, rest;
         auto td0 = std::chrono::steady_clock::now();
         if (graph) {  // capture outside the timed region: one untimed decode, then restore by re-running the prompt
             eng->decode_greedy(next, pos, 1, rest, true);
             eng->reset();
-            for (int p = 0; p < (int)toks.size(); ++p) eng->step(toks[p], p);
+            if (use_prefill) eng->prefill(toks.data(), (int)toks.size(), 0);
+            else for (int p = 0; p < (int)toks.size(); ++p) eng->step(toks[p], p);
             eng->sync();
-            cudaEventRecord(e1);
+            cudaEventRecord(e1b);
             td0 = std::chrono::steady_clock::now();
         }
         eng->decode_greedy(next, pos, n - 1, rest, graph);
@@ -98,7 +108,7 @@ int main(int argc, char** argv) {
         double td = std::chrono::duration<double>(std::chrono::steady_clock::now() - td0).count();
         float pre_ms, dec_ms;
         cudaEventElapsedTime(&pre_ms, e0, e1);
-        cudaEventElapsedTime(&dec_ms, e1, e2);
+        cudaEventElapsedTime(&dec_ms, e1b, e2);
         cudaMemGetInfo(&fr, &tot);
         std::printf("{\"prompt_tokens\": %zu, \"prefill_ms\": %.2f, \"prefill_tok_s\": %.2f, \"decode_tokens\": %d, "
                     "\"decode_ms\": %.2f, \"decode_tok_s\": %.2f, \"decode_tok_s_wall\": %.2f, \"vram_used_gib\": %.3f, \"ids\": [",

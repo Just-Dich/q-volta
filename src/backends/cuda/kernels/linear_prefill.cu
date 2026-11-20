@@ -39,7 +39,8 @@ static void gemm_block(cublasHandle_t h, const __half* B, int nr, const __half* 
 }
 
 void linear_seq(LinearPrefill& lp, const QMat& W, const __half* X, int T, float* Y, cudaStream_t s) {
-    const int rows_per = (int)std::min<size_t>(W.N, lp.slab_elems / W.K);
+    int rows_per = (int)std::min<size_t>(W.N, lp.slab_elems / W.K);
+    if (rows_per < W.N && rows_per >= 256) rows_per &= ~255;  // aligned column blocks (cuBLAS picks wide-alignment kernels)
     if (rows_per <= 0) {
         std::fprintf(stderr, "linear_seq: slab too small for K=%d\n", W.K);
         std::abort();
