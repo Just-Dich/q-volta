@@ -87,3 +87,9 @@ if(QV_CPU)
     target_compile_definitions(qv_run PRIVATE QV_HAVE_CPU)
   endif()
 endif()
+
+# ---- tokenizer / sampling / server (CPU-only capable; the CUDA engine is linked when QV_CUDA=ON) ----
+add_library(qv_text STATIC src/tokenizer/tokenizer.cpp src/tokenizer/chat_template.cpp src/sampling/sampler.cpp)
+target_include_directories(qv_text PUBLIC include src)
+add_executable(qv_tok tools/qv_tok.cpp)
+target_link_libraries(qv_tok PRIVATE qv_text)

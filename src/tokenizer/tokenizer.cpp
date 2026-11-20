@@ -66,17 +66,6 @@ std::vector<uint32_t> to_codepoints(const std::string& s) {
 }
 
 // ------------------------------------------------------------------------------------------------ unicode classes
-template <size_t N>
-bool in_ranges(const uint32_t (&t)[N][2], uint32_t cp) {
-    size_t lo = 0, hi = N;
-    while (lo < hi) {
-        size_t mid = (lo + hi) / 2;
-        if (cp < t[mid][0]) hi = mid;
-        else if (cp > t[mid][1]) lo = mid + 1;
-        else return true;
-    }
-    return false;
-}
 // kCatL etc. are declared with unknown extent in the .inc, so go through pointers + counts.
 bool in_ranges_p(const uint32_t (*t)[2], size_t n, uint32_t cp) {
     size_t lo = 0, hi = n;
@@ -88,7 +77,6 @@ bool in_ranges_p(const uint32_t (*t)[2], size_t n, uint32_t cp) {
     }
     return false;
 }
-(void)sizeof(in_ranges<1>);
 bool is_L(uint32_t c) {
     if (c < 0x80) return (c | 32) - 'a' < 26u;
     return in_ranges_p(kCatL, kCatL_n, c);
@@ -222,8 +210,6 @@ void Tokenizer::split_pieces(const std::vector<uint32_t>& cp, std::vector<std::p
                 while (k < n && (is_L(cp[k]) || is_M(cp[k]))) ++k;
                 out.emplace_back(i, k); i = k; continue;
             }
-            if (j != i && (is_L(c) || is_M(c))) {}  // unreachable: prefix class excludes L; M handled by j==i path below
-            if (j == i + 1 && is_M(c) && false) {}
             if (is_M(c)) {  // a lone mark with no following letters: matches via [\p{L}\p{M}]+ without a prefix
                 size_t k = i;
                 while (k < n && (is_L(cp[k]) || is_M(cp[k]))) ++k;
@@ -439,8 +425,7 @@ Tokenizer Tokenizer::load(const std::string& path) {
         if (m.is_array()) { a = m.items().at(0).as_string(); b = m.items().at(1).as_string(); }
         else {
             const std::string& s = m.as_string();
-            size_t sp = s.find(' ', 1);  // first char may itself be a space-like byte char; they are never ' ' in byte alphabet
-            sp = s.find(' ');
+            size_t sp = s.find(' ');  // the byte alphabet never contains a literal space
             if (sp == std::string::npos) throw std::runtime_error("tokenizer: bad merge");
             a = s.substr(0, sp);
             b = s.substr(sp + 1);
