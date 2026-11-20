@@ -29,6 +29,10 @@ add_executable(test_cpu_gemv ${QV_ROOT}/tests/test_cpu_gemv.cpp)
 target_link_libraries(test_cpu_gemv PRIVATE qv_cpu)
 add_test(NAME cpu_gemv COMMAND test_cpu_gemv ${QV_ROOT}/tests/data/pack_fixture.txt)
 
+add_executable(test_cpu_gemm ${QV_ROOT}/tests/test_cpu_gemm.cpp)
+target_link_libraries(test_cpu_gemm PRIVATE qv_cpu)
+add_test(NAME cpu_gemm COMMAND test_cpu_gemm)
+
 add_executable(test_cpu_ops ${QV_ROOT}/tests/test_cpu_ops.cpp)
 target_link_libraries(test_cpu_ops PRIVATE qv_cpu_ops)
 add_test(NAME cpu_ops COMMAND test_cpu_ops)

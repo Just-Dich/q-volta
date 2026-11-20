@@ -56,6 +56,27 @@ struct Q8ActC {
     float sum(int sg) const { return ds[4 * (sg >> 1) + 2 + (sg & 1)]; }
 };
 
+// Batched quantized activations for gemm_q: T rows (tokens) of K values, same per-row numerics as Q8ActC, plus two
+// pre-expanded side tables so the GEMM inner loop needs no shuffles:
+//   dv8[(t*G + g)*8 + i] = d of 32-sub-group (i >= 4), i.e. (d0,d0,d0,d0,d1,d1,d1,d1) of 64-group g (matches the int32
+//   lane order of the dot of one group); xs[t*G + g] = sum0 + sum1 (fp32) for the weight-min term.
+struct Q8Batch {
+    int T = 0, K = 0, G = 0;  // capacity rows, row stride in elements, K/64
+    std::vector<int8_t> q;    // [T][K] (per row: Q8ActC layout)
+    std::vector<float> ds;    // [T][G*4]
+    std::vector<float> dv8;   // [T][G][8]
+    std::vector<float> xs;    // [T][G]
+    void resize(int rows, int k) {
+        T = rows; K = k; G = k / 64;
+        q.assign((size_t)rows * k, 0);
+        ds.assign((size_t)rows * G * 4, 0.f);
+        dv8.assign((size_t)rows * G * 8, 0.f);
+        xs.assign((size_t)rows * G, 0.f);
+    }
+    // Quantize x[0..kuse) (kuse % 64 == 0, kuse <= K) into row t. Thread-safe for distinct t.
+    void quantize_row(int t, const float* x, int kuse);
+};
+
 // natural in-group index -> stored position
 inline int q8_perm(int n) {
     const int c = n >> 5, r = n & 31, b = r >> 3, a = r & 7;
@@ -67,9 +88,19 @@ void quantize_act_q8(const float* x, int K, Q8ActC& out);  // AVX2; K % 64 == 0
 // Range variant for fused/parallel use: quantizes groups [g0,g1) of x (x points at the START of the vector) into a
 // pre-sized `out` (q.size() >= 64*g1, ds.size() >= 2*g1). Disjoint group ranges may run concurrently.
 void quantize_act_q8_range(const float* x, int g0, int g1, Q8ActC& out);
+// Same on raw buffers (q: 64 bytes per group, ds: 4 floats per group, both starting at group 0).
+void quantize_act_q8_raw(const float* x, int g0, int g1, int8_t* q, float* ds);
 
 // y[row0..row1) = W[row0..row1) . x  (single thread). Optimized AVX2 for bits 2,3,4,5,6,8.
 void gemv_q(const QMatC& W, const Q8ActC& x, float* y, int row0, int row1);
+
+// Batched (prefill) GEMM: Y[t*ldy + n] = W[n] . X[t] for rows n in [row0,row1), tokens t in [0,T). Every weight row block is
+// unpacked ONCE (bit planes -> int8 in an L1-sized buffer) and multiplied against all T tokens (register tile of 2 rows x
+// 4 tokens, K processed in chunks so the unpacked tile and the token tile stay in L1). Per-token results equal gemv_q up to
+// fp32 summation order of the weight-min term (<1e-6 relative). bits 8 falls back to per-token gemv_q.
+void gemm_q(const QMatC& W, const Q8Batch& X, int T, float* Y, size_t ldy, int row0, int row1);
+// Multi-threaded over the pool: dynamic claims of 8 rows; each claimed block handles all T tokens.
+void gemm_q_par(ThreadPool& pool, const QMatC& W, const Q8Batch& X, int T, float* Y, size_t ldy);
 
 // Multi-threaded: rows split statically over the pool (multiples of 4 rows per thread).
 void gemv_q_par(ThreadPool& pool, const QMatC& W, const Q8ActC& x, float* y);

@@ -37,7 +37,7 @@ int main(int argc, char** argv) {
     std::string backend = "cpu";
 #endif
     int threads = 32;
-    int n = 128, max_ctx = 4096, warm = 8, chunk = 2048;
+    int n = 128, max_ctx = 4096, warm = 8, chunk = -1;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { if (i + 1 >= argc) throw std::runtime_error("missing value for " + a); return argv[++i]; };
@@ -60,7 +60,7 @@ int main(int argc, char** argv) {
     qv::ModelFile mf = qv::ModelFile::open(model);
     qv::EngineOptions opt;
     opt.max_ctx = max_ctx;
-    opt.prefill_chunk = chunk;
+    opt.prefill_chunk = chunk > 0 ? chunk : (backend == "cpu" ? 256 : 2048);  // cpu: tokens per batched-prefill chunk
     opt.dump_hidden = !golden.empty();
     opt.threads = threads;
     std::unique_ptr<qv::Engine> eng;

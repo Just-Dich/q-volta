@@ -48,3 +48,15 @@ Golden (tests/check_golden.py, T=64, 32 threads): group-64 activations FAIL (top
 (top1 0.9524 = 60/63 vs gate 0.95, KL 3.6e-3, worst layer rel 0.078, final logits rel 0.030). Margin is thin (one flipped token fails);
 KL is ~6x the GPU path (5.7e-4), mostly int8 activation noise (fp32-activation diagnostic gives <5e-4 per layer).
 Not done: batched prefill GEMM (prefill = step loop), NEON/ARM, int4 KV for long context, comparison with llama.cpp on this machine.
+
+## CPU batched prefill (branch p5/cpuprefill)
+`gemm_q` / `gemm_q_par` (src/backends/cpu/cpu_gemv.cpp): each claimed 16-row block is unpacked once per 16-group K chunk into an int8
+L1 buffer and multiplied against every token of the chunk (register tile 4 rows x 2 tokens, maddubs+madd, same per-32 activation
+scale/sum scheme as gemv_q; weight-min term computed separately as sum_g min*xsum). `Q8Batch` = batched activations + pre-expanded scale tables.
+`CpuEngine::prefill` runs chunks of 256 tokens (`--prefill-chunk`, `QV_CPU_PREFILL_CHUNK`): gemm projections, GDN conv/recurrence parallel over
+channels/v-heads, attention causal over (cache + chunk) parallel over (kv head, token), logits only for the last token unless dump_hidden.
+`QV_PREFILL_STEP=1` selects the old step loop, `QV_PREFILL_PROF=1` prints a phase breakdown, `QV_DIAG_GEMV=1` swaps gemm_q for per-token gemv_q.
+Correctness: tests/test_cpu_gemm (gemm vs gemv_q per token <= 6.3e-7 rel); prefill with QV_DIAG_GEMV and the step path with a single attention split are
+bit-identical, i.e. the only prefill-vs-step numeric differences are gemm summation order and the attention split order. The int8-activation
+pipeline amplifies such 1e-7 differences chaotically (4e-4 after the first attention layer, 4-6% at layer 64 between two valid runs), so
+check_golden numbers move a little between runs (worst layer 0.078 step vs 0.097 prefill; top1 vs qsim 0.9524 for both).

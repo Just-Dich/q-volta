@@ -15,6 +15,10 @@ void quantize_act_q8(const float* x, int K, Q8ActC& out) {
 }
 
 void quantize_act_q8_range(const float* x, int g0, int g1, Q8ActC& out) {
+    quantize_act_q8_raw(x, g0, g1, out.q.data(), out.ds.data());
+}
+
+void quantize_act_q8_raw(const float* x, int g0, int g1, int8_t* qout, float* dsout) {
     static int perm[64];
     static bool init = [] { for (int n = 0; n < 64; ++n) perm[n] = q8_perm(n); return true; }();
     (void)init;
@@ -44,11 +48,11 @@ void quantize_act_q8_range(const float* x, int g0, int g1, Q8ActC& out) {
             dsub[c] = _mm_cvtss_f32(m4) / 127.f;
             ssub[c] = _mm_cvtss_f32(s4);
         }
-        out.ds[4 * g] = dsub[0];
-        out.ds[4 * g + 1] = dsub[1];
-        out.ds[4 * g + 2] = ssub[0];
-        out.ds[4 * g + 3] = ssub[1];
-        if (!(dsub[0] > 0.f) && !(dsub[1] > 0.f)) std::memset(out.q.data() + (size_t)g * 64, 0, 64);
+        dsout[4 * g] = dsub[0];
+        dsout[4 * g + 1] = dsub[1];
+        dsout[4 * g + 2] = ssub[0];
+        dsout[4 * g + 3] = ssub[1];
+        if (!(dsub[0] > 0.f) && !(dsub[1] > 0.f)) std::memset(qout + (size_t)g * 64, 0, 64);
         else {
             // zero sub-group: divide by 1 (all inputs are 0 there)
             const __m256 d0 = _mm256_set1_ps(dsub[0] > 0.f ? dsub[0] : 1.f), d1 = _mm256_set1_ps(dsub[1] > 0.f ? dsub[1] : 1.f);
@@ -64,7 +68,7 @@ void quantize_act_q8_range(const float* x, int g0, int g1, Q8ActC& out) {
             const __m256i fix = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
             _mm256_store_si256((__m256i*)nat, _mm256_permutevar8x32_epi32(a, fix));
             _mm256_store_si256((__m256i*)(nat + 32), _mm256_permutevar8x32_epi32(b, fix));
-            int8_t* o = out.q.data() + (size_t)g * 64;
+            int8_t* o = qout + (size_t)g * 64;
             for (int n = 0; n < 64; ++n) o[perm[n]] = nat[n];
         }
     }
@@ -114,19 +118,11 @@ inline void plane1(const uint32_t* p, int off, int sh, __m256i& lo, __m256i& hi)
     hi = _mm256_slli_epi16(hi, sh);
 }
 
-// int32x8 partial dot of one 64-weight group (p = first word of the group, 2*BITS words).
+// Rebuild the 64 q bytes of one group (p = first word, 2*BITS words) as two byte vectors that pair with the activation
+// halves (xlo, xhi). BITS != 8 only (q <= 63).
 template <int BITS>
-inline __m256i dot_group(const uint32_t* p, __m256i xlo, __m256i xhi) {
-    const __m256i ones = _mm256_set1_epi16(1);
-    __m256i lo, hi;
-    if constexpr (BITS == 8) {
-        __m256i alo, ahi, blo, bhi;
-        plane4<8>(p, 0, alo, ahi);
-        plane4<8>(p, 4, blo, bhi);
-        __m256i sa = _mm256_madd_epi16(_mm256_add_epi16(_mm256_maddubs_epi16(alo, xlo), _mm256_maddubs_epi16(ahi, xhi)), ones);
-        __m256i sb = _mm256_madd_epi16(_mm256_add_epi16(_mm256_maddubs_epi16(blo, xlo), _mm256_maddubs_epi16(bhi, xhi)), ones);
-        return _mm256_add_epi32(sa, _mm256_slli_epi32(sb, 4));
-    } else if constexpr (BITS == 4) {
+inline void unpack_group(const uint32_t* p, __m256i& lo, __m256i& hi) {
+    if constexpr (BITS == 4) {
         plane4<4>(p, 0, lo, hi);
     } else if constexpr (BITS == 6) {
         __m256i l2, h2;
@@ -149,9 +145,26 @@ inline __m256i dot_group(const uint32_t* p, __m256i xlo, __m256i xhi) {
     } else {  // 2
         plane2<2>(p, 0, 0, lo, hi);
     }
-    // q <= 63: pair sums (<=16002) and the add of two (<=32004) fit in int16 without saturation.
-    __m256i s = _mm256_add_epi16(_mm256_maddubs_epi16(lo, xlo), _mm256_maddubs_epi16(hi, xhi));
-    return _mm256_madd_epi16(s, ones);
+}
+
+// int32x8 partial dot of one 64-weight group (p = first word of the group, 2*BITS words).
+template <int BITS>
+inline __m256i dot_group(const uint32_t* p, __m256i xlo, __m256i xhi) {
+    const __m256i ones = _mm256_set1_epi16(1);
+    if constexpr (BITS == 8) {
+        __m256i alo, ahi, blo, bhi;
+        plane4<8>(p, 0, alo, ahi);
+        plane4<8>(p, 4, blo, bhi);
+        __m256i sa = _mm256_madd_epi16(_mm256_add_epi16(_mm256_maddubs_epi16(alo, xlo), _mm256_maddubs_epi16(ahi, xhi)), ones);
+        __m256i sb = _mm256_madd_epi16(_mm256_add_epi16(_mm256_maddubs_epi16(blo, xlo), _mm256_maddubs_epi16(bhi, xhi)), ones);
+        return _mm256_add_epi32(sa, _mm256_slli_epi32(sb, 4));
+    } else {
+        __m256i lo, hi;
+        unpack_group<BITS>(p, lo, hi);
+        // q <= 63: pair sums (<=16002) and the add of two (<=32004) fit in int16 without saturation.
+        __m256i s = _mm256_add_epi16(_mm256_maddubs_epi16(lo, xlo), _mm256_maddubs_epi16(hi, xhi));
+        return _mm256_madd_epi16(s, ones);
+    }
 }
 
 inline float hsum(__m256 v) {
@@ -201,6 +214,140 @@ void rows_kernel(const QMatC& W, const Q8ActC& x, float* y, int r0) {
         y[r0 + r] = hsum(accf[r]) + _mm_cvtss_f32(accm[r]);
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Batched GEMM. Loop nest per claimed row block (RB rows, one thread):
+//   for K chunk (KCG groups):  unpack RB rows x KCG groups -> int8 buffer (once)
+//     for token tile (TB tokens): for row tile (RT rows): load acc, run KCG groups, store acc
+// Accumulators (fp32 x8 lanes per (row, token)) live in a per-thread array between chunks; the weight-min term
+// sum_g min[n,g]*xsum[t,g] is added at the end.
+#ifndef QV_GEMM_TB
+#define QV_GEMM_TB 2
+#endif
+#ifndef QV_GEMM_RT
+#define QV_GEMM_RT 4
+#endif
+constexpr int kRT = QV_GEMM_RT;  // rows per register tile
+#ifndef QV_GEMM_RB
+#define QV_GEMM_RB 16
+#endif
+#ifndef QV_GEMM_TP
+#define QV_GEMM_TP 64
+#endif
+constexpr int kRB = QV_GEMM_RB;  // rows per claimed block
+constexpr int kTP = QV_GEMM_TP;  // tokens per panel
+constexpr int kKCG = 16;  // 64-groups per K chunk (1024 weights)
+constexpr int kTB = QV_GEMM_TB;
+
+template <int RT, int TB>
+inline void tile_kernel(const int8_t* wb, size_t wrow, const float* sc, size_t scrow, const int8_t* xq, size_t xqrow,
+                        const float* dv, size_t dvrow, float* acc, size_t accrow, int ng) {
+    __m256 a[RT][TB];
+    for (int r = 0; r < RT; ++r)
+        for (int t = 0; t < TB; ++t) a[r][t] = _mm256_loadu_ps(acc + r * accrow + t * 8);
+    const __m256i ones = _mm256_set1_epi16(1);
+    for (int g = 0; g < ng; ++g) {
+        __m256i wlo[RT], whi[RT];
+        __m256 s[RT];
+        for (int r = 0; r < RT; ++r) {
+            wlo[r] = _mm256_load_si256((const __m256i*)(wb + r * wrow + 64 * g));
+            whi[r] = _mm256_load_si256((const __m256i*)(wb + r * wrow + 64 * g + 32));
+            s[r] = _mm256_broadcast_ss(sc + r * scrow + g);
+        }
+        for (int t = 0; t < TB; ++t) {
+            const __m256i xlo = _mm256_loadu_si256((const __m256i*)(xq + t * xqrow + 64 * g));
+            const __m256i xhi = _mm256_loadu_si256((const __m256i*)(xq + t * xqrow + 64 * g + 32));
+            const __m256 d = _mm256_loadu_ps(dv + t * dvrow + 8 * g);
+            for (int r = 0; r < RT; ++r) {
+                const __m256i p = _mm256_add_epi16(_mm256_maddubs_epi16(wlo[r], xlo), _mm256_maddubs_epi16(whi[r], xhi));
+                a[r][t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(p, ones)), _mm256_mul_ps(d, s[r]), a[r][t]);
+            }
+        }
+    }
+    for (int r = 0; r < RT; ++r)
+        for (int t = 0; t < TB; ++t) _mm256_storeu_ps(acc + r * accrow + t * 8, a[r][t]);
+}
+
+template <int RT, int TB>
+inline void tile_dispatch(int tn, const int8_t* wb, size_t wrow, const float* sc, size_t scrow, const int8_t* xq, size_t xqrow,
+                          const float* dv, size_t dvrow, float* acc, size_t accrow, int ng) {
+    if (tn == TB) tile_kernel<RT, TB>(wb, wrow, sc, scrow, xq, xqrow, dv, dvrow, acc, accrow, ng);
+    else if constexpr (TB > 1) tile_dispatch<RT, TB - 1>(tn, wb, wrow, sc, scrow, xq, xqrow, dv, dvrow, acc, accrow, ng);
+}
+
+template <int RT>
+inline void tile_tokens(const int8_t* wb, size_t wrow, const float* sc, size_t scrow, const Q8Batch& X, int t0, int tn,
+                        int g0, int ng, float* acc, size_t accrow) {
+    const size_t xqrow = (size_t)X.K, dvrow = (size_t)X.G * 8;
+    const int8_t* xq = X.q.data() + (size_t)t0 * xqrow + 64 * (size_t)g0;
+    const float* dv = X.dv8.data() + (size_t)t0 * dvrow + 8 * (size_t)g0;
+    tile_dispatch<RT, kTB>(tn, wb, wrow, sc, scrow, xq, xqrow, dv, dvrow, acc, accrow, ng);
+}
+
+template <int BITS>
+void gemm_block(const QMatC& W, const Q8Batch& X, int T, float* Y, size_t ldy, int r0, int nr) {
+    const int G = W.K / 64;
+    const size_t rw = W.row_words();
+    alignas(64) static thread_local int8_t wb[kRB * kKCG * 64];
+    static thread_local std::vector<float> accv, scv, mnv;
+    scv.resize((size_t)nr * G);
+    mnv.resize((size_t)nr * G);
+    for (int r = 0; r < nr; ++r) {
+        const uint16_t* sp = W.sm + (size_t)(r0 + r) * G * 2;
+        for (int g = 0; g < G; ++g) {
+            scv[(size_t)r * G + g] = _cvtsh_ss(sp[2 * g]);
+            mnv[(size_t)r * G + g] = _cvtsh_ss(sp[2 * g + 1]);
+        }
+    }
+    // Token panels of kTP tokens bound the accumulator array (nr x kTP x 8 fp32) and the working set of the activation
+    // chunk; the weight rows are re-unpacked per panel (~1-3% of the MAC work for kTP=64).
+    for (int tp0 = 0; tp0 < T; tp0 += kTP) {
+        const int tpn = T - tp0 < kTP ? T - tp0 : kTP;
+        const size_t accrow = (size_t)tpn * 8;
+        accv.assign((size_t)nr * tpn * 8, 0.f);
+        for (int g0 = 0; g0 < G; g0 += kKCG) {
+            const int ng = G - g0 < kKCG ? G - g0 : kKCG;
+            for (int r = 0; r < nr; ++r) {
+                const uint32_t* p = W.q + (size_t)(r0 + r) * rw + (size_t)g0 * 2 * BITS;
+                for (int g = 0; g < ng; ++g) {
+                    __m256i lo, hi;
+                    unpack_group<BITS>(p + (size_t)g * 2 * BITS, lo, hi);
+                    _mm256_store_si256((__m256i*)(wb + ((size_t)r * kKCG + g) * 64), lo);
+                    _mm256_store_si256((__m256i*)(wb + ((size_t)r * kKCG + g) * 64 + 32), hi);
+                }
+            }
+            for (int tl = 0; tl < tpn; tl += kTB) {
+                const int tn = tpn - tl < kTB ? tpn - tl : kTB;
+                int r = 0;
+                for (; r + kRT <= nr; r += kRT)
+                    tile_tokens<kRT>(wb + (size_t)r * kKCG * 64, (size_t)kKCG * 64, scv.data() + (size_t)r * G + g0, G, X,
+                                     tp0 + tl, tn, g0, ng, accv.data() + r * accrow + tl * 8, accrow);
+                for (; r < nr; ++r)
+                    tile_tokens<1>(wb + (size_t)r * kKCG * 64, (size_t)kKCG * 64, scv.data() + (size_t)r * G + g0, G, X,
+                                   tp0 + tl, tn, g0, ng, accv.data() + r * accrow + tl * 8, accrow);
+            }
+        }
+        // epilogue: horizontal sum + weight-min term
+        for (int tl = 0; tl < tpn; ++tl) {
+            const int t = tp0 + tl;
+            const float* xs = X.xs.data() + (size_t)t * G;
+            for (int r = 0; r < nr; ++r) {
+                const float* mn = mnv.data() + (size_t)r * G;
+                __m256 m = _mm256_setzero_ps();
+                int g = 0;
+                for (; g + 8 <= G; g += 8) m = _mm256_fmadd_ps(_mm256_loadu_ps(mn + g), _mm256_loadu_ps(xs + g), m);
+                float tail = 0.f;
+                for (; g < G; ++g) tail += mn[g] * xs[g];
+                Y[(size_t)t * ldy + r0 + r] = hsum(_mm256_loadu_ps(accv.data() + r * accrow + (size_t)tl * 8)) + hsum(m) + tail;
+            }
+        }
+    }
+}
+
+template <int BITS>
+void gemm_bits(const QMatC& W, const Q8Batch& X, int T, float* Y, size_t ldy, int row0, int row1) {
+    for (int r = row0; r < row1; r += kRB) gemm_block<BITS>(W, X, T, Y, ldy, r, row1 - r < kRB ? row1 - r : kRB);
+}
+
 template <int BITS>
 void gemv_bits(const QMatC& W, const Q8ActC& x, float* y, int row0, int row1) {
     int r = row0;
@@ -226,6 +373,48 @@ void gemv_q_par(ThreadPool& pool, const QMatC& W, const Q8ActC& x, float* y) {
     // dynamic chunks of 16 rows (a multiple of the 4-row kernel block): robust to preempted threads
     pool.parallel_for_dyn(
         (size_t)W.N, [&](size_t b, size_t e, int) { gemv_q(W, x, y, (int)b, (int)e); }, 16);
+}
+
+void Q8Batch::quantize_row(int t, const float* x, int kuse) {
+    const int Gu = kuse / 64;
+    quantize_act_q8_raw(x, 0, Gu, q.data() + (size_t)t * K, ds.data() + (size_t)t * G * 4);
+    const float* d = ds.data() + (size_t)t * G * 4;
+    float* o = dv8.data() + (size_t)t * G * 8;
+    float* s = xs.data() + (size_t)t * G;
+    for (int g = 0; g < Gu; ++g) {
+        for (int i = 0; i < 4; ++i) { o[8 * g + i] = d[4 * g]; o[8 * g + 4 + i] = d[4 * g + 1]; }
+        s[g] = d[4 * g + 2] + d[4 * g + 3];
+    }
+}
+
+void gemm_q(const QMatC& W, const Q8Batch& X, int T, float* Y, size_t ldy, int row0, int row1) {
+    if (T <= 0) return;
+    switch (W.bits) {
+        case 2: gemm_bits<2>(W, X, T, Y, ldy, row0, row1); break;
+        case 3: gemm_bits<3>(W, X, T, Y, ldy, row0, row1); break;
+        case 4: gemm_bits<4>(W, X, T, Y, ldy, row0, row1); break;
+        case 5: gemm_bits<5>(W, X, T, Y, ldy, row0, row1); break;
+        case 6: gemm_bits<6>(W, X, T, Y, ldy, row0, row1); break;
+        case 8: {  // q up to 255 needs the two-nibble-plane dot: reuse the GEMV kernel token by token (not optimized)
+            Q8ActC a;
+            a.K = X.K;
+            a.q.resize((size_t)X.K);
+            a.ds.resize((size_t)X.G * 4);
+            std::vector<float> y((size_t)W.N);
+            for (int t = 0; t < T; ++t) {
+                std::memcpy(a.q.data(), X.q.data() + (size_t)t * X.K, X.K);
+                std::memcpy(a.ds.data(), X.ds.data() + (size_t)t * X.G * 4, (size_t)X.G * 16);
+                gemv_q(W, a, y.data(), row0, row1);
+                for (int r = row0; r < row1; ++r) Y[(size_t)t * ldy + r] = y[r];
+            }
+            break;
+        }
+        default: break;
+    }
+}
+
+void gemm_q_par(ThreadPool& pool, const QMatC& W, const Q8Batch& X, int T, float* Y, size_t ldy) {
+    pool.parallel_for_dyn((size_t)W.N, [&](size_t b, size_t e, int) { gemm_q(W, X, T, Y, ldy, (int)b, (int)e); }, kRB);
 }
 
 }  // namespace qv::cpu

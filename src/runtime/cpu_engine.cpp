@@ -49,6 +49,13 @@ struct Prof { double ns[P_N] = {}; long steps = 0; };
 #define QV_PHASE(ph) ((void)0)
 #endif
 
+// batched-prefill phase timers (wall time of each parallel region; always on, ~50 clock reads per layer-chunk)
+enum PPhase { PP_EMBED, PP_NORMQ, PP_QKV, PP_ZPROJ, PP_AB, PP_CONV, PP_GDN, PP_ATT_PREP, PP_ATT, PP_QMIX, PP_OUT, PP_GATE, PP_UP,
+              PP_ACT, PP_DOWN, PP_RESID, PP_HEAD, PP_N };
+const char* kPPName[PP_N] = {"embed+rope tables", "rmsnorm+quantize", "gemm qkv / q,k,v", "gemm z", "alpha/beta dense", "conv1d",
+                             "gdn recurrence", "attn prep (norm,rope,kv)", "attn scores+softmax+pv", "attn merge+quant",
+                             "gemm out-proj", "gemm gate", "gemm up", "silu*mul+quantize", "gemm down", "residual add", "head"};
+
 // fp16 dense row dot (F16C + FMA), K % 8 == 0
 float dot_f16(const uint16_t* w, const float* x, int K) {
     __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
@@ -127,6 +134,13 @@ class CpuEngine final : public Engine {
                              prof_.ns[i] / prof_.steps / 1e6, 100.0 * prof_.ns[i] / tot);
         }
 #endif
+        if (pp_steps_ && std::getenv("QV_PREFILL_PROF")) {
+            double tot = 0;
+            for (double v : pp_ns_) tot += v;
+            std::fprintf(stderr, "[prefill-prof] %ld tokens in %.1f ms (timed phases)\n", pp_steps_, tot / 1e6);
+            for (int i = 0; i < PP_N; ++i)
+                std::fprintf(stderr, "[prefill-prof]   %-30s %9.1f ms  (%4.1f%%)\n", kPPName[i], pp_ns_[i] / 1e6, 100.0 * pp_ns_[i] / tot);
+        }
         if (map_) { if (owned_) std::free(map_); else munmap(map_, map_len_); }
         std::free(k_cache_);
         std::free(v_cache_);
@@ -139,11 +153,16 @@ class CpuEngine final : public Engine {
 
     void prefill(const int* tokens, int T, int pos0) override {
         if (pos0 + T > opt_.max_ctx) throw std::runtime_error("context overflow");
-        for (int t = 0; t < T; ++t) {
-            const bool need = opt_.dump_hidden || t == T - 1;
-            forward(tokens[t], pos0 + t, need);
-            if (opt_.dump_hidden) logits_all_.insert(logits_all_.end(), logits_.begin(), logits_.end());
+        if (T <= 0) return;
+        if (std::getenv("QV_PREFILL_STEP")) {  // reference path: token-by-token (identical to step())
+            for (int t = 0; t < T; ++t) {
+                const bool need = opt_.dump_hidden || t == T - 1;
+                forward(tokens[t], pos0 + t, need);
+                if (opt_.dump_hidden) logits_all_.insert(logits_all_.end(), logits_.begin(), logits_.end());
+            }
+            return;
         }
+        prefill_batched(tokens, T, pos0);
     }
 
     void decode_greedy(int first, int start_pos, int n, std::vector<int>& out, bool) override {
@@ -186,6 +205,8 @@ class CpuEngine final : public Engine {
     EngineOptions opt_;
     ThreadPool pool_;
     Prof prof_;
+    double pp_ns_[PP_N] = {};
+    long pp_steps_ = 0;
     void* map_ = nullptr;
     size_t map_len_ = 0;
     const char* base_ = nullptr;
@@ -425,6 +446,238 @@ class CpuEngine final : public Engine {
     }
 
     void dump() { hidden_.insert(hidden_.end(), x_.begin(), x_.end()); }
+
+    // ---------------------------------------------------------------- batched prefill
+    // Chunk of Tc tokens flows through the layers together: projections use gemm_q (each weight tile unpacked once, applied
+    // to all tokens of the chunk), elementwise/quantize steps are parallel over tokens, the GDN recurrence is sequential over
+    // tokens but parallel over v-heads, attention is causal over (cache + chunk) and parallel over (kv head, token).
+    struct PB {  // chunk scratch
+        int Tc = 0;
+        std::vector<float> x, xn, qkv, conv, z, al, be, mix, qg, kb, vb, qr, part, g, u, tmp, rope;
+        Q8Batch xq, xqmix, xqact;
+    } pb_;
+
+    template <class F>
+    void timed(PPhase ph, F&& f) {
+        const auto t0 = std::chrono::steady_clock::now();
+        f();
+        pp_ns_[ph] += std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count();
+    }
+    template <class F>
+    void par_tok(int Tn, size_t grain, F&& f) {  // f(t_begin, t_end)
+        pool_.parallel_for_dyn((size_t)Tn, [&](size_t b, size_t e, int) { f((int)b, (int)e); }, grain);
+    }
+    bool diag_gemv_ = std::getenv("QV_DIAG_GEMV") != nullptr;  // debug: per-token gemv_q instead of gemm_q
+    void gemm(const QMatC& W, const Q8Batch& xb, int Tn, float* y) {
+        if (!diag_gemv_) { gemm_q_par(pool_, W, xb, Tn, y, (size_t)W.N); return; }
+        Q8ActC a; a.K = xb.K; a.q.resize(xb.K); a.ds.resize((size_t)xb.G * 4);
+        std::vector<float> row(W.N);
+        for (int t = 0; t < Tn; ++t) {
+            std::memcpy(a.q.data(), xb.q.data() + (size_t)t * xb.K, xb.K);
+            std::memcpy(a.ds.data(), xb.ds.data() + (size_t)t * xb.G * 4, (size_t)xb.G * 16);
+            gemv_q_par(pool_, W, a, y + (size_t)t * W.N);
+        }
+    }
+
+    void pb_alloc(int Tc) {
+        const Config& c = cfg_;
+        if (pb_.Tc >= Tc) return;
+        const int conv_C = 2 * c.lin_k_heads * c.lin_k_dim + c.lin_v_heads * c.lin_v_dim;
+        const int VD = c.lin_v_heads * c.lin_v_dim, QD = c.n_heads * c.head_dim, KVD = c.n_kv_heads * c.head_dim;
+        const size_t T = Tc;
+        pb_.Tc = Tc;
+        pb_.x.assign(T * c.hidden, 0.f); pb_.xn.assign(T * c.hidden, 0.f); pb_.tmp.assign(T * c.hidden, 0.f);
+        pb_.qkv.assign(T * conv_C, 0.f); pb_.conv.assign(T * conv_C, 0.f); pb_.z.assign(T * VD, 0.f);
+        pb_.al.assign(T * c.lin_v_heads, 0.f); pb_.be.assign(T * c.lin_v_heads, 0.f);
+        pb_.mix.assign(T * std::max(VD, QD), 0.f);
+        pb_.qg.assign(T * 2 * QD, 0.f); pb_.kb.assign(T * KVD, 0.f); pb_.vb.assign(T * KVD, 0.f); pb_.qr.assign(T * QD, 0.f);
+        pb_.part.assign(T * attn_part_floats(c.n_heads, 1, c.head_dim), 0.f);
+        pb_.g.assign(T * c.inter, 0.f); pb_.u.assign(T * c.inter, 0.f);
+        pb_.rope.assign(T * c.rope_dim, 0.f);
+        pb_.xq.resize(Tc, c.hidden);
+        pb_.xqmix.resize(Tc, std::max(VD, QD));
+        pb_.xqact.resize(Tc, c.inter);
+    }
+
+    void prefill_batched(const int* tokens, int T, int pos0) {
+        const Config& c = cfg_;
+        const int H = c.hidden, NL = (int)layers_.size();
+        int Tc = 256;  // default when the caller did not set EngineOptions::prefill_chunk (qv_run: 256 for cpu)
+        if (const char* e = std::getenv("QV_CPU_PREFILL_CHUNK")) Tc = std::max(1, std::atoi(e));
+        else if (opt_.prefill_chunk > 0) Tc = opt_.prefill_chunk;
+        Tc = std::min(Tc, T);
+        pb_alloc(Tc);
+        const size_t dump_tok0 = opt_.dump_hidden ? hidden_.size() / ((size_t)(NL + 1) * H) : 0;
+        if (opt_.dump_hidden) {
+            hidden_.resize((dump_tok0 + T) * (size_t)(NL + 1) * H);
+            logits_all_.resize((dump_tok0 + T) * (size_t)c.vocab);
+        }
+        pp_steps_ += T;
+        for (int c0 = 0; c0 < T; c0 += Tc) {
+            const int Tn = std::min(Tc, T - c0);
+            const int p0 = pos0 + c0;
+            float* X = pb_.x.data();
+            timed(PP_EMBED, [&] {
+                par_tok(Tn, 4, [&](int b, int e) {
+                    for (int t = b; t < e; ++t) {
+                        embed_row(embed_, tokens[c0 + t], X + (size_t)t * H);
+                        attn_rope_table(p0 + t, inv_freq_.data(), c.rope_dim, pb_.rope.data() + (size_t)t * c.rope_dim);
+                        if (opt_.dump_hidden)
+                            std::memcpy(hidden_.data() + ((dump_tok0 + c0 + t) * (size_t)(NL + 1)) * H, X + (size_t)t * H, H * 4);
+                    }
+                });
+            });
+            for (int li = 0; li < NL; ++li) {
+                const Layer& L = layers_[li];
+                pb_norm_quant(L.in_norm, Tn);
+                if (!L.attn) pb_gdn(L, Tn); else pb_attn(L, Tn, p0);
+                pb_norm_quant(L.post_norm, Tn);
+                timed(PP_GATE, [&] { gemm(L.gate, pb_.xq, Tn, pb_.g.data()); });
+                timed(PP_UP, [&] { gemm(L.up, pb_.xq, Tn, pb_.u.data()); });
+                timed(PP_ACT, [&] {
+                    par_tok(Tn, 1, [&](int b, int e) {
+                        for (int t = b; t < e; ++t) {
+                            float* g = pb_.g.data() + (size_t)t * c.inter;
+                            silu_mul_range(g, pb_.u.data() + (size_t)t * c.inter, g, 0, c.inter);
+                            pb_.xqact.quantize_row(t, g, c.inter);
+                        }
+                    });
+                });
+                timed(PP_DOWN, [&] { gemm(L.down, pb_.xqact, Tn, pb_.tmp.data()); });
+                pb_residual(Tn);
+                if (opt_.dump_hidden)
+                    for (int t = 0; t < Tn; ++t)
+                        std::memcpy(hidden_.data() + ((dump_tok0 + c0 + t) * (size_t)(NL + 1) + li + 1) * H, X + (size_t)t * H, H * 4);
+            }
+            if (opt_.dump_hidden) {  // logits of every token
+                pb_norm_quant(final_norm_, Tn);
+                timed(PP_HEAD, [&] { gemm_q_par(pool_, head_, pb_.xq, Tn, logits_all_.data() + (dump_tok0 + c0) * (size_t)c.vocab, (size_t)c.vocab); });
+                if (c0 + Tn == T)
+                    std::memcpy(logits_.data(), logits_all_.data() + (dump_tok0 + T - 1) * (size_t)c.vocab, (size_t)c.vocab * 4);
+            } else if (c0 + Tn == T) {  // logits of the last token only (GEMV path, bandwidth-bound but a single token)
+                timed(PP_HEAD, [&] {
+                    std::memcpy(x_.data(), X + (size_t)(Tn - 1) * H, H * 4);
+                    norm_quant(final_norm_);
+                    jobs_.push_back(qjob(head_, xq_, logits_.data(), xn_.data()));
+                    run_jobs();
+                });
+            }
+        }
+    }
+
+    void pb_norm_quant(const float* w, int Tn) {
+        timed(PP_NORMQ, [&] {
+            const int H = cfg_.hidden;
+            par_tok(Tn, 1, [&](int b, int e) {
+                for (int t = b; t < e; ++t) {
+                    rmsnorm(pb_.x.data() + (size_t)t * H, w, pb_.xn.data() + (size_t)t * H, H, cfg_.eps);
+                    pb_.xq.quantize_row(t, pb_.xn.data() + (size_t)t * H, H);
+                }
+            });
+        });
+    }
+    void pb_residual(int Tn) {
+        timed(PP_RESID, [&] {
+            const int H = cfg_.hidden;
+            par_tok(Tn, 4, [&](int b, int e) { add_range(pb_.x.data() + (size_t)b * H, pb_.tmp.data() + (size_t)b * H, pb_.x.data() + (size_t)b * H, 0, (e - b) * H); });
+        });
+    }
+
+    void pb_gdn(const Layer& L, int Tn) {
+        const Config& c = cfg_;
+        const GdnLayer& g = L.g;
+        const int H = c.hidden, C = g.qkv.N, Hv = c.lin_v_heads, dv = c.lin_v_dim, VD = Hv * dv;
+        const int mld = pb_.xqmix.K;
+        timed(PP_QKV, [&] { gemm(g.qkv, pb_.xq, Tn, pb_.qkv.data()); });
+        timed(PP_ZPROJ, [&] { gemm(g.z, pb_.xq, Tn, pb_.z.data()); });
+        timed(PP_AB, [&] {
+            par_tok(Tn, 2, [&](int b, int e) {
+                for (int t = b; t < e; ++t) {
+                    const float* xn = pb_.xn.data() + (size_t)t * H;
+                    for (int r = 0; r < g.a_rows; ++r) pb_.al[(size_t)t * Hv + r] = dot_f16(g.a + (size_t)r * H, xn, H);
+                    for (int r = 0; r < g.b_rows; ++r) pb_.be[(size_t)t * Hv + r] = dot_f16(g.b + (size_t)r * H, xn, H);
+                }
+            });
+        });
+        float* cs = conv_state_.data() + (size_t)L.idx_kind * C * 3;
+        timed(PP_CONV, [&] {  // causal conv: sequential over tokens, parallel over channel blocks
+            pool_.parallel_for_dyn((size_t)C, [&](size_t b, size_t e, int) {
+                for (int t = 0; t < Tn; ++t)
+                    conv_step_range(pb_.qkv.data() + (size_t)t * C, g.conv_w, cs, pb_.conv.data() + (size_t)t * C, (int)b, (int)e);
+            }, 128);
+        });
+        timed(PP_GDN, [&] {  // delta-rule recurrence: sequential over tokens, parallel over v-heads
+            float* st = gdn_state_.data() + (size_t)L.idx_kind * Hv * c.lin_k_dim * dv;
+            pool_.parallel_for_dyn((size_t)Hv, [&](size_t b, size_t e, int) {
+                for (int t = 0; t < Tn; ++t) {
+                    GdnArgs a{pb_.conv.data() + (size_t)t * C, pb_.al.data() + (size_t)t * Hv, pb_.be.data() + (size_t)t * Hv, g.A_neg,
+                              g.dt_bias, pb_.z.data() + (size_t)t * VD, g.norm_w, st, pb_.mix.data() + (size_t)t * mld,
+                              c.lin_k_heads, Hv, c.lin_k_dim, dv, c.eps};
+                    gdn_step_range(a, (int)b, (int)e);
+                }
+            }, 1);
+        });
+        pb_mix_out(g.out, Tn, VD);
+    }
+
+    // quantize mix rows (first kuse columns) -> out-projection -> residual
+    void pb_mix_out(const QMatC& Wo, int Tn, int kuse) {
+        const int mld = pb_.xqmix.K;
+        timed(PP_QMIX, [&] {
+            par_tok(Tn, 1, [&](int b, int e) { for (int t = b; t < e; ++t) pb_.xqmix.quantize_row(t, pb_.mix.data() + (size_t)t * mld, kuse); });
+        });
+        timed(PP_OUT, [&] { gemm(Wo, pb_.xqmix, Tn, pb_.tmp.data()); });
+        pb_residual(Tn);
+    }
+
+    void pb_attn(const Layer& L, int Tn, int p0) {
+        const Config& c = cfg_;
+        const AttnLayer& at = L.at;
+        const int Hq = c.n_heads, Hkv = c.n_kv_heads, D = c.head_dim, QD = Hq * D, KVD = Hkv * D, mld = pb_.xqmix.K;
+        timed(PP_QKV, [&] {
+            gemm(at.q, pb_.xq, Tn, pb_.qg.data());
+            gemm(at.k, pb_.xq, Tn, pb_.kb.data());
+            gemm(at.v, pb_.xq, Tn, pb_.vb.data());
+        });
+        const size_t kv_layer = (size_t)Hkv * opt_.max_ctx * D;
+        float* kc = k_cache_ + L.idx_kind * kv_layer;
+        float* vc = v_cache_ + L.idx_kind * kv_layer;
+        timed(PP_ATT_PREP, [&] {
+            const int per = Hq + Hkv;
+            pool_.parallel_for_dyn((size_t)Tn * per, [&](size_t b, size_t e, int) {
+                for (size_t w = b; w < e; ++w) {
+                    const int t = (int)(w / per), it = (int)(w % per);
+                    AttnPrepArgs p{pb_.qg.data() + (size_t)t * 2 * QD, pb_.kb.data() + (size_t)t * KVD, pb_.vb.data() + (size_t)t * KVD,
+                                   at.q_norm, at.k_norm, pb_.rope.data() + (size_t)t * c.rope_dim, pb_.qr.data() + (size_t)t * QD, kc, vc,
+                                   Hq, Hkv, D, c.rope_dim, opt_.max_ctx, p0 + t, c.eps};
+                    attn_prep_range(p, it, it + 1);
+                }
+            }, 8);
+        });
+        const size_t pf = attn_part_floats(Hq, 1, D);
+        auto targs = [&](int t) {
+            return AttnDecodeArgs{pb_.qr.data() + (size_t)t * QD, pb_.qg.data() + (size_t)t * 2 * QD, kc, vc, pb_.part.data() + (size_t)t * pf,
+                                  pb_.mix.data() + (size_t)t * mld, Hq, Hkv, D, opt_.max_ctx, p0 + t + 1, 1};
+        };
+        timed(PP_ATT, [&] {  // item = (kv head, token); kv-head-major so one head's K/V stays cache-resident; causal keys per token
+            pool_.parallel_for_dyn((size_t)Hkv * Tn, [&](size_t b, size_t e, int) {
+                for (size_t w = b; w < e; ++w) {
+                    const int g = (int)(w / Tn), t = (int)(w % Tn);
+                    attn_decode_range(targs(t), g, g + 1);
+                }
+            }, 2);
+        });
+        timed(PP_QMIX, [&] {
+            par_tok(Tn, 1, [&](int b, int e) {
+                for (int t = b; t < e; ++t) {
+                    attn_merge_range(targs(t), 0, Hq);
+                    pb_.xqmix.quantize_row(t, pb_.mix.data() + (size_t)t * mld, QD);
+                }
+            });
+        });
+        timed(PP_OUT, [&] { gemm(at.o, pb_.xqmix, Tn, pb_.tmp.data()); });
+        pb_residual(Tn);
+    }
 
     // ---------------------------------------------------------------- one token
     void forward(int token, int pos, bool want_logits) {
