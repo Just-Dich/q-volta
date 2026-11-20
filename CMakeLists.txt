@@ -23,6 +23,7 @@ target_include_directories(qv_core PUBLIC include)
 add_library(qv_cuda STATIC
   src/backends/cuda/kernels/gemv.cu
   src/backends/cuda/kernels/gemv_q8.cu
+  src/backends/cuda/kernels/dequant.cu
   src/backends/cuda/kernels/elementwise.cu
   src/backends/cuda/recurrent/gdn.cu
   src/backends/cuda/attention/attn.cu
@@ -46,3 +47,7 @@ add_executable(test_gemv_multi tests/test_gemv_multi.cu)
 target_link_libraries(test_gemv_multi PRIVATE qv_cuda)
 target_compile_options(test_gemv_multi PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-gpu-targets>)
 add_test(NAME gemv_multi COMMAND test_gemv_multi)
+add_executable(test_dequant tests/test_dequant.cu)
+target_link_libraries(test_dequant PRIVATE qv_cuda)
+target_compile_options(test_dequant PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-gpu-targets>)
+add_test(NAME dequant COMMAND test_dequant)
