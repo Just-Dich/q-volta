@@ -1,0 +1,45 @@
+{
+  "label": "b0-mtp-r1",
+  "rows": [
+    {
+      "kind": "code",
+      "ttft": 0.19775185734033585,
+      "elapsed": 1.3916442631743848,
+      "timings": {
+        "cache_n": 0,
+        "draft_n": 98,
+        "draft_n_accepted": 94,
+        "predicted_ms": 1192.702269,
+        "predicted_n": 128,
+        "predicted_per_second": 106.48089074776466,
+        "predicted_per_token_ms": 9.391356448818897,
+        "prompt_ms": 132.225078,
+        "prompt_n": 37,
+        "prompt_per_second": 279.8258890042024,
+        "prompt_per_token_ms": 3.5736507567567566
+      },
+      "text": "```python\ndef binary_search(arr, target):\n    left, right = 0, len(arr) - 1\n    while left <= right:\n        mid = (left + right) // 2\n        if arr[mid] == target:\n            return mid\n        elif arr[mid] < target:\n            left = mid + 1\n        else:\n            right = mid - 1\n    return -1\n\n# Пример вызова\nprint(binary_search([1, 3, 5, 7, 9], 5))  # Вывод: 2\n```",
+      "error": null
+    },
+    {
+      "kind": "prose",
+      "ttft": 0.1686730468645692,
+      "elapsed": 2.0105420537292957,
+      "timings": {
+        "cache_n": 0,
+        "draft_n": 153,
+        "draft_n_accepted": 76,
+        "predicted_ms": 1840.803492,
+        "predicted_n": 128,
+        "predicted_per_second": 68.99161184337866,
+        "predicted_per_token_ms": 14.49451568503937,
+        "prompt_ms": 138.33479200000002,
+        "prompt_n": 47,
+        "prompt_per_second": 339.75545356659075,
+        "prompt_per_token_ms": 2.9432934468085112
+      },
+      "text": "Представь, что Земля — это не просто шар, который крутится вокруг Солнца, а **наклоненный мяч**.\n\nВот простое объяснение того, почему у нас меняются времена года:\n\n### 1. Наклон оси (главная причина)\nЗемля вращается вокруг своей воображаемой оси (как волчок). Но эта ось **не стоит вертикально** (перпендикулярно к орбите), а наклонена примерно на **23,5 градуса**.\n\n*   Если бы ось была строго вертикальной, все точки Земли получали бы одинаковое",
+      "error": null
+    }
+  ]
+}

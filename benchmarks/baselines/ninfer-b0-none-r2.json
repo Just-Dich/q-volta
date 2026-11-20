@@ -1,0 +1,41 @@
+{
+  "label": "b0-none-r2",
+  "rows": [
+    {
+      "kind": "code",
+      "ttft": 0.16562907211482525,
+      "elapsed": 2.967045546043664,
+      "timings": {
+        "cache_n": 0,
+        "predicted_ms": 2801.083157,
+        "predicted_n": 128,
+        "predicted_per_second": 45.33960360392114,
+        "predicted_per_token_ms": 22.05577288976378,
+        "prompt_ms": 128.000872,
+        "prompt_n": 37,
+        "prompt_per_second": 289.0605307751341,
+        "prompt_per_token_ms": 3.4594830270270265
+      },
+      "text": "```python\ndef binary_search(arr, target):\n    left, right = 0, len(arr) - 1\n    while left <= right:\n        mid = (left + right) // 2\n        if arr[mid] == target:\n            return mid\n        elif arr[mid] < target:\n            left = mid + 1\n        else:\n            right = mid - 1\n    return -1\n\n# Пример вызова\nprint(binary_search([1, 3, 5, 7, 9], 5))  # Вывод: 2\n```",
+      "error": null
+    },
+    {
+      "kind": "prose",
+      "ttft": 0.1364775588735938,
+      "elapsed": 2.9384135040454566,
+      "timings": {
+        "cache_n": 0,
+        "predicted_ms": 2801.548097,
+        "predicted_n": 128,
+        "predicted_per_second": 45.33207912296642,
+        "predicted_per_token_ms": 22.059433834645667,
+        "prompt_ms": 133.821763,
+        "prompt_n": 47,
+        "prompt_per_second": 351.213427071649,
+        "prompt_per_token_ms": 2.8472715531914896
+      },
+      "text": "Представь, что Земля — это не просто шар, который крутится вокруг Солнца, а **наклоненный мяч**.\n\nВот простое объяснение того, почему у нас меняются времена года:\n\n### 1. Наклон оси (главная причина)\nЗемля вращается вокруг своей воображаемой оси (как волчок). Но эта ось **не стоит вертикально** (перпендикулярно к орбите), а наклонена примерно на **23,5 градуса**.\n\n*   Если бы ось была строго вертикальной, все точки Земли получали бы одинаковое",
+      "error": null
+    }
+  ]
+}
