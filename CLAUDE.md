@@ -56,3 +56,7 @@ Env switches: `QV_GEMV=fp32` (A/B the fp32 GEMV path), `QV_GEMV_CFG=R,W` (force 
 - Every optimisation: test_gemv / check_golden must pass; log in ~/autoresearch-runs/q-volta/EXPERIMENTS.md.
 - Never report unmeasured numbers. No CPU offload in GPU benchmarks.
 - The strata service was stopped to free the V100 (restart: `cd /workspace/strata-v100/dashboard && sh watchdog.sh start`).
+
+## Research gen1 (2026-11-20) — see ~/autoresearch-runs/q-volta/PLAN.md
+Order after GPU frees: B0 re-run NInfer on this V100 (same protocol) -> per-kernel profile -> P1/P2 chunked prefill (52 tok/s now) -> N1/N2 decode (merged GDN GEMV, graph side streams)
+-> Q1/Q3/Q2 quant quality (ours +12% ppl vs NInfer +0.3%) -> MTP rows M1..M7. Quality is a co-metric; MTP target is compared on identical workloads (NInfer 100.4 was one code sample).
