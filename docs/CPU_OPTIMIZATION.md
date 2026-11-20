@@ -31,5 +31,5 @@ group-64 layout with a 36 B group, not the real Q-Volta bit-plane layout (that k
 
 ## Consequences for the plan
 - CPU decode target: approach 55 GB/s of weight reads => ~4 tok/s with E0 weights; use 16-32 pinned threads, not 64.
-- GDN state traffic (48 x 144 MiB read+write per token) competes for the same bandwidth; being measured (branch p4/cpuops).
+- GDN state traffic is small: 3 MiB per layer (48x128x128 fp32), 144 MiB per token over 48 layers (288 MiB read+write); measured ~6.4 ms/token at 48 threads (~3% of a 250 ms token). Earlier draft of this doc wrongly said 144 MiB per layer.
 - Using CPU weights in parallel with the GPU is pointless: 55 GB/s is ~6% of V100 HBM and both would fight for host RAM.
