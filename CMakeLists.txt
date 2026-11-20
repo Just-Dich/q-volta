@@ -36,7 +36,6 @@ target_include_directories(qv_cuda PUBLIC include)
 target_link_libraries(qv_cuda PUBLIC qv_core CUDA::cublas)
 target_compile_options(qv_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${QV_CUDA_FLAGS}>)
 
-add_subdirectory(src/backends/cpu)  # CPU backend: qv_cpu + test_cpu_gemv + bench_cpu_gemv (no CUDA needed)
 
 add_executable(qv_run tools/qv_run.cpp)
 target_link_libraries(qv_run PRIVATE qv_cuda CUDA::cudart)
