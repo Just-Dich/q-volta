@@ -39,6 +39,7 @@ add_library(qv_cuda STATIC
   src/backends/cuda/recurrent/gdn_seq.cu
   src/backends/cuda/attention/attn.cu
   src/backends/cuda/attention/attn_seq.cu
+  src/backends/cuda/attention/attn_seq_tc.cu
   src/runtime/cuda_engine.cu)
 target_include_directories(qv_cuda PUBLIC include)
 target_link_libraries(qv_cuda PUBLIC qv_core CUDA::cublas)
@@ -65,6 +66,9 @@ add_executable(test_dequant tests/test_dequant.cu)
 target_link_libraries(test_dequant PRIVATE qv_cuda)
 target_compile_options(test_dequant PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-gpu-targets>)
 add_test(NAME dequant COMMAND test_dequant)
+add_executable(bench_attn_seq tests/bench_attn_seq.cu)
+target_link_libraries(bench_attn_seq PRIVATE qv_cuda)
+target_compile_options(bench_attn_seq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-gpu-targets>)
 add_executable(test_attn_seq tests/test_attn_seq.cu)
 target_link_libraries(test_attn_seq PRIVATE qv_cuda)
 target_compile_options(test_attn_seq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-gpu-targets>)
