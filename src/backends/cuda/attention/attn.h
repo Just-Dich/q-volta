@@ -1,6 +1,7 @@
 #pragma once
 #include "../common.cuh"
 #include "../kernels/gemv.h"
+#include "kv4.h"
 
 namespace qv::cuda {
 
@@ -19,6 +20,7 @@ struct AttnPrepArgs {
     float eps;
     // nt > 1 (MTP verify): nt rows in one launch, row y reads/writes at +y*stride (floats); per-row positions pos[y]
     int nt = 1, qg_stride = 0, k_stride = 0, q_stride = 0;
+    Kv4Layer kv4{};  // kv4.blocks != nullptr: write the fp16 ring (+ quantize completed blocks) instead of k_cache/v_cache
 };
 
 struct AttnDecodeArgs {
@@ -39,12 +41,14 @@ struct AttnDecodeArgs {
     // nt > 1: nt rows in one launch (row z: q/qg/out + z*stride, pos[z], part + z*part_stride, q8 rows of q8_k elements)
     int nt = 1, q_stride = 0, qg_stride = 0, out_stride = 0, q8_k = 0;
     size_t part_stride = 0;
+    Kv4Layer kv4{};  // kv4.blocks != nullptr: int4 KV (k_cache/v_cache unused)
 };
 
 constexpr int ATTN_MAX_SPLITS = 80;  // default; total CTAs = n_kv_heads * max_splits
 
 void attn_prep(const AttnPrepArgs& a, cudaStream_t s);  // for nt > 1 all rows' K/V are written before any row attends
 void attn_decode(const AttnDecodeArgs& a, cudaStream_t s);      // split-K if a.part, else reference
+void attn_split_kv4(const AttnDecodeArgs& a, cudaStream_t s);   // split-K partials for the int4 KV (attn_kv4.cu)
 void attn_decode_ref(const AttnDecodeArgs& a, cudaStream_t s);  // original one-block-per-head kernel (uses a.scores)
 
 }  // namespace qv::cuda

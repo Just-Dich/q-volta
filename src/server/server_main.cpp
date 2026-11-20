@@ -656,6 +656,7 @@ void usage_exit() {
 
 int main(int argc, char** argv) {
     Options o;
+    int kv_mode = 0, kv4_kmode = 0;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { if (i + 1 >= argc) { std::fprintf(stderr, "missing value for %s\n", a.c_str()); usage_exit(); } return argv[++i]; };
@@ -664,6 +665,8 @@ int main(int argc, char** argv) {
             else if (a == "--backend") o.backend = next();
             else if (a == "--threads") o.threads = std::stoi(next());
             else if (a == "--max-ctx") o.max_ctx = std::stoi(next());
+            else if (a == "--kv") { std::string v = next(); if (v == "int4") kv_mode = 1; else if (v == "fp16") kv_mode = 2; else if (v == "fp32") kv_mode = 0; else { std::fprintf(stderr, "--kv fp32|fp16|int4\n"); return 2; } }
+            else if (a == "--kv4-kmode") kv4_kmode = next() == "token" ? 1 : 0;
             else if (a == "--host") o.host = next();
             else if (a == "--port") o.port = std::stoi(next());
             else if (a == "--api-key") o.api_key = next();
@@ -712,6 +715,8 @@ int main(int argc, char** argv) {
     if (backend != "cpu" && backend != "cuda") usage_exit();
     qv::EngineOptions eo;
     eo.max_ctx = o.max_ctx;
+    eo.kv_mode = kv_mode;      // CUDA backend only (0 fp32, 1 int4, 2 fp16)
+    eo.kv4_kmode = kv4_kmode;
     eo.threads = o.threads > 0 ? o.threads : (int)std::min(32u, std::max(1u, std::thread::hardware_concurrency()));
     app->chunk = o.prefill_chunk > 0 ? o.prefill_chunk : (backend == "cpu" ? 256 : 2048);
     eo.prefill_chunk = app->chunk;

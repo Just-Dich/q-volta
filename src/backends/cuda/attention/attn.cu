@@ -33,15 +33,22 @@ __global__ void __launch_bounds__(D) qk_prep_kernel(AttnPrepArgs a) {
     if (is_q) {
         a.q_out[h * D + t] = y;
     } else {
-        size_t off = ((size_t)h * a.max_ctx + pos) * D + t;
-        a.k_cache[off] = y;
-        a.v_cache[off] = a.v[h * D + t];
+        if (a.kv4.blocks) {
+            const size_t ro = ((size_t)h * a.kv4.ring_n + kv4_slot(a.kv4, pos)) * D + t;
+            a.kv4.ring_k[ro] = __float2half(fminf(fmaxf(y, -65504.f), 65504.f));
+            a.kv4.ring_v[ro] = __float2half(fminf(fmaxf(a.v[h * D + t], -65504.f), 65504.f));
+        } else {
+            size_t off = ((size_t)h * a.max_ctx + pos) * D + t;
+            a.k_cache[off] = y;
+            a.v_cache[off] = a.v[h * D + t];
+        }
     }
 }
 
 void attn_prep(const AttnPrepArgs& a, cudaStream_t s) {
     if (a.head_dim != 256) { std::fprintf(stderr, "attn: head_dim 256 only\n"); std::abort(); }
     qk_prep_kernel<256><<<dim3(a.n_heads + a.n_kv_heads, a.nt), 256, 0, s>>>(a);
+    if (a.kv4.blocks) kv4_quant_decode(a.kv4, a.n_kv_heads, a.pos, a.nt, s);
 }
 
 // One block per q head; scores kept in a global scratch row [n_heads][max_ctx].
@@ -115,6 +122,9 @@ __device__ __forceinline__ int sk_chunk(int n, int S) {
     int c = (n + S - 1) / S;
     return c < SK_MIN_CHUNK ? SK_MIN_CHUNK : c;
 }
+
+// int4 KV: splits own whole 64-key blocks (attn_kv4.cu uses the same rule)
+__device__ __forceinline__ int sk4_chunk(int n, int S) { return (((n + 63) / 64 + S - 1) / S) * 64; }
 
 template <int D>
 __global__ void __launch_bounds__(D) attn_split_kernel(AttnDecodeArgs a) {
@@ -233,7 +243,7 @@ __global__ void __launch_bounds__(D) attn_combine_kernel(AttnDecodeArgs a, int S
     if (a.q8.q) { a.q8.q += (size_t)blockIdx.y * (a.q8_k >> 2); a.q8.d += (size_t)blockIdx.y * (a.q8_k >> 5);
                   a.q8.sum += (size_t)blockIdx.y * (a.q8_k >> 5); a.q8.qsum += (size_t)blockIdx.y * (a.q8_k >> 5); }
     const int n = *a.pos + 1;
-    const int chunk = sk_chunk(n, S);
+    const int chunk = a.kv4.blocks ? sk4_chunk(n, S) : sk_chunk(n, S);
     const int ns = min(S, (n + chunk - 1) / chunk);  // splits that own at least one key (>= 1)
     const float* ml = a.part + (size_t)a.n_heads * S * D + (size_t)h * S * 2;
     const float* pa = a.part + (size_t)h * S * D + t;
@@ -258,7 +268,8 @@ void attn_decode(const AttnDecodeArgs& a, cudaStream_t s) {
         std::fprintf(stderr, "attn_decode: split-K needs n_heads == 6*n_kv_heads and max_splits >= 1\n");
         std::abort();
     }
-    attn_split_kernel<256><<<dim3(a.n_kv_heads, a.max_splits, a.nt), 256, 0, s>>>(a);
+    if (a.kv4.blocks) attn_split_kv4(a, s);
+    else attn_split_kernel<256><<<dim3(a.n_kv_heads, a.max_splits, a.nt), 256, 0, s>>>(a);
     attn_combine_kernel<256><<<dim3(a.n_heads, a.nt), 256, 0, s>>>(a, a.max_splits);
 }
 

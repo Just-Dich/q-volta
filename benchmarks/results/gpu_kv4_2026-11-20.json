@@ -1,0 +1,2362 @@
+{
+ "date": "2026-11-20",
+ "branch": "p9/kv4",
+ "base_commit": "832c32b",
+ "hypothesis": "H-A int4 KV cache (PLAN.md Gen 6)",
+ "gpu": "Tesla V100-SXM2-16GB device 0 (shared with other jobs; timed runs under flock /tmp/qv_bench.lock + idle check)",
+ "model": "Qwen3.8-27B E0 (12.63 GiB), kv modes: fp32 (default) | fp16 (full-length fp16 ring, no quantization) | int4",
+ "layout": {
+  "block_tokens": 64,
+  "record_bytes": 18432,
+  "bits_per_element": 4.5,
+  "bytes_per_token_16_layers": 18432,
+  "fp16_window_tokens": "128..191",
+  "ring_slots": 256,
+  "k_modes": [
+   "channel (KIVI-style, per-channel over 64 tokens)",
+   "token (groups of 64 channels per token)"
+  ],
+  "v_mode": "per-token groups of 64 channels"
+ },
+ "tests": {
+  "test_attn_kv4": "PASS (3 modes x 12 lengths; int4 vs fp32 rel L2 2e-4..2.5e-2 (channel), <=3.7e-2 (token), fp16 1e-4; decode vs prefill kernel 3e-7..1e-6; multi-chunk identical; nt=3 verify bit-identical)",
+  "test_cuda_mtp_int4": "PASS depth 1,3 (K channel) and depth 3 (K token): prompts of 14/37/120/4088 tokens, 96 generated; ids and final logits identical to plain greedy on the same int4 cache",
+  "ctest_fp32_path": "attn_seq, attn_decode_split, gdn_seq, dequant, gemv_multi, gemv pass"
+ },
+ "quality": {
+  "protocol": "wikitext-2 test text first N tokens, teacher-forced prefill (chunk 2048), reference = same engine with fp32 KV; KL over the reference top-1024 + lumped tail bucket (mean tail mass 0.76-0.80%)",
+  "rows": [
+   {
+    "mode": "write",
+    "kv": "fp32",
+    "kmode": "channel",
+    "tokens": 4088,
+    "scored": 4087,
+    "ppl": 6.25671,
+    "mean_nll": 1.833655,
+    "seconds": 45.1
+   },
+   {
+    "mode": "cmp",
+    "kv": "int4",
+    "kmode": "channel",
+    "tokens": 4088,
+    "scored": 4087,
+    "ppl": 6.25369,
+    "mean_nll": 1.833172,
+    "ref_ppl": 6.25671,
+    "kl_topk_mean": 0.000828,
+    "top1_agree": 0.9865,
+    "ref_tail_mass_mean": 0.007649,
+    "seconds": 40.2
+   },
+   {
+    "mode": "cmp",
+    "kv": "int4",
+    "kmode": "token",
+    "tokens": 4088,
+    "scored": 4087,
+    "ppl": 6.26047,
+    "mean_nll": 1.834255,
+    "ref_ppl": 6.25671,
+    "kl_topk_mean": 0.001222,
+    "top1_agree": 0.9848,
+    "ref_tail_mass_mean": 0.007649,
+    "seconds": 41.1
+   },
+   {
+    "mode": "cmp",
+    "kv": "fp16",
+    "kmode": "channel",
+    "tokens": 4088,
+    "scored": 4087,
+    "ppl": 6.25691,
+    "mean_nll": 1.833686,
+    "ref_ppl": 6.25671,
+    "kl_topk_mean": 8e-06,
+    "top1_agree": 0.9988,
+    "ref_tail_mass_mean": 0.007649,
+    "seconds": 39.8
+   },
+   {
+    "mode": "write",
+    "kv": "fp32",
+    "kmode": "channel",
+    "tokens": 8192,
+    "scored": 8191,
+    "ppl": 6.87934,
+    "mean_nll": 1.928523,
+    "seconds": 92.8
+   },
+   {
+    "mode": "cmp",
+    "kv": "int4",
+    "kmode": "channel",
+    "tokens": 8192,
+    "scored": 8191,
+    "ppl": 6.88072,
+    "mean_nll": 1.928723,
+    "ref_ppl": 6.87934,
+    "kl_topk_mean": 0.00079,
+    "top1_agree": 0.9875,
+    "ref_tail_mass_mean": 0.007973,
+    "seconds": 70.6
+   },
+   {
+    "mode": "cmp",
+    "kv": "int4",
+    "kmode": "token",
+    "tokens": 8192,
+    "scored": 8191,
+    "ppl": 6.88534,
+    "mean_nll": 1.929395,
+    "ref_ppl": 6.87934,
+    "kl_topk_mean": 0.001307,
+    "top1_agree": 0.9839,
+    "ref_tail_mass_mean": 0.007973,
+    "seconds": 57.4
+   },
+   {
+    "mode": "cmp",
+    "kv": "fp16",
+    "kmode": "channel",
+    "tokens": 8192,
+    "scored": 8191,
+    "ppl": 6.87919,
+    "mean_nll": 1.928501,
+    "ref_ppl": 6.87934,
+    "kl_topk_mean": 8e-06,
+    "top1_agree": 0.9982,
+    "ref_tail_mass_mean": 0.007973,
+    "seconds": 56.0
+   }
+  ]
+ },
+ "niah_single": {
+  "fp32_4096": {
+   "correct": 6,
+   "total": 6,
+   "prefill_s_mean": 4.8,
+   "rows": [
+    {
+     "file": "p_4096_0.10_0.i32",
+     "depth": 0.1,
+     "key": "17412",
+     "answer": "17412<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 4.57
+    },
+    {
+     "file": "p_4096_0.10_1.i32",
+     "depth": 0.1,
+     "key": "22004",
+     "answer": "22004<|im_end|>\n<|endoftext|><|im_start|><|im_end|>\n<|im_start|>user\nThe user",
+     "ok": true,
+     "prefill_s": 4.62
+    },
+    {
+     "file": "p_4096_0.50_0.i32",
+     "depth": 0.5,
+     "key": "21124",
+     "answer": "21124<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 4.76
+    },
+    {
+     "file": "p_4096_0.50_1.i32",
+     "depth": 0.5,
+     "key": "57324",
+     "answer": "57324<|im_end|>\n<|endoftext|><|im_start|><|im_end|>\n<|im_start|>user\nWhat is",
+     "ok": true,
+     "prefill_s": 4.85
+    },
+    {
+     "file": "p_4096_0.90_0.i32",
+     "depth": 0.9,
+     "key": "32162",
+     "answer": "32162<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 4.97
+    },
+    {
+     "file": "p_4096_0.90_1.i32",
+     "depth": 0.9,
+     "key": "97782",
+     "answer": "97782<|im_end|>\n<|endoftext|><|im_start|><|im_end|>\n<|im_start|>user\nWhat is",
+     "ok": true,
+     "prefill_s": 4.96
+    }
+   ]
+  },
+  "fp32_8192": {
+   "correct": 6,
+   "total": 6,
+   "prefill_s_mean": 10.8,
+   "rows": [
+    {
+     "file": "p_8192_0.10_0.i32",
+     "depth": 0.1,
+     "key": "50388",
+     "answer": "50388<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 10.35
+    },
+    {
+     "file": "p_8192_0.10_1.i32",
+     "depth": 0.1,
+     "key": "42975",
+     "answer": "42975<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n",
+     "ok": true,
+     "prefill_s": 10.8
+    },
+    {
+     "file": "p_8192_0.50_0.i32",
+     "depth": 0.5,
+     "key": "89422",
+     "answer": "89422<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 10.93
+    },
+    {
+     "file": "p_8192_0.50_1.i32",
+     "depth": 0.5,
+     "key": "37815",
+     "answer": "37815<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|>user",
+     "ok": true,
+     "prefill_s": 11.02
+    },
+    {
+     "file": "p_8192_0.90_0.i32",
+     "depth": 0.9,
+     "key": "89534",
+     "answer": "89534<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 10.95
+    },
+    {
+     "file": "p_8192_0.90_1.i32",
+     "depth": 0.9,
+     "key": "14683",
+     "answer": "14683<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|>user",
+     "ok": true,
+     "prefill_s": 10.99
+    }
+   ]
+  },
+  "fp32_16384": {
+   "correct": 6,
+   "total": 6,
+   "prefill_s_mean": 25.8,
+   "rows": [
+    {
+     "file": "p_16384_0.10_0.i32",
+     "depth": 0.1,
+     "key": "86179",
+     "answer": "86179<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|>user\n",
+     "ok": true,
+     "prefill_s": 25.19
+    },
+    {
+     "file": "p_16384_0.10_1.i32",
+     "depth": 0.1,
+     "key": "99292",
+     "answer": "99292<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|>user",
+     "ok": true,
+     "prefill_s": 25.95
+    },
+    {
+     "file": "p_16384_0.50_0.i32",
+     "depth": 0.5,
+     "key": "30759",
+     "answer": "30759<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|>user\n",
+     "ok": true,
+     "prefill_s": 25.97
+    },
+    {
+     "file": "p_16384_0.50_1.i32",
+     "depth": 0.5,
+     "key": "66448",
+     "answer": "66448<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|>user",
+     "ok": true,
+     "prefill_s": 25.91
+    },
+    {
+     "file": "p_16384_0.90_0.i32",
+     "depth": 0.9,
+     "key": "93685",
+     "answer": "93685<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 26.04
+    },
+    {
+     "file": "p_16384_0.90_1.i32",
+     "depth": 0.9,
+     "key": "61581",
+     "answer": "61581<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|>user",
+     "ok": true,
+     "prefill_s": 25.89
+    }
+   ]
+  },
+  "fp16_4096": {
+   "correct": 6,
+   "total": 6,
+   "prefill_s_mean": 4.2,
+   "rows": [
+    {
+     "file": "p_4096_0.10_0.i32",
+     "depth": 0.1,
+     "key": "17412",
+     "answer": "17412<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 4.18
+    },
+    {
+     "file": "p_4096_0.10_1.i32",
+     "depth": 0.1,
+     "key": "22004",
+     "answer": "22004<|im_end|>\n<|endoftext|><|im_start|><|im_end|>\n<|im_start|>user\nThe user",
+     "ok": true,
+     "prefill_s": 4.08
+    },
+    {
+     "file": "p_4096_0.50_0.i32",
+     "depth": 0.5,
+     "key": "21124",
+     "answer": "21124<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 4.09
+    },
+    {
+     "file": "p_4096_0.50_1.i32",
+     "depth": 0.5,
+     "key": "57324",
+     "answer": "57324<|im_end|>\n<|endoftext|><|im_start|><|im_end|>\n<|im_start|>user\nWhat is",
+     "ok": true,
+     "prefill_s": 4.18
+    },
+    {
+     "file": "p_4096_0.90_0.i32",
+     "depth": 0.9,
+     "key": "32162",
+     "answer": "32162<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 4.31
+    },
+    {
+     "file": "p_4096_0.90_1.i32",
+     "depth": 0.9,
+     "key": "97782",
+     "answer": "97782<|im_end|>\n<|endoftext|><|im_start|><|im_end|>\n<|im_start|>user\nWhat is",
+     "ok": true,
+     "prefill_s": 4.37
+    }
+   ]
+  },
+  "fp16_8192": {
+   "correct": 6,
+   "total": 6,
+   "prefill_s_mean": 10.0,
+   "rows": [
+    {
+     "file": "p_8192_0.10_0.i32",
+     "depth": 0.1,
+     "key": "50388",
+     "answer": "50388<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 9.46
+    },
+    {
+     "file": "p_8192_0.10_1.i32",
+     "depth": 0.1,
+     "key": "42975",
+     "answer": "42975<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n",
+     "ok": true,
+     "prefill_s": 9.93
+    },
+    {
+     "file": "p_8192_0.50_0.i32",
+     "depth": 0.5,
+     "key": "89422",
+     "answer": "89422<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 10.11
+    },
+    {
+     "file": "p_8192_0.50_1.i32",
+     "depth": 0.5,
+     "key": "37815",
+     "answer": "37815<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|>user",
+     "ok": true,
+     "prefill_s": 10.17
+    },
+    {
+     "file": "p_8192_0.90_0.i32",
+     "depth": 0.9,
+     "key": "89534",
+     "answer": "89534<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 10.31
+    },
+    {
+     "file": "p_8192_0.90_1.i32",
+     "depth": 0.9,
+     "key": "14683",
+     "answer": "14683<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 10.27
+    }
+   ]
+  },
+  "fp16_16384": {
+   "correct": 6,
+   "total": 6,
+   "prefill_s_mean": 24.8,
+   "rows": [
+    {
+     "file": "p_16384_0.10_0.i32",
+     "depth": 0.1,
+     "key": "86179",
+     "answer": "86179<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 23.38
+    },
+    {
+     "file": "p_16384_0.10_1.i32",
+     "depth": 0.1,
+     "key": "99292",
+     "answer": "99292<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|>user",
+     "ok": true,
+     "prefill_s": 24.65
+    },
+    {
+     "file": "p_16384_0.50_0.i32",
+     "depth": 0.5,
+     "key": "30759",
+     "answer": "30759<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|>",
+     "ok": true,
+     "prefill_s": 25.05
+    },
+    {
+     "file": "p_16384_0.50_1.i32",
+     "depth": 0.5,
+     "key": "66448",
+     "answer": "66448<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|>user",
+     "ok": true,
+     "prefill_s": 25.19
+    },
+    {
+     "file": "p_16384_0.90_0.i32",
+     "depth": 0.9,
+     "key": "93685",
+     "answer": "93685<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|>",
+     "ok": true,
+     "prefill_s": 25.26
+    },
+    {
+     "file": "p_16384_0.90_1.i32",
+     "depth": 0.9,
+     "key": "61581",
+     "answer": "61581<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|>user",
+     "ok": true,
+     "prefill_s": 25.24
+    }
+   ]
+  },
+  "fp16_32768": {
+   "correct": 6,
+   "total": 6,
+   "prefill_s_mean": 67.6,
+   "rows": [
+    {
+     "file": "p_32768_0.10_0.i32",
+     "depth": 0.1,
+     "key": "76724",
+     "answer": "76724<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 66.16
+    },
+    {
+     "file": "p_32768_0.10_1.i32",
+     "depth": 0.1,
+     "key": "58766",
+     "answer": "58766<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|><think>",
+     "ok": true,
+     "prefill_s": 68.32
+    },
+    {
+     "file": "p_32768_0.50_0.i32",
+     "depth": 0.5,
+     "key": "81326",
+     "answer": "81326<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|><think>\n",
+     "ok": true,
+     "prefill_s": 68.62
+    },
+    {
+     "file": "p_32768_0.50_1.i32",
+     "depth": 0.5,
+     "key": "68307",
+     "answer": "68307<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|>",
+     "ok": true,
+     "prefill_s": 68.5
+    },
+    {
+     "file": "p_32768_0.90_0.i32",
+     "depth": 0.9,
+     "key": "75806",
+     "answer": "75806<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|>user\n",
+     "ok": true,
+     "prefill_s": 66.02
+    },
+    {
+     "file": "p_32768_0.90_1.i32",
+     "depth": 0.9,
+     "key": "45158",
+     "answer": "45158<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|><think>",
+     "ok": true,
+     "prefill_s": 68.2
+    }
+   ]
+  },
+  "int4_4096": {
+   "correct": 6,
+   "total": 6,
+   "prefill_s_mean": 4.5,
+   "rows": [
+    {
+     "file": "p_4096_0.10_0.i32",
+     "depth": 0.1,
+     "key": "17412",
+     "answer": "17412<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 4.25
+    },
+    {
+     "file": "p_4096_0.10_1.i32",
+     "depth": 0.1,
+     "key": "22004",
+     "answer": "22004<|im_end|>\n<|endoftext|><|im_start|><|im_end|>\n<|im_start|>user\nThe user",
+     "ok": true,
+     "prefill_s": 4.36
+    },
+    {
+     "file": "p_4096_0.50_0.i32",
+     "depth": 0.5,
+     "key": "21124",
+     "answer": "21124<|im_end|>\n<|endoftext|><|im_start|>system\nYou are a helpful assistant",
+     "ok": true,
+     "prefill_s": 4.55
+    },
+    {
+     "file": "p_4096_0.50_1.i32",
+     "depth": 0.5,
+     "key": "57324",
+     "answer": "57324<|im_end|>\n<|endoftext|><|im_start|><|im_end|>\n<|im_start|>user\nWhat is",
+     "ok": true,
+     "prefill_s": 4.62
+    },
+    {
+     "file": "p_4096_0.90_0.i32",
+     "depth": 0.9,
+     "key": "32162",
+     "answer": "32162<|im_end|>\n<|endoftext|><|im_start|>assistant\n<|im_end|>\n<|im_start|>user\n",
+     "ok": true,
+     "prefill_s": 4.66
+    },
+    {
+     "file": "p_4096_0.90_1.i32",
+     "depth": 0.9,
+     "key": "97782",
+     "answer": "97782<|im_end|>\n<|endoftext|><|im_start|><|im_end|>\n<|im_start|>user\nWhat is",
+     "ok": true,
+     "prefill_s": 4.7
+    }
+   ]
+  },
+  "int4_8192": {
+   "correct": 6,
+   "total": 6,
+   "prefill_s_mean": 10.4,
+   "rows": [
+    {
+     "file": "p_8192_0.10_0.i32",
+     "depth": 0.1,
+     "key": "50388",
+     "answer": "50388<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|>",
+     "ok": true,
+     "prefill_s": 9.81
+    },
+    {
+     "file": "p_8192_0.10_1.i32",
+     "depth": 0.1,
+     "key": "42975",
+     "answer": "42975<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|>",
+     "ok": true,
+     "prefill_s": 10.28
+    },
+    {
+     "file": "p_8192_0.50_0.i32",
+     "depth": 0.5,
+     "key": "89422",
+     "answer": "89422<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 10.41
+    },
+    {
+     "file": "p_8192_0.50_1.i32",
+     "depth": 0.5,
+     "key": "37815",
+     "answer": "37815<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|>user",
+     "ok": true,
+     "prefill_s": 10.5
+    },
+    {
+     "file": "p_8192_0.90_0.i32",
+     "depth": 0.9,
+     "key": "89534",
+     "answer": "89534<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 10.55
+    },
+    {
+     "file": "p_8192_0.90_1.i32",
+     "depth": 0.9,
+     "key": "14683",
+     "answer": "14683<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|>user",
+     "ok": true,
+     "prefill_s": 10.73
+    }
+   ]
+  },
+  "int4_16384": {
+   "correct": 6,
+   "total": 6,
+   "prefill_s_mean": 25.3,
+   "rows": [
+    {
+     "file": "p_16384_0.10_0.i32",
+     "depth": 0.1,
+     "key": "86179",
+     "answer": "86179<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n",
+     "ok": true,
+     "prefill_s": 24.08
+    },
+    {
+     "file": "p_16384_0.10_1.i32",
+     "depth": 0.1,
+     "key": "99292",
+     "answer": "99292<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|>user",
+     "ok": true,
+     "prefill_s": 25.18
+    },
+    {
+     "file": "p_16384_0.50_0.i32",
+     "depth": 0.5,
+     "key": "30759",
+     "answer": "30759<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n",
+     "ok": true,
+     "prefill_s": 25.53
+    },
+    {
+     "file": "p_16384_0.50_1.i32",
+     "depth": 0.5,
+     "key": "66448",
+     "answer": "66448<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|>user",
+     "ok": true,
+     "prefill_s": 25.56
+    },
+    {
+     "file": "p_16384_0.90_0.i32",
+     "depth": 0.9,
+     "key": "93685",
+     "answer": "93685<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 25.65
+    },
+    {
+     "file": "p_16384_0.90_1.i32",
+     "depth": 0.9,
+     "key": "61581",
+     "answer": "61581<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|>user",
+     "ok": true,
+     "prefill_s": 25.66
+    }
+   ]
+  },
+  "int4_32768": {
+   "correct": 6,
+   "total": 6,
+   "prefill_s_mean": 67.1,
+   "rows": [
+    {
+     "file": "p_32768_0.10_0.i32",
+     "depth": 0.1,
+     "key": "76724",
+     "answer": "76724<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|><think>\n",
+     "ok": true,
+     "prefill_s": 65.52
+    },
+    {
+     "file": "p_32768_0.10_1.i32",
+     "depth": 0.1,
+     "key": "58766",
+     "answer": "58766<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|><think>",
+     "ok": true,
+     "prefill_s": 68.41
+    },
+    {
+     "file": "p_32768_0.50_0.i32",
+     "depth": 0.5,
+     "key": "81326",
+     "answer": "81326<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n",
+     "ok": true,
+     "prefill_s": 68.5
+    },
+    {
+     "file": "p_32768_0.50_1.i32",
+     "depth": 0.5,
+     "key": "68307",
+     "answer": "68307<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|>",
+     "ok": true,
+     "prefill_s": 67.88
+    },
+    {
+     "file": "p_32768_0.90_0.i32",
+     "depth": 0.9,
+     "key": "75806",
+     "answer": "75806<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 65.74
+    },
+    {
+     "file": "p_32768_0.90_1.i32",
+     "depth": 0.9,
+     "key": "45158",
+     "answer": "45158<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|><think>",
+     "ok": true,
+     "prefill_s": 66.32
+    }
+   ]
+  }
+ },
+ "niah_multi_needle": {
+  "fp16_8192": {
+   "correct": 6,
+   "total": 6,
+   "prefill_s_mean": 10.3,
+   "rows": [
+    {
+     "file": "m_8192_0.i32",
+     "depth": 0.08333333333333333,
+     "key": "92014",
+     "answer": "92014<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n",
+     "ok": true,
+     "prefill_s": 9.56
+    },
+    {
+     "file": "m_8192_1.i32",
+     "depth": 0.25,
+     "key": "82041",
+     "answer": "82041<|im_end|>\n<|endoftext|><|im_start|>user\n<|im_start|>assistant\n<think>\n",
+     "ok": true,
+     "prefill_s": 10.06
+    },
+    {
+     "file": "m_8192_2.i32",
+     "depth": 0.4166666666666667,
+     "key": "15608",
+     "answer": "15608<|im_end|>\n<|endoftext|><|im_start|><|im_end|>\n<|im_start|>user\nWhat is",
+     "ok": true,
+     "prefill_s": 10.46
+    },
+    {
+     "file": "m_8192_3.i32",
+     "depth": 0.5833333333333334,
+     "key": "22773",
+     "answer": "22773<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|>",
+     "ok": true,
+     "prefill_s": 10.53
+    },
+    {
+     "file": "m_8192_4.i32",
+     "depth": 0.75,
+     "key": "55994",
+     "answer": "55994<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 10.65
+    },
+    {
+     "file": "m_8192_5.i32",
+     "depth": 0.9166666666666666,
+     "key": "81010",
+     "answer": "81010<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 10.76
+    }
+   ]
+  },
+  "fp16_16384": {
+   "correct": 6,
+   "total": 6,
+   "prefill_s_mean": 26.1,
+   "rows": [
+    {
+     "file": "m_16384_0.i32",
+     "depth": 0.08333333333333333,
+     "key": "47349",
+     "answer": "47349<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n",
+     "ok": true,
+     "prefill_s": 24.96
+    },
+    {
+     "file": "m_16384_1.i32",
+     "depth": 0.25,
+     "key": "65986",
+     "answer": "65986<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|><|im_start|><|im_start|>",
+     "ok": true,
+     "prefill_s": 26.07
+    },
+    {
+     "file": "m_16384_2.i32",
+     "depth": 0.4166666666666667,
+     "key": "76246",
+     "answer": "76246<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|>user\n",
+     "ok": true,
+     "prefill_s": 26.38
+    },
+    {
+     "file": "m_16384_3.i32",
+     "depth": 0.5833333333333334,
+     "key": "90015",
+     "answer": "90015<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|>",
+     "ok": true,
+     "prefill_s": 26.32
+    },
+    {
+     "file": "m_16384_4.i32",
+     "depth": 0.75,
+     "key": "94395",
+     "answer": "94395<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n",
+     "ok": true,
+     "prefill_s": 26.21
+    },
+    {
+     "file": "m_16384_5.i32",
+     "depth": 0.9166666666666666,
+     "key": "81883",
+     "answer": "81883<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|>",
+     "ok": true,
+     "prefill_s": 26.4
+    }
+   ]
+  },
+  "fp16_32768": {
+   "correct": 6,
+   "total": 6,
+   "prefill_s_mean": 70.4,
+   "rows": [
+    {
+     "file": "m_32768_0.i32",
+     "depth": 0.08333333333333333,
+     "key": "59350",
+     "answer": "59350<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 67.86
+    },
+    {
+     "file": "m_32768_1.i32",
+     "depth": 0.25,
+     "key": "74160",
+     "answer": "74160<|im_end|>\n<|endoftext|><|im_start|>The user is asking for the secret",
+     "ok": true,
+     "prefill_s": 71.08
+    },
+    {
+     "file": "m_32768_2.i32",
+     "depth": 0.4166666666666667,
+     "key": "51946",
+     "answer": "51946<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|><|im_start|><|im_start|>",
+     "ok": true,
+     "prefill_s": 71.18
+    },
+    {
+     "file": "m_32768_3.i32",
+     "depth": 0.5833333333333334,
+     "key": "27225",
+     "answer": "27225<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 71.22
+    },
+    {
+     "file": "m_32768_4.i32",
+     "depth": 0.75,
+     "key": "52200",
+     "answer": "52200<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|><|im_end|>\n",
+     "ok": true,
+     "prefill_s": 70.73
+    },
+    {
+     "file": "m_32768_5.i32",
+     "depth": 0.9166666666666666,
+     "key": "14444",
+     "answer": "14444<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|><|im_start|><|im_end|>",
+     "ok": true,
+     "prefill_s": 70.26
+    }
+   ]
+  },
+  "int4_8192": {
+   "correct": 6,
+   "total": 6,
+   "prefill_s_mean": 9.6,
+   "rows": [
+    {
+     "file": "m_8192_0.i32",
+     "depth": 0.08333333333333333,
+     "key": "92014",
+     "answer": "92014<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 9.17
+    },
+    {
+     "file": "m_8192_1.i32",
+     "depth": 0.25,
+     "key": "82041",
+     "answer": "82041<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|>user",
+     "ok": true,
+     "prefill_s": 9.11
+    },
+    {
+     "file": "m_8192_2.i32",
+     "depth": 0.4166666666666667,
+     "key": "15608",
+     "answer": "15608<|im_end|>\n<|endoftext|><|im_start|><|im_end|>\n<|im_start|>user\nWhat is",
+     "ok": true,
+     "prefill_s": 9.45
+    },
+    {
+     "file": "m_8192_3.i32",
+     "depth": 0.5833333333333334,
+     "key": "22773",
+     "answer": "22773<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 9.76
+    },
+    {
+     "file": "m_8192_4.i32",
+     "depth": 0.75,
+     "key": "55994",
+     "answer": "55994<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 10.1
+    },
+    {
+     "file": "m_8192_5.i32",
+     "depth": 0.9166666666666666,
+     "key": "81010",
+     "answer": "81010<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 10.19
+    }
+   ]
+  },
+  "int4_16384": {
+   "correct": 6,
+   "total": 6,
+   "prefill_s_mean": 24.6,
+   "rows": [
+    {
+     "file": "m_16384_0.i32",
+     "depth": 0.08333333333333333,
+     "key": "47349",
+     "answer": "47349<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n",
+     "ok": true,
+     "prefill_s": 22.65
+    },
+    {
+     "file": "m_16384_1.i32",
+     "depth": 0.25,
+     "key": "65986",
+     "answer": "65986<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|><|im_start|><|im_start|>",
+     "ok": true,
+     "prefill_s": 24.08
+    },
+    {
+     "file": "m_16384_2.i32",
+     "depth": 0.4166666666666667,
+     "key": "76246",
+     "answer": "76246<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 24.86
+    },
+    {
+     "file": "m_16384_3.i32",
+     "depth": 0.5833333333333334,
+     "key": "90015",
+     "answer": "90015<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 25.22
+    },
+    {
+     "file": "m_16384_4.i32",
+     "depth": 0.75,
+     "key": "94395",
+     "answer": "94395<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|>",
+     "ok": true,
+     "prefill_s": 25.33
+    },
+    {
+     "file": "m_16384_5.i32",
+     "depth": 0.9166666666666666,
+     "key": "81883",
+     "answer": "81883<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|>",
+     "ok": true,
+     "prefill_s": 25.5
+    }
+   ]
+  },
+  "int4_32768": {
+   "correct": 6,
+   "total": 6,
+   "prefill_s_mean": 68.3,
+   "rows": [
+    {
+     "file": "m_32768_0.i32",
+     "depth": 0.08333333333333333,
+     "key": "59350",
+     "answer": "59350<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 66.95
+    },
+    {
+     "file": "m_32768_1.i32",
+     "depth": 0.25,
+     "key": "74160",
+     "answer": "74160<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 68.43
+    },
+    {
+     "file": "m_32768_2.i32",
+     "depth": 0.4166666666666667,
+     "key": "51946",
+     "answer": "51946<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 68.46
+    },
+    {
+     "file": "m_32768_3.i32",
+     "depth": 0.5833333333333334,
+     "key": "27225",
+     "answer": "27225<|im_end|>\n<|endoftext|><|im_start|><|im_end|>\n<|im_start|><|im_end|>\n<|im_start|>\n",
+     "ok": true,
+     "prefill_s": 68.41
+    },
+    {
+     "file": "m_32768_4.i32",
+     "depth": 0.75,
+     "key": "52200",
+     "answer": "52200<|im_end|>\n<|endoftext|><|im_start|>assistant\n<think>\nThe user is",
+     "ok": true,
+     "prefill_s": 68.68
+    },
+    {
+     "file": "m_32768_5.i32",
+     "depth": 0.9166666666666666,
+     "key": "14444",
+     "answer": "14444<|im_end|>\n<|endoftext|><|im_start|><|im_start|><|im_start|><|im_end|>\n<|im_start|><|im_start|><|im_end|>",
+     "ok": true,
+     "prefill_s": 68.61
+    }
+   ]
+  }
+ },
+ "decode_speed": {
+  "protocol": "qv_run --decode-bench: real wikitext prefix prefill (chunk 1024), untimed warm-up (1 token plain / 8 tokens MTP), 129 timed graph-decode tokens; runs: 3 rounds at <=8K, 2 at 16K/32K, interleaved formats; MTP depth 3 1 run each",
+  "runs": [
+   {
+    "kv": "fp32",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 512,
+    "decode_pos": 513,
+    "synthetic_kv": false,
+    "prefill_ms": 620.3,
+    "prefill_tok_s": 825.4,
+    "decode_tokens": 129,
+    "decode_ms": 2476.5,
+    "decode_tok_s": 52.09,
+    "vram_used_gib": 13.628,
+    "ids_head": [
+     15717,
+     6930,
+     25385,
+     641,
+     1216,
+     995,
+     264,
+     8376
+    ]
+   },
+   {
+    "kv": "fp16",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 512,
+    "decode_pos": 513,
+    "synthetic_kv": false,
+    "prefill_ms": 614.0,
+    "prefill_tok_s": 833.9,
+    "decode_tokens": 129,
+    "decode_ms": 2487.08,
+    "decode_tok_s": 51.87,
+    "vram_used_gib": 13.587,
+    "ids_head": [
+     15717,
+     6930,
+     25385,
+     641,
+     1216,
+     995,
+     264,
+     8376
+    ]
+   },
+   {
+    "kv": "int4",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 512,
+    "decode_pos": 513,
+    "synthetic_kv": false,
+    "prefill_ms": 595.1,
+    "prefill_tok_s": 860.3,
+    "decode_tokens": 129,
+    "decode_ms": 2494.61,
+    "decode_tok_s": 51.71,
+    "vram_used_gib": 13.567,
+    "ids_head": [
+     15717,
+     6930,
+     25385,
+     641,
+     1216,
+     995,
+     264,
+     8376
+    ]
+   },
+   {
+    "kv": "fp32",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 4096,
+    "decode_pos": 4097,
+    "synthetic_kv": false,
+    "prefill_ms": 4016.6,
+    "prefill_tok_s": 1019.8,
+    "decode_tokens": 129,
+    "decode_ms": 2579.51,
+    "decode_tok_s": 50.01,
+    "vram_used_gib": 14.065,
+    "ids_head": [
+     695,
+     283,
+     283,
+     283,
+     8186,
+     2632,
+     283,
+     283
+    ]
+   },
+   {
+    "kv": "fp16",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 4096,
+    "decode_pos": 4097,
+    "synthetic_kv": false,
+    "prefill_ms": 4125.7,
+    "prefill_tok_s": 992.8,
+    "decode_tokens": 129,
+    "decode_ms": 2560.81,
+    "decode_tok_s": 50.37,
+    "vram_used_gib": 13.805,
+    "ids_head": [
+     695,
+     283,
+     283,
+     283,
+     8186,
+     2632,
+     283,
+     283
+    ]
+   },
+   {
+    "kv": "int4",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 4096,
+    "decode_pos": 4097,
+    "synthetic_kv": false,
+    "prefill_ms": 4134.9,
+    "prefill_tok_s": 990.6,
+    "decode_tokens": 129,
+    "decode_ms": 2549.75,
+    "decode_tok_s": 50.59,
+    "vram_used_gib": 13.63,
+    "ids_head": [
+     695,
+     283,
+     283,
+     283,
+     8186,
+     2632,
+     283,
+     283
+    ]
+   },
+   {
+    "kv": "fp32",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 8192,
+    "decode_pos": 8193,
+    "synthetic_kv": false,
+    "prefill_ms": 8785.6,
+    "prefill_tok_s": 932.4,
+    "decode_tokens": 129,
+    "decode_ms": 2678.25,
+    "decode_tok_s": 48.17,
+    "vram_used_gib": 14.565,
+    "ids_head": [
+     1116,
+     321,
+     7157,
+     264,
+     2702,
+     314,
+     220,
+     16
+    ]
+   },
+   {
+    "kv": "fp16",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 8192,
+    "decode_pos": 8193,
+    "synthetic_kv": false,
+    "prefill_ms": 9302.8,
+    "prefill_tok_s": 880.6,
+    "decode_tokens": 129,
+    "decode_ms": 2631.52,
+    "decode_tok_s": 49.02,
+    "vram_used_gib": 14.055,
+    "ids_head": [
+     1116,
+     321,
+     7157,
+     264,
+     2702,
+     314,
+     220,
+     16
+    ]
+   },
+   {
+    "kv": "int4",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 8192,
+    "decode_pos": 8193,
+    "synthetic_kv": false,
+    "prefill_ms": 9187.7,
+    "prefill_tok_s": 891.6,
+    "decode_tokens": 129,
+    "decode_ms": 2618.96,
+    "decode_tok_s": 49.26,
+    "vram_used_gib": 13.7,
+    "ids_head": [
+     1116,
+     321,
+     7157,
+     264,
+     2702,
+     314,
+     220,
+     16
+    ]
+   },
+   {
+    "kv": "fp32",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 16384,
+    "decode_pos": 16385,
+    "synthetic_kv": false,
+    "prefill_ms": 21104.3,
+    "prefill_tok_s": 776.3,
+    "decode_tokens": 129,
+    "decode_ms": 3009.28,
+    "decode_tok_s": 42.87,
+    "vram_used_gib": 15.565,
+    "ids_head": [
+     8032,
+     279,
+     3074,
+     554,
+     12,
+     31,
+     427,
+     54244
+    ]
+   },
+   {
+    "kv": "fp16",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 16384,
+    "decode_pos": 16385,
+    "synthetic_kv": false,
+    "prefill_ms": 22950.9,
+    "prefill_tok_s": 713.9,
+    "decode_tokens": 129,
+    "decode_ms": 2809.93,
+    "decode_tok_s": 45.91,
+    "vram_used_gib": 14.555,
+    "ids_head": [
+     8032,
+     279,
+     3074,
+     554,
+     12,
+     31,
+     427,
+     54244
+    ]
+   },
+   {
+    "kv": "int4",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 16384,
+    "decode_pos": 16385,
+    "synthetic_kv": false,
+    "prefill_ms": 22265.8,
+    "prefill_tok_s": 735.8,
+    "decode_tokens": 129,
+    "decode_ms": 2763.99,
+    "decode_tok_s": 46.67,
+    "vram_used_gib": 13.84,
+    "ids_head": [
+     8032,
+     279,
+     3074,
+     554,
+     12,
+     31,
+     427,
+     54244
+    ]
+   },
+   {
+    "kv": "fp16",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 32768,
+    "decode_pos": 32769,
+    "synthetic_kv": false,
+    "prefill_ms": 64803.9,
+    "prefill_tok_s": 505.6,
+    "decode_tokens": 129,
+    "decode_ms": 3358.89,
+    "decode_tok_s": 38.41,
+    "vram_used_gib": 15.555,
+    "ids_head": [
+     641,
+     561,
+     2859,
+     303,
+     279,
+     44798,
+     998,
+     303
+    ]
+   },
+   {
+    "kv": "int4",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 32768,
+    "decode_pos": 32769,
+    "synthetic_kv": false,
+    "prefill_ms": 64166.9,
+    "prefill_tok_s": 510.7,
+    "decode_tokens": 129,
+    "decode_ms": 3219.37,
+    "decode_tok_s": 40.07,
+    "vram_used_gib": 14.122,
+    "ids_head": [
+     641,
+     561,
+     2859,
+     303,
+     279,
+     44798,
+     998,
+     303
+    ]
+   },
+   {
+    "kv": "fp32",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 512,
+    "decode_pos": 513,
+    "synthetic_kv": false,
+    "prefill_ms": 673.1,
+    "prefill_tok_s": 760.6,
+    "decode_tokens": 129,
+    "decode_ms": 2476.11,
+    "decode_tok_s": 52.1,
+    "vram_used_gib": 13.628,
+    "ids_head": [
+     15717,
+     6930,
+     25385,
+     641,
+     1216,
+     995,
+     264,
+     8376
+    ]
+   },
+   {
+    "kv": "fp16",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 512,
+    "decode_pos": 513,
+    "synthetic_kv": false,
+    "prefill_ms": 692.9,
+    "prefill_tok_s": 739.0,
+    "decode_tokens": 129,
+    "decode_ms": 2486.47,
+    "decode_tok_s": 51.88,
+    "vram_used_gib": 13.587,
+    "ids_head": [
+     15717,
+     6930,
+     25385,
+     641,
+     1216,
+     995,
+     264,
+     8376
+    ]
+   },
+   {
+    "kv": "int4",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 512,
+    "decode_pos": 513,
+    "synthetic_kv": false,
+    "prefill_ms": 662.7,
+    "prefill_tok_s": 772.6,
+    "decode_tokens": 129,
+    "decode_ms": 2495.48,
+    "decode_tok_s": 51.69,
+    "vram_used_gib": 13.567,
+    "ids_head": [
+     15717,
+     6930,
+     25385,
+     641,
+     1216,
+     995,
+     264,
+     8376
+    ]
+   },
+   {
+    "kv": "fp32",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 4096,
+    "decode_pos": 4097,
+    "synthetic_kv": false,
+    "prefill_ms": 4101.9,
+    "prefill_tok_s": 998.6,
+    "decode_tokens": 129,
+    "decode_ms": 2579.98,
+    "decode_tok_s": 50.0,
+    "vram_used_gib": 14.065,
+    "ids_head": [
+     695,
+     283,
+     283,
+     283,
+     8186,
+     2632,
+     283,
+     283
+    ]
+   },
+   {
+    "kv": "fp16",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 4096,
+    "decode_pos": 4097,
+    "synthetic_kv": false,
+    "prefill_ms": 4284.0,
+    "prefill_tok_s": 956.1,
+    "decode_tokens": 129,
+    "decode_ms": 2560.86,
+    "decode_tok_s": 50.37,
+    "vram_used_gib": 13.805,
+    "ids_head": [
+     695,
+     283,
+     283,
+     283,
+     8186,
+     2632,
+     283,
+     283
+    ]
+   },
+   {
+    "kv": "int4",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 4096,
+    "decode_pos": 4097,
+    "synthetic_kv": false,
+    "prefill_ms": 4229.9,
+    "prefill_tok_s": 968.3,
+    "decode_tokens": 129,
+    "decode_ms": 2553.18,
+    "decode_tok_s": 50.53,
+    "vram_used_gib": 13.63,
+    "ids_head": [
+     695,
+     283,
+     283,
+     283,
+     8186,
+     2632,
+     283,
+     283
+    ]
+   },
+   {
+    "kv": "fp32",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 8192,
+    "decode_pos": 8193,
+    "synthetic_kv": false,
+    "prefill_ms": 8903.4,
+    "prefill_tok_s": 920.1,
+    "decode_tokens": 129,
+    "decode_ms": 2779.01,
+    "decode_tok_s": 46.42,
+    "vram_used_gib": 14.565,
+    "ids_head": [
+     1116,
+     321,
+     7157,
+     264,
+     2702,
+     314,
+     220,
+     16
+    ]
+   },
+   {
+    "kv": "fp16",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 8192,
+    "decode_pos": 8193,
+    "synthetic_kv": false,
+    "prefill_ms": 9482.6,
+    "prefill_tok_s": 863.9,
+    "decode_tokens": 129,
+    "decode_ms": 2710.07,
+    "decode_tok_s": 47.6,
+    "vram_used_gib": 14.055,
+    "ids_head": [
+     1116,
+     321,
+     7157,
+     264,
+     2702,
+     314,
+     220,
+     16
+    ]
+   },
+   {
+    "kv": "int4",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 8192,
+    "decode_pos": 8193,
+    "synthetic_kv": false,
+    "prefill_ms": 9352.8,
+    "prefill_tok_s": 875.9,
+    "decode_tokens": 129,
+    "decode_ms": 2676.4,
+    "decode_tok_s": 48.2,
+    "vram_used_gib": 13.7,
+    "ids_head": [
+     1116,
+     321,
+     7157,
+     264,
+     2702,
+     314,
+     220,
+     16
+    ]
+   },
+   {
+    "kv": "fp32",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 16384,
+    "decode_pos": 16385,
+    "synthetic_kv": false,
+    "prefill_ms": 21642.1,
+    "prefill_tok_s": 757.0,
+    "decode_tokens": 129,
+    "decode_ms": 3539.53,
+    "decode_tok_s": 36.45,
+    "vram_used_gib": 15.565,
+    "ids_head": [
+     8032,
+     279,
+     3074,
+     554,
+     12,
+     31,
+     427,
+     54244
+    ]
+   },
+   {
+    "kv": "fp16",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 16384,
+    "decode_pos": 16385,
+    "synthetic_kv": false,
+    "prefill_ms": 23692.8,
+    "prefill_tok_s": 691.5,
+    "decode_tokens": 129,
+    "decode_ms": 3278.67,
+    "decode_tok_s": 39.35,
+    "vram_used_gib": 14.555,
+    "ids_head": [
+     8032,
+     279,
+     3074,
+     554,
+     12,
+     31,
+     427,
+     54244
+    ]
+   },
+   {
+    "kv": "int4",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 16384,
+    "decode_pos": 16385,
+    "synthetic_kv": false,
+    "prefill_ms": 23559.3,
+    "prefill_tok_s": 695.4,
+    "decode_tokens": 129,
+    "decode_ms": 3358.74,
+    "decode_tok_s": 38.41,
+    "vram_used_gib": 13.84,
+    "ids_head": [
+     8032,
+     279,
+     3074,
+     554,
+     12,
+     31,
+     427,
+     54244
+    ]
+   },
+   {
+    "kv": "fp16",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 32768,
+    "decode_pos": 32769,
+    "synthetic_kv": false,
+    "prefill_ms": 68197.6,
+    "prefill_tok_s": 480.5,
+    "decode_tokens": 129,
+    "decode_ms": 3843.42,
+    "decode_tok_s": 33.56,
+    "vram_used_gib": 15.555,
+    "ids_head": [
+     641,
+     561,
+     2859,
+     303,
+     279,
+     44798,
+     998,
+     303
+    ]
+   },
+   {
+    "kv": "int4",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 32768,
+    "decode_pos": 32769,
+    "synthetic_kv": false,
+    "prefill_ms": 65512.0,
+    "prefill_tok_s": 500.2,
+    "decode_tokens": 129,
+    "decode_ms": 3522.05,
+    "decode_tok_s": 36.63,
+    "vram_used_gib": 14.122,
+    "ids_head": [
+     641,
+     561,
+     2859,
+     303,
+     279,
+     44798,
+     998,
+     303
+    ]
+   },
+   {
+    "kv": "fp32",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 512,
+    "decode_pos": 513,
+    "synthetic_kv": false,
+    "prefill_ms": 755.2,
+    "prefill_tok_s": 678.0,
+    "decode_tokens": 129,
+    "decode_ms": 2485.96,
+    "decode_tok_s": 51.89,
+    "vram_used_gib": 13.628,
+    "ids_head": [
+     15717,
+     6930,
+     25385,
+     641,
+     1216,
+     995,
+     264,
+     8376
+    ]
+   },
+   {
+    "kv": "fp16",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 512,
+    "decode_pos": 513,
+    "synthetic_kv": false,
+    "prefill_ms": 685.9,
+    "prefill_tok_s": 746.5,
+    "decode_tokens": 129,
+    "decode_ms": 2486.54,
+    "decode_tok_s": 51.88,
+    "vram_used_gib": 13.587,
+    "ids_head": [
+     15717,
+     6930,
+     25385,
+     641,
+     1216,
+     995,
+     264,
+     8376
+    ]
+   },
+   {
+    "kv": "int4",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 512,
+    "decode_pos": 513,
+    "synthetic_kv": false,
+    "prefill_ms": 1081.1,
+    "prefill_tok_s": 473.6,
+    "decode_tokens": 129,
+    "decode_ms": 2494.93,
+    "decode_tok_s": 51.7,
+    "vram_used_gib": 13.567,
+    "ids_head": [
+     15717,
+     6930,
+     25385,
+     641,
+     1216,
+     995,
+     264,
+     8376
+    ]
+   },
+   {
+    "kv": "fp32",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 4096,
+    "decode_pos": 4097,
+    "synthetic_kv": false,
+    "prefill_ms": 4214.9,
+    "prefill_tok_s": 971.8,
+    "decode_tokens": 129,
+    "decode_ms": 2579.59,
+    "decode_tok_s": 50.01,
+    "vram_used_gib": 14.065,
+    "ids_head": [
+     695,
+     283,
+     283,
+     283,
+     8186,
+     2632,
+     283,
+     283
+    ]
+   },
+   {
+    "kv": "fp16",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 4096,
+    "decode_pos": 4097,
+    "synthetic_kv": false,
+    "prefill_ms": 4206.6,
+    "prefill_tok_s": 973.7,
+    "decode_tokens": 129,
+    "decode_ms": 2562.65,
+    "decode_tok_s": 50.34,
+    "vram_used_gib": 13.805,
+    "ids_head": [
+     695,
+     283,
+     283,
+     283,
+     8186,
+     2632,
+     283,
+     283
+    ]
+   },
+   {
+    "kv": "int4",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 4096,
+    "decode_pos": 4097,
+    "synthetic_kv": false,
+    "prefill_ms": 4206.7,
+    "prefill_tok_s": 973.7,
+    "decode_tokens": 129,
+    "decode_ms": 2561.26,
+    "decode_tok_s": 50.37,
+    "vram_used_gib": 13.63,
+    "ids_head": [
+     695,
+     283,
+     283,
+     283,
+     8186,
+     2632,
+     283,
+     283
+    ]
+   },
+   {
+    "kv": "fp32",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 8192,
+    "decode_pos": 8193,
+    "synthetic_kv": false,
+    "prefill_ms": 8923.7,
+    "prefill_tok_s": 918.0,
+    "decode_tokens": 129,
+    "decode_ms": 2813.67,
+    "decode_tok_s": 45.85,
+    "vram_used_gib": 14.565,
+    "ids_head": [
+     1116,
+     321,
+     7157,
+     264,
+     2702,
+     314,
+     220,
+     16
+    ]
+   },
+   {
+    "kv": "fp16",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 8192,
+    "decode_pos": 8193,
+    "synthetic_kv": false,
+    "prefill_ms": 9507.5,
+    "prefill_tok_s": 861.6,
+    "decode_tokens": 129,
+    "decode_ms": 2818.37,
+    "decode_tok_s": 45.77,
+    "vram_used_gib": 14.055,
+    "ids_head": [
+     1116,
+     321,
+     7157,
+     264,
+     2702,
+     314,
+     220,
+     16
+    ]
+   },
+   {
+    "kv": "int4",
+    "kmode": "channel",
+    "mtp_depth": 0,
+    "prompt_tokens": 8192,
+    "decode_pos": 8193,
+    "synthetic_kv": false,
+    "prefill_ms": 9453.8,
+    "prefill_tok_s": 866.5,
+    "decode_tokens": 129,
+    "decode_ms": 2795.97,
+    "decode_tok_s": 46.14,
+    "vram_used_gib": 13.7,
+    "ids_head": [
+     1116,
+     321,
+     7157,
+     264,
+     2702,
+     314,
+     220,
+     16
+    ]
+   },
+   {
+    "kv": "fp32",
+    "kmode": "channel",
+    "mtp_depth": 3,
+    "prompt_tokens": 512,
+    "decode_pos": 520,
+    "synthetic_kv": false,
+    "prefill_ms": 694.4,
+    "prefill_tok_s": 737.3,
+    "decode_tokens": 129,
+    "decode_ms": 998.55,
+    "decode_tok_s": 129.19,
+    "vram_used_gib": 14.11,
+    "mtp": {
+     "cycles": 36,
+     "accepted": 100,
+     "drafted": 108,
+     "accept_rate": 0.9259
+    },
+    "ids_head": [
+     8376,
+     3364,
+     303,
+     279,
+     12069,
+     3878,
+     19594,
+     3629
+    ]
+   },
+   {
+    "kv": "int4",
+    "kmode": "channel",
+    "mtp_depth": 3,
+    "prompt_tokens": 512,
+    "decode_pos": 520,
+    "synthetic_kv": false,
+    "prefill_ms": 715.6,
+    "prefill_tok_s": 715.4,
+    "decode_tokens": 129,
+    "decode_ms": 969.19,
+    "decode_tok_s": 133.1,
+    "vram_used_gib": 14.047,
+    "mtp": {
+     "cycles": 35,
+     "accepted": 101,
+     "drafted": 105,
+     "accept_rate": 0.9619
+    },
+    "ids_head": [
+     8376,
+     3364,
+     303,
+     279,
+     12069,
+     3878,
+     19594,
+     3629
+    ]
+   },
+   {
+    "kv": "fp32",
+    "kmode": "channel",
+    "mtp_depth": 3,
+    "prompt_tokens": 4096,
+    "decode_pos": 4104,
+    "synthetic_kv": false,
+    "prefill_ms": 4212.6,
+    "prefill_tok_s": 972.3,
+    "decode_tokens": 129,
+    "decode_ms": 1515.08,
+    "decode_tok_s": 85.14,
+    "vram_used_gib": 14.581,
+    "mtp": {
+     "cycles": 50,
+     "accepted": 86,
+     "drafted": 146,
+     "accept_rate": 0.589
+    },
+    "ids_head": [
+     283,
+     283,
+     695,
+     15226,
+     28296,
+     359,
+     82,
+     15200
+    ]
+   },
+   {
+    "kv": "int4",
+    "kmode": "channel",
+    "mtp_depth": 3,
+    "prompt_tokens": 4096,
+    "decode_pos": 4104,
+    "synthetic_kv": false,
+    "prefill_ms": 4287.3,
+    "prefill_tok_s": 955.4,
+    "decode_tokens": 129,
+    "decode_ms": 1436.73,
+    "decode_tok_s": 89.79,
+    "vram_used_gib": 14.118,
+    "mtp": {
+     "cycles": 49,
+     "accepted": 87,
+     "drafted": 143,
+     "accept_rate": 0.6084
+    },
+    "ids_head": [
+     283,
+     283,
+     695,
+     15226,
+     28296,
+     359,
+     82,
+     15200
+    ]
+   },
+   {
+    "kv": "int4",
+    "kmode": "channel",
+    "mtp_depth": 3,
+    "prompt_tokens": 16384,
+    "decode_pos": 16392,
+    "synthetic_kv": false,
+    "prefill_ms": 23326.2,
+    "prefill_tok_s": 702.4,
+    "decode_tokens": 129,
+    "decode_ms": 1807.39,
+    "decode_tok_s": 71.37,
+    "vram_used_gib": 14.344,
+    "mtp": {
+     "cycles": 51,
+     "accepted": 85,
+     "drafted": 151,
+     "accept_rate": 0.5629
+    },
+    "ids_head": [
+     54244,
+     2790,
+     314,
+     279,
+     23779,
+     32119,
+     440,
+     264
+    ]
+   },
+   {
+    "kv": "int4",
+    "kmode": "channel",
+    "mtp_depth": 3,
+    "prompt_tokens": 32768,
+    "decode_pos": 32776,
+    "synthetic_kv": false,
+    "prefill_ms": 67905.2,
+    "prefill_tok_s": 482.6,
+    "decode_tokens": 129,
+    "decode_ms": 2892.29,
+    "decode_tok_s": 44.6,
+    "vram_used_gib": 14.647,
+    "mtp": {
+     "cycles": 65,
+     "accepted": 72,
+     "drafted": 192,
+     "accept_rate": 0.375
+    },
+    "ids_head": [
+     303,
+     264,
+     9990,
+     7458,
+     641,
+     695,
+     2332,
+     220
+    ]
+   }
+  ]
+ },
+ "mtp_exactness_bench": [
+  {
+   "kv": "fp32",
+   "ctx": 512,
+   "ids_equal_plain_over_overlap": true
+  },
+  {
+   "kv": "int4",
+   "ctx": 512,
+   "ids_equal_plain_over_overlap": true
+  },
+  {
+   "kv": "fp32",
+   "ctx": 4096,
+   "ids_equal_plain_over_overlap": true
+  },
+  {
+   "kv": "int4",
+   "ctx": 4096,
+   "ids_equal_plain_over_overlap": true
+  },
+  {
+   "kv": "int4",
+   "ctx": 16384,
+   "ids_equal_plain_over_overlap": true
+  },
+  {
+   "kv": "int4",
+   "ctx": 32768,
+   "ids_equal_plain_over_overlap": true
+  }
+ ],
+ "max_ctx_probe": {
+  "protocol": "engine with max_ctx N, prefill chunk 512, 512-token prefill, 33 graph-decode tokens at position ~N-300 over unwritten KV (speed/VRAM only); plain decode, no MTP",
+  "probes": [
+   {
+    "kv": "int4",
+    "max_ctx": 65536,
+    "fits": true,
+    "decode_pos": 65237,
+    "decode_tok_s": 38.92,
+    "vram_used_gib": 14.475,
+    "synthetic_unwritten_kv": true
+   },
+   {
+    "kv": "int4",
+    "max_ctx": 98304,
+    "fits": true,
+    "decode_pos": 98005,
+    "decode_tok_s": 34.42,
+    "vram_used_gib": 15.04,
+    "synthetic_unwritten_kv": true
+   },
+   {
+    "kv": "int4",
+    "max_ctx": 131072,
+    "fits": true,
+    "decode_pos": 130773,
+    "decode_tok_s": 31.22,
+    "vram_used_gib": 15.602,
+    "synthetic_unwritten_kv": true
+   },
+   {
+    "kv": "int4",
+    "max_ctx": 163840,
+    "fits": false,
+    "error": "cudaMalloc OOM"
+   },
+   {
+    "kv": "fp16",
+    "max_ctx": 24576,
+    "fits": true,
+    "decode_pos": 24277,
+    "decode_tok_s": 45.19,
+    "vram_used_gib": 14.837,
+    "synthetic_unwritten_kv": true
+   },
+   {
+    "kv": "fp16",
+    "max_ctx": 28672,
+    "fits": true,
+    "decode_pos": 28373,
+    "decode_tok_s": 44.02,
+    "vram_used_gib": 15.087,
+    "synthetic_unwritten_kv": true
+   },
+   {
+    "kv": "fp32",
+    "max_ctx": 12288,
+    "fits": true,
+    "decode_pos": 11989,
+    "decode_tok_s": 47.03,
+    "vram_used_gib": 14.833,
+    "synthetic_unwritten_kv": true
+   },
+   {
+    "kv": "fp32",
+    "max_ctx": 14336,
+    "fits": true,
+    "decode_pos": 14037,
+    "decode_tok_s": 46.28,
+    "vram_used_gib": 15.083,
+    "synthetic_unwritten_kv": true
+   },
+   {
+    "kv": "int4",
+    "max_ctx": 139264,
+    "fits": true,
+    "decode_pos": 138965,
+    "decode_tok_s": 30.28,
+    "vram_used_gib": 15.743,
+    "synthetic_unwritten_kv": true
+   },
+   {
+    "kv": "int4",
+    "max_ctx": 147456,
+    "fits": false,
+    "error": "cudaMalloc OOM"
+   },
+   {
+    "kv": "int4",
+    "max_ctx": 155648,
+    "fits": false,
+    "error": "cudaMalloc OOM"
+   },
+   {
+    "kv": "fp32",
+    "max_ctx": 16384,
+    "fits": true,
+    "decode_pos": 16085,
+    "decode_tok_s": 45.61,
+    "vram_used_gib": 15.333,
+    "synthetic_unwritten_kv": true
+   },
+   {
+    "kv": "fp32",
+    "max_ctx": 18432,
+    "fits": true,
+    "decode_pos": 18133,
+    "decode_tok_s": 44.85,
+    "vram_used_gib": 15.583,
+    "synthetic_unwritten_kv": true
+   },
+   {
+    "kv": "fp16",
+    "max_ctx": 34816,
+    "fits": true,
+    "decode_pos": 34517,
+    "decode_tok_s": 42.91,
+    "vram_used_gib": 15.462,
+    "synthetic_unwritten_kv": true
+   },
+   {
+    "kv": "fp16",
+    "max_ctx": 38912,
+    "fits": true,
+    "decode_pos": 38613,
+    "decode_tok_s": 41.94,
+    "vram_used_gib": 15.712,
+    "synthetic_unwritten_kv": true
+   },
+   {
+    "kv": "int4",
+    "max_ctx": 143360,
+    "fits": false,
+    "error": "cudaMalloc OOM"
+   },
+   {
+    "kv": "fp32",
+    "max_ctx": 20480,
+    "fits": false,
+    "error": "cudaMalloc OOM"
+   },
+   {
+    "kv": "fp32",
+    "max_ctx": 22528,
+    "fits": false,
+    "error": "cudaMalloc OOM"
+   },
+   {
+    "kv": "fp32",
+    "max_ctx": 24576,
+    "fits": false,
+    "error": "cudaMalloc OOM"
+   },
+   {
+    "kv": "fp16",
+    "max_ctx": 40960,
+    "fits": false,
+    "error": "cudaMalloc OOM"
+   },
+   {
+    "kv": "fp16",
+    "max_ctx": 43008,
+    "fits": false,
+    "error": "cudaMalloc OOM"
+   },
+   {
+    "kv": "fp16",
+    "max_ctx": 45056,
+    "fits": false,
+    "error": "cudaMalloc OOM"
+   }
+  ]
+ },
+ "vram_256k_arithmetic": {
+  "int4_kv_bytes_per_token": 18432,
+  "int4_kv_gib_at_262144": 4.5,
+  "mtp_layer_extra_gib": 0.281,
+  "fp16_kv_gib": 16.0,
+  "v100_total_gib": 15.77,
+  "non_kv_gib_measured_at_65536_probe": 13.35,
+  "shortfall_gib": 2.08,
+  "note": "arithmetic from the 65,536-token probe (nvidia-smi used 14.475 GiB incl. CUDA context); NOT a measurement at 256K"
+ }
+}

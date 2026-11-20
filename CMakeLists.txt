@@ -39,6 +39,8 @@ add_library(qv_cuda STATIC
   src/backends/cuda/recurrent/gdn_seq.cu
   src/backends/cuda/attention/attn.cu
   src/backends/cuda/attention/attn_seq.cu
+  src/backends/cuda/attention/attn_kv4.cu
+  src/backends/cuda/attention/kv4.cu
   src/runtime/cuda_engine.cu)
 target_include_directories(qv_cuda PUBLIC include)
 target_link_libraries(qv_cuda PUBLIC qv_core CUDA::cublas)
@@ -77,6 +79,10 @@ add_executable(test_attn_decode_split tests/test_attn_decode_split.cu)
 target_link_libraries(test_attn_decode_split PRIVATE qv_cuda)
 target_compile_options(test_attn_decode_split PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-gpu-targets>)
 add_test(NAME attn_decode_split COMMAND test_attn_decode_split)
+add_executable(test_attn_kv4 tests/test_attn_kv4.cu)
+target_link_libraries(test_attn_kv4 PRIVATE qv_cuda)
+target_compile_options(test_attn_kv4 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-gpu-targets>)
+add_test(NAME attn_kv4 COMMAND test_attn_kv4)
 add_executable(test_cuda_mtp tests/test_cuda_mtp.cpp)
 target_link_libraries(test_cuda_mtp PRIVATE qv_cuda CUDA::cudart)
 # needs the model and the GPU; skips itself when the model is missing. Override: -DQV_MTP_TEST_MODEL=prefix-or-.qv
