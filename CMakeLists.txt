@@ -25,6 +25,7 @@ add_library(qv_cuda STATIC
   src/backends/cuda/kernels/gemv_q8.cu
   src/backends/cuda/kernels/elementwise.cu
   src/backends/cuda/recurrent/gdn.cu
+  src/backends/cuda/recurrent/gdn_seq.cu
   src/backends/cuda/attention/attn.cu
   src/runtime/cuda_engine.cu)
 target_include_directories(qv_cuda PUBLIC include)
@@ -46,3 +47,7 @@ add_executable(test_gemv_multi tests/test_gemv_multi.cu)
 target_link_libraries(test_gemv_multi PRIVATE qv_cuda)
 target_compile_options(test_gemv_multi PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-gpu-targets>)
 add_test(NAME gemv_multi COMMAND test_gemv_multi)
+add_executable(test_gdn_seq tests/test_gdn_seq.cu)
+target_link_libraries(test_gdn_seq PRIVATE qv_cuda)
+target_compile_options(test_gdn_seq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-gpu-targets>)
+add_test(NAME gdn_seq COMMAND test_gdn_seq)
