@@ -132,8 +132,10 @@ try:
     st, h3, b = req(port, "POST", "/v1/chat/completions", chat1)
     check("unrelated/shorter prompt resets (cached=0)", h3.get("x-qv-prompt-cached-tokens") == "0", h3)
 
+    chat_long = dict(chat1, messages=[{"role": "user", "content": "Count from 1 to 30, separated by commas."}])  # does not stop within 8 tokens
+
     # chat stream
-    st, ev, tfirst, ttot, sh = sse(port, "/v1/chat/completions", dict(chat1, stream=True, max_tokens=8, stream_options={"include_usage": True}))
+    st, ev, tfirst, ttot, sh = sse(port, "/v1/chat/completions", dict(chat_long, stream=True, max_tokens=8, stream_options={"include_usage": True}))
     chunks = [e for e in ev if e != "[DONE]"]
     d0 = chunks[0]["choices"][0]["delta"]
     content = "".join(e["choices"][0]["delta"].get("content", "") for e in chunks if e["choices"] and e["choices"][0].get("delta"))
@@ -145,7 +147,7 @@ try:
     check("stream: one finish chunk (length) with empty delta", len(fin) == 1 and fin[0]["choices"][0]["finish_reason"] == "length" and fin[0]["choices"][0]["delta"] == {}, fin)
     check("stream: usage chunk (include_usage) has empty choices", len(usage_chunks) == 1 and usage_chunks[0]["choices"] == [] and usage_chunks[0]["usage"]["completion_tokens"] == 8, usage_chunks)
     check("stream: terminated by [DONE]", ev[-1] == "[DONE]")
-    st, _, nb = req(port, "POST", "/v1/chat/completions", dict(chat1, max_tokens=8))
+    st, _, nb = req(port, "POST", "/v1/chat/completions", dict(chat_long, max_tokens=8))
     check("stream content == non-stream content (greedy)", nb["choices"][0]["message"]["content"] == content, (content, nb["choices"][0]["message"]["content"]))
     print(f"METRIC chat stream: time to first content chunk {tfirst:.2f}s (prompt {nb['usage']['prompt_tokens']} tok), 8 tokens in {ttot:.2f}s -> {7 / (ttot - tfirst):.2f} tok/s; loadavg {os.getloadavg()[0]:.1f}")
 
@@ -171,7 +173,7 @@ try:
     check("same seed -> identical text at temperature 1.0", s1["choices"][0]["text"] == s2["choices"][0]["text"], (s1["choices"][0]["text"], s2["choices"][0]["text"]))
     _, _, s3 = req(port, "POST", "/v1/completions", dict(sb, seed=99, max_tokens=10, temperature=2.0, top_p=1.0, top_k=0))
     print("   seed 1234:", repr(s1["choices"][0]["text"]), " seed 99 (T=2):", repr(s3["choices"][0]["text"]))
-    _, _, lp = req(port, "POST", "/v1/chat/completions", dict(chat1, max_tokens=2, logprobs=True, top_logprobs=2))
+    _, _, lp = req(port, "POST", "/v1/chat/completions", dict(chat_long, max_tokens=2, logprobs=True, top_logprobs=2))
     lc = lp["choices"][0]["logprobs"]["content"]
     check("chat logprobs (sampled token + top-2 alternatives)", len(lc) == 2 and lc[0]["logprob"] <= 0 and len(lc[0]["top_logprobs"]) == 2 and lc[0]["top_logprobs"][0]["token"] == lc[0]["token"], lc)
     _, _, pp = req(port, "POST", "/v1/completions", {"prompt": "aaa aaa aaa aaa", "max_tokens": 3, "temperature": 0, "frequency_penalty": 1.0, "presence_penalty": 0.5})
