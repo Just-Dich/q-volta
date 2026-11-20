@@ -25,11 +25,13 @@ add_library(qv_cuda STATIC
   src/backends/cuda/kernels/gemv_q8.cu
   src/backends/cuda/kernels/dequant.cu
   src/backends/cuda/kernels/elementwise.cu
+  src/backends/cuda/kernels/linear_prefill.cu
+  src/backends/cuda/kernels/elementwise_seq.cu
   src/backends/cuda/recurrent/gdn.cu
   src/backends/cuda/attention/attn.cu
   src/runtime/cuda_engine.cu)
 target_include_directories(qv_cuda PUBLIC include)
-target_link_libraries(qv_cuda PUBLIC qv_core)
+target_link_libraries(qv_cuda PUBLIC qv_core CUDA::cublas)
 target_compile_options(qv_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${QV_CUDA_FLAGS}>)
 
 add_executable(qv_run tools/qv_run.cpp)
