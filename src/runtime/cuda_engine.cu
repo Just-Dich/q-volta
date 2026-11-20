@@ -129,8 +129,9 @@ class CudaEngine final : public Engine {
                 AttnPrepArgs p{qg_, kb_, vb_, at.q_norm, at.k_norm, inv_freq_, qr_, kc, vc,
                                c.n_heads, c.n_kv_heads, c.head_dim, c.rope_dim, opt_.max_ctx, d_pos_, c.eps};
                 attn_prep(p, s);
-                AttnDecodeArgs d{qr_, qg_, kc, vc, scores_, mix_, c.n_heads, c.n_kv_heads, opt_.max_ctx, d_pos_,
+                AttnDecodeArgs d{qr_, qg_, kc, vc, nullptr, mix_, c.n_heads, c.n_kv_heads, opt_.max_ctx, d_pos_,
                                  q8_ ? xq_ : Q8Buf{}};
+                d.part = part_;
                 attn_decode(d, s);
                 if (!q8_) prep(mix_, at.o.K, false);
                 mv(at.o, mix_, x_, x_);
@@ -324,7 +325,7 @@ class CudaEngine final : public Engine {
     float *conv_state_ = nullptr, *gdn_state_ = nullptr, *k_cache_ = nullptr, *v_cache_ = nullptr;
     size_t conv_bytes_ = 0, gdn_bytes_ = 0;
     // scratch
-    float *x_, *xn_, *xs_, *qkv_, *z_, *alpha_, *beta_, *conv_out_, *mix_, *qg_, *kb_, *vb_, *qr_, *scores_, *g_, *u_,
+    float *x_, *xn_, *xs_, *qkv_, *z_, *alpha_, *beta_, *conv_out_, *mix_, *qg_, *kb_, *vb_, *qr_, *part_, *g_, *u_,
         *act_, *logits_, *inv_freq_;
     int *d_tok_, *d_arg_, *d_pos_, *d_gen_, *h_tp_ = nullptr;
     cudaGraphExec_t graph_exec_ = nullptr;
@@ -467,7 +468,7 @@ class CudaEngine final : public Engine {
         kb_ = dalloc<float>(c.n_kv_heads * c.head_dim);
         vb_ = dalloc<float>(c.n_kv_heads * c.head_dim);
         qr_ = dalloc<float>(c.n_heads * c.head_dim);
-        scores_ = dalloc<float>((size_t)c.n_heads * opt_.max_ctx);
+        part_ = dalloc<float>((size_t)c.n_heads * ATTN_MAX_SPLITS * (c.head_dim + 2));
         g_ = dalloc<float>(c.inter);
         u_ = dalloc<float>(c.inter);
         act_ = dalloc<float>(c.inter);

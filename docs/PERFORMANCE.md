@@ -39,3 +39,10 @@ Current engine: fp32 KV (128 KiB/token) => ~20K tokens max in VRAM. 256K needs 4
 
 ## Known limitations / not done
 MTP, split-K long-context decode attention (decode drops 52 -> 36 tok/s after a 4K prompt), KV quantization, tensor-core attention, quality improvements (GPTQ/bit allocation), tokenizer/server/CLI, CPU backend (gated until the GPU completion gate).
+
+## Decode vs context (split-K attention, 2026-11-20)
+| context at decode start | before | after |
+|---:|---:|---:|
+| ~128 | 52 tok/s | 52.3 |
+| 4088 | 36 | 50.2 |
+Kernel-only (per layer, us, old -> new): pos 511 52->19.5; 4095 573->69; 16383 2278->189; 32767 4557->348. Short contexts (pos<=63) are ~4 us slower per layer (second launch). Not yet measured end-to-end at >4K; no NIAH/quality check at long context yet.
