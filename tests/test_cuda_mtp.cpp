@@ -56,7 +56,9 @@ int main(int argc, char** argv) {
     int fail = 0;
     for (int depth : depths) {
         qv::EngineOptions opt;
-        opt.max_ctx = 2048;
+        opt.max_ctx = std::getenv("QV_TEST_MAXCTX") ? std::atoi(std::getenv("QV_TEST_MAXCTX")) : 2048;
+        opt.kv_mode = std::getenv("QV_TEST_KV") ? std::atoi(std::getenv("QV_TEST_KV")) : 0;  // 0 fp32, 1 int4, 2 fp16
+        opt.kv4_kmode = std::getenv("QV_TEST_KMODE") ? std::atoi(std::getenv("QV_TEST_KMODE")) : 0;
         opt.mtp = true;
         opt.mtp_depth = depth;
         auto eng = qv::make_cuda_engine(mf, opt);

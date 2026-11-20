@@ -3,6 +3,7 @@
 // attn_prep + attn_decode (attn.h) for positions pos0..pos0+T-1 in order.
 #include <cuda_fp16.h>
 #include "../common.cuh"
+#include "kv4.h"
 
 namespace qv::cuda {
 
@@ -18,6 +19,10 @@ struct AttnSeqPrepArgs {
     float* v_cache;
     int n_heads, n_kv_heads, head_dim, rope_dim, max_ctx, pos0, T;
     float eps;
+    // int4 KV: post-RoPE K and V of the chunk are written as fp16 to stage_k/stage_v [T][Hkv*D] (instead of the fp caches),
+    // then completed blocks are quantized (kv4.h). The ring is updated by attn_seq() after the chunk's attention.
+    Kv4Layer kv4{};
+    __half *stage_k = nullptr, *stage_v = nullptr;
 };
 
 struct AttnSeqArgs {
@@ -28,6 +33,8 @@ struct AttnSeqArgs {
     __half* out_h;         // [T][Hq*D] fp16 clamped to +-65504 (may be null)
     float* out_f;          // [T][Hq*D] fp32 (may be null)
     int n_heads, n_kv_heads, max_ctx, pos0, T;
+    Kv4Layer kv4{};                         // kv4.blocks != nullptr: read the int4 KV (+ fp16 window), k_cache/v_cache unused
+    const __half *stage_k = nullptr, *stage_v = nullptr;
 };
 
 void attn_prep_seq(const AttnSeqPrepArgs& a, cudaStream_t s);
