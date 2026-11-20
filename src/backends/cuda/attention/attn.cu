@@ -96,8 +96,163 @@ __global__ void __launch_bounds__(D) attn_decode_kernel(AttnDecodeArgs a) {
     if (a.q8.q) q8_store_chunk(y, (h * D + t) >> 5, a.q8);
 }
 
-void attn_decode(const AttnDecodeArgs& a, cudaStream_t s) {
+void attn_decode_ref(const AttnDecodeArgs& a, cudaStream_t s) {
     attn_decode_kernel<256><<<a.n_heads, 256, 0, s>>>(a);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Split-K decode. Grid (n_kv_heads, S). CTA (g, s) owns a contiguous key slice for the G = Hq/Hkv q heads of kv head
+// g, so each K/V row is read once per kv head. Online softmax over tiles of TK keys yields (m, l, acc[D]) partials;
+// attn_combine_kernel merges them, then applies the gate and the optional int8 epilogue.
+// ---------------------------------------------------------------------------------------------------------------
+constexpr int SK_TK = 64;        // keys per tile
+constexpr int SK_MIN_CHUNK = 32; // minimum keys per split (short contexts use few active CTAs)
+constexpr int SK_G = 6;          // q heads per kv head (compile-time; checked on the host)
+
+__device__ __forceinline__ int sk_chunk(int n, int S) {
+    int c = (n + S - 1) / S;
+    return c < SK_MIN_CHUNK ? SK_MIN_CHUNK : c;
+}
+
+template <int D>
+__global__ void __launch_bounds__(D) attn_split_kernel(AttnDecodeArgs a) {
+    constexpr int NW = D / 32;
+    constexpr int G = SK_G;
+    __shared__ float ps[G][SK_TK];  // scores, then probabilities
+    __shared__ float alpha_s[G];
+    const int g = blockIdx.x, sp = blockIdx.y, S = gridDim.y;
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int n = *a.pos + 1;
+    const int chunk = sk_chunk(n, S);
+    const int j0 = sp * chunk;
+    const int j1 = min(n, j0 + chunk);
+    float* part_acc = a.part;
+    float* part_ml = a.part + (size_t)a.n_heads * S * D;
+    const int hb = g * G;
+
+    float acc[G];
+#pragma unroll
+    for (int h = 0; h < G; ++h) acc[h] = 0.f;
+    float m_run = -INFINITY, l_run = 0.f;  // meaningful in warp h < G (lane-uniform)
+
+    if (j0 < j1) {
+        // q slice for this lane: elements e = 4*lane + 128*i (i < D/128), all G heads, in registers
+        constexpr int NV = D / 128;
+        float4 q[G][NV];
+#pragma unroll
+        for (int h = 0; h < G; ++h)
+#pragma unroll
+            for (int i = 0; i < NV; ++i)
+                q[h][i] = *reinterpret_cast<const float4*>(a.q + (size_t)(hb + h) * D + 4 * lane + 128 * i);
+        const float* K = a.k_cache + (size_t)g * a.max_ctx * D;
+        const float* V = a.v_cache + (size_t)g * a.max_ctx * D;
+        const float scale = rsqrtf((float)D);
+
+        for (int jt = j0; jt < j1; jt += SK_TK) {
+            // phase 1: scores. warp w handles keys jt+w, jt+w+NW, ...
+            for (int jj = warp; jj < SK_TK; jj += NW) {
+                const int j = jt + jj;
+                if (j < j1) {
+                    const float* kr = K + (size_t)j * D;
+                    float4 kv[NV];
+#pragma unroll
+                    for (int i = 0; i < NV; ++i) kv[i] = *reinterpret_cast<const float4*>(kr + 4 * lane + 128 * i);
+                    float d[G];
+#pragma unroll
+                    for (int h = 0; h < G; ++h) {
+                        float x = 0.f;
+#pragma unroll
+                        for (int i = 0; i < NV; ++i) {
+                            x = fmaf(q[h][i].x, kv[i].x, x);
+                            x = fmaf(q[h][i].y, kv[i].y, x);
+                            x = fmaf(q[h][i].z, kv[i].z, x);
+                            x = fmaf(q[h][i].w, kv[i].w, x);
+                        }
+                        d[h] = x;
+                    }
+#pragma unroll
+                    for (int off = 16; off > 0; off >>= 1)
+#pragma unroll
+                        for (int h = 0; h < G; ++h) d[h] += __shfl_xor_sync(0xffffffffu, d[h], off);
+                    if (lane < G) {
+                        float v = d[0];
+#pragma unroll
+                        for (int h = 1; h < G; ++h) if (lane == h) v = d[h];
+                        ps[lane][jj] = v * scale;
+                    }
+                } else if (lane < G) {
+                    ps[lane][jj] = -INFINITY;
+                }
+            }
+            __syncthreads();
+            // phase 2: warp h < G does the online-softmax bookkeeping for head h
+            if (warp < G) {
+                float s0 = ps[warp][lane], s1 = ps[warp][lane + 32];
+                float tm = warp_max(fmaxf(s0, s1));
+                float m_new = fmaxf(m_run, tm);
+                float p0 = expf(s0 - m_new), p1 = expf(s1 - m_new);
+                float al = expf(m_run - m_new);  // m_run = -inf on first tile -> 0
+                ps[warp][lane] = p0;
+                ps[warp][lane + 32] = p1;
+                l_run = l_run * al + warp_sum(p0 + p1);
+                m_run = m_new;
+                if (lane == 0) alpha_s[warp] = al;
+            }
+            __syncthreads();
+            // phase 3: accumulate; thread t owns output dim t
+#pragma unroll
+            for (int h = 0; h < G; ++h) acc[h] *= alpha_s[h];
+            const int cnt = min(SK_TK, j1 - jt);
+            const float* vp = V + (size_t)jt * D + t;
+#pragma unroll 4
+            for (int jj = 0; jj < cnt; ++jj) {
+                const float v = vp[(size_t)jj * D];
+#pragma unroll
+                for (int h = 0; h < G; ++h) acc[h] = fmaf(ps[h][jj], v, acc[h]);
+            }
+            __syncthreads();
+        }
+    }
+#pragma unroll
+    for (int h = 0; h < G; ++h) part_acc[((size_t)(hb + h) * S + sp) * D + t] = acc[h];
+    if (warp < G && lane == 0) {
+        part_ml[((size_t)(hb + warp) * S + sp) * 2] = m_run;
+        part_ml[((size_t)(hb + warp) * S + sp) * 2 + 1] = l_run;
+    }
+}
+
+// grid = n_heads, D threads. Merge partials of the active splits, apply gate, optional q8 epilogue.
+template <int D>
+__global__ void __launch_bounds__(D) attn_combine_kernel(AttnDecodeArgs a, int S) {
+    const int h = blockIdx.x, t = threadIdx.x;
+    const int n = *a.pos + 1;
+    const int chunk = sk_chunk(n, S);
+    const int ns = min(S, (n + chunk - 1) / chunk);  // splits that own at least one key (>= 1)
+    const float* ml = a.part + (size_t)a.n_heads * S * D + (size_t)h * S * 2;
+    const float* pa = a.part + (size_t)h * S * D + t;
+    float M = -INFINITY;
+    for (int s = 0; s < ns; ++s) M = fmaxf(M, ml[2 * s]);
+    float L = 0.f, acc = 0.f;
+    for (int s = 0; s < ns; ++s) {
+        const float w = expf(ml[2 * s] - M);  // empty slices (m=-inf) would give 0, but are never visited
+        L = fmaf(ml[2 * s + 1], w, L);
+        acc = fmaf(pa[(size_t)s * D], w, acc);
+    }
+    const float o = acc / L;
+    const float gate = a.qg[h * 2 * D + D + t];
+    const float y = o * (1.f / (1.f + expf(-gate)));
+    a.out[h * D + t] = y;
+    if (a.q8.q) q8_store_chunk(y, (h * D + t) >> 5, a.q8);
+}
+
+void attn_decode(const AttnDecodeArgs& a, cudaStream_t s) {
+    if (!a.part) { attn_decode_ref(a, s); return; }
+    if (a.n_heads != a.n_kv_heads * SK_G || a.max_splits < 1) {
+        std::fprintf(stderr, "attn_decode: split-K needs n_heads == 6*n_kv_heads and max_splits >= 1\n");
+        std::abort();
+    }
+    attn_split_kernel<256><<<dim3(a.n_kv_heads, a.max_splits), 256, 0, s>>>(a);
+    attn_combine_kernel<256><<<a.n_heads, 256, 0, s>>>(a, a.max_splits);
 }
 
 }  // namespace qv::cuda
