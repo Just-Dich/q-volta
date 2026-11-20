@@ -1,3 +1,4 @@
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -14,12 +15,40 @@ const TensorInfo& ModelFile::at(const std::string& n) const {
     return it->second;
 }
 
-ModelFile ModelFile::open(const std::string& prefix) {
-    std::ifstream f(prefix + ".qv.json");
-    if (!f) throw std::runtime_error("cannot open " + prefix + ".qv.json");
-    std::stringstream ss;
-    ss << f.rdbuf();
-    json::Value root = json::parse(ss.str());
+// Single-file container (.qv): "QVOLTA1\0" | u64 json_len | u64 data_off | json | zero pad | data (data_off is 2 MiB aligned).
+// Tensor offsets inside the JSON are relative to the data section; they are rebased to absolute file offsets on load,
+// so engines treat bin_path + offsets identically for the container and for the legacy .qv.json + .qv.bin pair.
+ModelFile ModelFile::open(const std::string& prefix_in) {
+    std::string prefix = prefix_in, path;
+    uint64_t rebase = 0;
+    std::string text;
+    auto ends = [&](const std::string& s, const char* e) {
+        size_t n = std::strlen(e);
+        return s.size() >= n && s.compare(s.size() - n, n, e) == 0;
+    };
+    std::string single = ends(prefix, ".qv") ? prefix : prefix + ".qv";
+    if (std::filesystem::is_regular_file(single)) {
+        path = single;
+        std::ifstream f(single, std::ios::binary);
+        char magic[8];
+        uint64_t jl = 0, doff = 0;
+        f.read(magic, 8);
+        f.read((char*)&jl, 8);
+        f.read((char*)&doff, 8);
+        if (!f || std::memcmp(magic, "QVOLTA1\0", 8) != 0) throw std::runtime_error("not a .qv container: " + single);
+        text.resize(jl);
+        f.read(text.data(), (std::streamsize)jl);
+        if (!f) throw std::runtime_error("truncated .qv header: " + single);
+        rebase = doff;
+    } else {
+        std::ifstream f(prefix + ".qv.json");
+        if (!f) throw std::runtime_error("cannot open " + single + " or " + prefix + ".qv.json");
+        std::stringstream ss;
+        ss << f.rdbuf();
+        text = ss.str();
+        path = prefix + ".qv.bin";
+    }
+    json::Value root = json::parse(text);
     if (root["format"].str() != "qvolta-v1") throw std::runtime_error("bad format tag");
     ModelFile m;
     const auto& c = root["config"];
@@ -53,18 +82,18 @@ ModelFile ModelFile::open(const std::string& prefix) {
             ti.kind = Kind::Quant;
             ti.bits = (int)v["bits"].i64();
             ti.group = (int)v["group"].i64();
-            ti.off_q = v["off_q"].i64();
+            ti.off_q = v["off_q"].i64() + rebase;
             ti.nbytes_q = v["nbytes_q"].i64();
-            ti.off_sm = v["off_sm"].i64();
+            ti.off_sm = v["off_sm"].i64() + rebase;
             ti.nbytes_sm = v["nbytes_sm"].i64();
         } else {
             ti.kind = k == "f32" ? Kind::F32 : Kind::F16;
-            ti.off = v["off"].i64();
+            ti.off = v["off"].i64() + rebase;
             ti.nbytes = v["nbytes"].i64();
         }
         m.tensors.emplace(name, std::move(ti));
     }
-    m.bin_path = prefix + ".qv.bin";
+    m.bin_path = path;
     m.bin_size = std::filesystem::file_size(m.bin_path);
     return m;
 }

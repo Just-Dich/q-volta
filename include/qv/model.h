@@ -35,7 +35,7 @@ struct ModelFile {
     std::map<std::string, TensorInfo> tensors;
     std::string bin_path;
     uint64_t bin_size = 0;
-    static ModelFile open(const std::string& prefix);  // reads <prefix>.qv.json
+    static ModelFile open(const std::string& prefix);  // <prefix>.qv (single file) or legacy <prefix>.qv.json + .qv.bin
     const TensorInfo& at(const std::string& n) const;
 };
 
