@@ -50,6 +50,47 @@ void rmsnorm_rows_f16(const float* x, const float* w, __half* out, int n, int T,
     rmsnorm_rows_kernel<<<T, 256, 0, s>>>(x, w, out, n, eps);
 }
 
+__global__ void __launch_bounds__(256) rmsnorm_rows_f32_kernel(const float* __restrict__ x, const float* __restrict__ w,
+                                                              float* __restrict__ out, int n, float eps) {
+    __shared__ float red[32];
+    const float* xr = x + (size_t)blockIdx.x * n;
+    float* orow = out + (size_t)blockIdx.x * n;
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < n / 4; i += blockDim.x) {
+        const float4 v = reinterpret_cast<const float4*>(xr)[i];
+        ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+    ss = block_sum(ss, red);
+    const float r = rsqrtf(ss / n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) orow[i] = xr[i] * r * w[i];
+}
+
+void rmsnorm_rows_f32(const float* x, const float* w, float* out, int n, int T, float eps, cudaStream_t s) {
+    rmsnorm_rows_f32_kernel<<<T, 256, 0, s>>>(x, w, out, n, eps);
+}
+
+__global__ void __launch_bounds__(256) mtp_cat_kernel(const float* __restrict__ emb, const float* __restrict__ hid,
+                                                      const float* __restrict__ we, const float* __restrict__ wh,
+                                                      __half* __restrict__ out, int n, float eps) {
+    __shared__ float red[32];
+    const float* e = emb + (size_t)blockIdx.x * n;
+    const float* h = hid + (size_t)blockIdx.x * n;
+    __half* o = out + (size_t)blockIdx.x * 2 * n;
+    float s1 = 0.f, s2 = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) { s1 += e[i] * e[i]; s2 += h[i] * h[i]; }
+    const float r1 = rsqrtf(block_sum(s1, red) / n + eps);
+    const float r2 = rsqrtf(block_sum(s2, red) / n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        o[i] = __float2half_rn(clamp_h(e[i] * r1 * we[i]));
+        o[n + i] = __float2half_rn(clamp_h(h[i] * r2 * wh[i]));
+    }
+}
+
+void mtp_cat_rows_f16(const float* emb, const float* hid, const float* w_e, const float* w_h, __half* out, int n, int T,
+                      float eps, cudaStream_t s) {
+    mtp_cat_kernel<<<T, 256, 0, s>>>(emb, hid, w_e, w_h, out, n, eps);
+}
+
 __global__ void silu_mul_f16_kernel(const float* __restrict__ g, const float* __restrict__ u, __half* __restrict__ out,
                                     size_t total) {
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;

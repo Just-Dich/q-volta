@@ -17,9 +17,10 @@ struct GdnStepArgs {
     int n_k_heads, n_v_heads, dk, dv;
     float eps;
     Q8Buf q8;  // if q8.q: also emit the out_proj int8 input
+    float* snap = nullptr;  // if set: additionally write the updated state here (same layout; MTP rollback snapshot)
 };
 
-void conv_step(const float* in, const float* w, float* state, float* out, int C, cudaStream_t s);
+void conv_step(const float* in, const float* w, float* state, float* out, int C, cudaStream_t s, float* snap = nullptr);
 void gdn_step(const GdnStepArgs& a, cudaStream_t s);
 
 }  // namespace qv::cuda

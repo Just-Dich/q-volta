@@ -1,13 +1,15 @@
-// Multi-token GEMV must equal nt independent single-token GEMVs (same arithmetic per token) to fp32 rounding.
+// Multi-token GEMV must be BIT-IDENTICAL to nt independent single-token GEMVs (same arithmetic per token): MTP verify
+// relies on it for exact greedy output. N covers the per-shape default configs of the 1-token kernel (warps 4 and 2).
 #include <cstdio>
+#include <cstring>
+#include <cmath>
 #include <random>
 #include <vector>
 #include "../src/backends/cuda/kernels/gemv.h"
 using namespace qv::cuda;
 int main() {
   std::mt19937 rng(7); int fails = 0;
-  for (int bits : {3, 4, 6}) for (int K : {5120, 17408}) for (int nt : {2, 3, 4, 8}) {
-    const int N = 1000;
+  for (int bits : {3, 4, 6}) for (int K : {5120, 17408}) for (int nt : {2, 3, 4, 8}) for (int N : {1000, 12000}) {
     std::vector<uint32_t> q((size_t)N * K / 32 * bits); for (auto& v : q) v = rng();
     std::vector<__half2> sm((size_t)N * K / 64); for (auto& v : sm) v = __floats2half2_rn(0.001f * (rng() % 100 + 1), -0.01f);
     std::vector<float> x((size_t)nt * K); std::normal_distribution<float> nd; for (auto& v : x) v = nd(rng);
@@ -26,8 +28,8 @@ int main() {
     std::vector<float> a((size_t)nt*N), c((size_t)nt*N);
     cudaMemcpy(a.data(), y1, a.size()*4, cudaMemcpyDeviceToHost); cudaMemcpy(c.data(), y2, c.size()*4, cudaMemcpyDeviceToHost);
     double num = 0, den = 0; for (size_t i = 0; i < a.size(); ++i) { num += (a[i]-c[i])*(a[i]-c[i]); den += a[i]*a[i]; }
-    double rel = std::sqrt(num/den); bool ok = rel < 1e-6; fails += !ok;
-    std::printf("bits=%d K=%5d nt=%d rel=%.1e %s\n", bits, K, nt, rel, ok ? "OK" : "FAIL");
+    double rel = std::sqrt(num/den); bool ok = std::memcmp(a.data(), c.data(), a.size()*4) == 0; fails += !ok;
+    std::printf("bits=%d K=%5d N=%5d nt=%d rel=%.1e %s\n", bits, K, N, nt, rel, ok ? "OK" : "FAIL");
   }
   return fails != 0;
 }

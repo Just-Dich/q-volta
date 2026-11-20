@@ -8,7 +8,7 @@ namespace qv::cuda {
 
 // Depthwise causal conv (kernel KC=4) + SiLU, with rolling state [C][KC-1] (oldest first).
 __global__ void conv_step_kernel(const float* __restrict__ in, const float* __restrict__ w, float* __restrict__ state,
-                                 float* __restrict__ out, int C) {
+                                 float* __restrict__ out, int C, float* __restrict__ snap) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
     float s0 = state[c * 3 + 0], s1 = state[c * 3 + 1], s2 = state[c * 3 + 2];
@@ -19,10 +19,11 @@ __global__ void conv_step_kernel(const float* __restrict__ in, const float* __re
     state[c * 3 + 0] = s1;
     state[c * 3 + 1] = s2;
     state[c * 3 + 2] = x;
+    if (snap) { snap[c * 3 + 0] = s1; snap[c * 3 + 1] = s2; snap[c * 3 + 2] = x; }  // MTP rollback copy
 }
 
-void conv_step(const float* in, const float* w, float* state, float* out, int C, cudaStream_t s) {
-    conv_step_kernel<<<(C + 255) / 256, 256, 0, s>>>(in, w, state, out, C);
+void conv_step(const float* in, const float* w, float* state, float* out, int C, cudaStream_t s, float* snap) {
+    conv_step_kernel<<<(C + 255) / 256, 256, 0, s>>>(in, w, state, out, C, snap);
 }
 
 __device__ __forceinline__ float softplus_t(float x) { return x > 20.f ? x : log1pf(expf(x)); }
@@ -66,6 +67,7 @@ __global__ void __launch_bounds__(DV) gdn_step_kernel(GdnStepArgs a) {
     for (int k = 0; k < DK; ++k) {
         s[k] = fmaf(ks[k], delta, s[k]);
         S[k * DV] = s[k];
+        if (a.snap) a.snap[(size_t)h * DK * DV + t + k * DV] = s[k];  // MTP rollback copy (state after this token)
         o = fmaf(s[k], qs[k], o);
     }
 

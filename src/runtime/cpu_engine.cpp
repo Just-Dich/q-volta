@@ -873,6 +873,7 @@ class CpuEngine final : public Engine {
             auto t1 = clk::now();
             mtp_st_.verify_ms += ms(t0, t1);
             mtp_st_.cycles++;
+            mtp_st_.drafted++;
             if (ok) {
                 mtp_st_.accepted++;
                 out[produced++] = g0;

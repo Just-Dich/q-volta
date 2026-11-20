@@ -1,4 +1,6 @@
 // CUDA backend: decode-step executor for Qwen3.5-family hybrid (GDN + gated attention) models.
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
@@ -44,6 +46,7 @@ class CudaEngine final : public Engine {
    public:
     CudaEngine(const ModelFile& mf, const EngineOptions& opt) : opt_(opt) {
         cfg_ = mf.cfg;
+        if (opt_.mtp_depth < 1 || opt_.mtp_depth > 3) throw std::runtime_error("mtp_depth must be 1..3");
         QV_CUDA_CHECK(cudaStreamCreate(&stream_));
         load_weights(mf);
         bind(mf);
@@ -54,6 +57,8 @@ class CudaEngine final : public Engine {
         if (graph_exec_) cudaGraphExecDestroy(graph_exec_);
         lp_.destroy();
         if (h_tp_) cudaFreeHost(h_tp_);
+        if (opt_.mtp) { cudaFreeHost(h_a_); cudaFreeHost(h_b_); cudaFreeHost(h_res_); }
+        for (auto g : vgraph_) if (g) cudaGraphExecDestroy(g);
         for (void* p : allocs_) cudaFree(p);
         cudaFree(weights_);
         cudaStreamDestroy(stream_);
@@ -61,6 +66,7 @@ class CudaEngine final : public Engine {
 
     void step(int token, int pos) override {
         if (pos >= opt_.max_ctx) throw std::runtime_error("context overflow");
+        mtp_ready_ = -1;
         h_tp_[0] = token;
         h_tp_[1] = pos;
         QV_CUDA_CHECK(cudaMemcpyAsync(d_tok_, h_tp_, 2 * sizeof(int), cudaMemcpyHostToDevice, stream_));
@@ -72,6 +78,7 @@ class CudaEngine final : public Engine {
     // feedback) is one CUDA graph and no host synchronisation happens until the end.
     void decode_greedy(int first, int start_pos, int n, std::vector<int>& out, bool use_graph) override {
         if (start_pos + n > opt_.max_ctx) throw std::runtime_error("context overflow");
+        if (opt_.mtp && mtp_on_ && n >= 2 && mtp_ready_ == start_pos) { decode_mtp(first, start_pos, n, out); return; }
         h_tp_[0] = first;
         h_tp_[1] = start_pos;
         QV_CUDA_CHECK(cudaMemcpyAsync(d_tok_, h_tp_, 2 * sizeof(int), cudaMemcpyHostToDevice, stream_));
@@ -152,6 +159,9 @@ class CudaEngine final : public Engine {
     void prefill(const int* tokens, int T, int pos0) override {
         if (pos0 + T > opt_.max_ctx) throw std::runtime_error("context overflow");
         ensure_prefill_buffers();
+        mtp_pf_ = opt_.mtp && mtp_on_ && !opt_.dump_hidden && (pos0 == 0 || pos0 == mtp_ready_);
+        mtp_ready_ = -1;
+        mtp_pf_T_ = T;
         const int L = (int)layers_.size(), H = cfg_.hidden;
         size_t hbase = 0;
         if (opt_.dump_hidden) {
@@ -169,6 +179,7 @@ class CudaEngine final : public Engine {
         rmsnorm(x_, final_norm_, xn_, xs_, H, cfg_.eps, stream_, q8_ ? &xq_ : nullptr);
         mv(head_, xn_, logits_, nullptr);
         QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
+        if (mtp_pf_) mtp_ready_ = pos0 + T;
     }
 
     void pf_dump(int layer_slot, int n, int t0, size_t hbase) {
@@ -178,6 +189,59 @@ class CudaEngine final : public Engine {
                                         (size_t)(L + 1) * H * 4, pf_x_, (size_t)H * 4, (size_t)H * 4, n,
                                         cudaMemcpyDeviceToHost, stream_));
         QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
+    }
+
+    // one decoder layer over n prompt rows (residual stream X [n][H], updated in place)
+    void prefill_layer(const Layer& L, int n, int pos0, float* X) {
+        const Config& c = cfg_;
+        cudaStream_t s = stream_;
+        const int H = c.hidden;
+        rmsnorm_rows_f16(X, L.in_norm, pf_xh_, H, n, c.eps, s);
+        if (!L.attn) {
+            const GdnLayer& g = L.g;
+            const int C = g.qkv.N, VD = c.lin_v_heads * c.lin_v_dim;
+            linear_seq(lp_, g.qkv, pf_xh_, n, pf_qkv_, s);
+            linear_seq(lp_, g.z, pf_xh_, n, pf_z_, s);
+            linear_seq_dense(lp_, g.a, pf_xh_, n, pf_alpha_, s);
+            linear_seq_dense(lp_, g.b, pf_xh_, n, pf_beta_, s);
+            conv_seq(pf_qkv_, g.conv_w, conv_state_ + (size_t)L.idx_kind * C * 3, pf_conv_, C, n, s);
+            GdnSeqArgs a{};
+            a.conv_out = pf_conv_; a.alpha = pf_alpha_; a.beta_logit = pf_beta_; a.A_neg = g.A_neg;
+            a.dt_bias = g.dt_bias; a.z = pf_z_; a.norm_w = g.norm_w;
+            a.state = gdn_state_ + (size_t)L.idx_kind * c.lin_v_heads * c.lin_k_dim * c.lin_v_dim;
+            a.out_h = pf_mixh_; a.out_f = nullptr;
+            a.n_k_heads = c.lin_k_heads; a.n_v_heads = c.lin_v_heads; a.dk = c.lin_k_dim; a.dv = c.lin_v_dim;
+            a.T = n; a.eps = c.eps;
+            gdn_seq(a, s);
+            (void)VD;
+            linear_seq(lp_, g.out, pf_mixh_, n, pf_y_, s);
+        } else {
+            const AttnLayer& at = L.at;
+            linear_seq(lp_, at.q, pf_xh_, n, pf_qg_, s);
+            linear_seq(lp_, at.k, pf_xh_, n, pf_k_, s);
+            linear_seq(lp_, at.v, pf_xh_, n, pf_v_, s);
+            const size_t kv_layer = (size_t)c.n_kv_heads * opt_.max_ctx * c.head_dim;
+            float* kc = k_cache_ + L.idx_kind * kv_layer;
+            float* vc = v_cache_ + L.idx_kind * kv_layer;
+            AttnSeqPrepArgs p{};
+            p.qg = pf_qg_; p.k = pf_k_; p.v = pf_v_; p.q_norm = at.q_norm; p.k_norm = at.k_norm;
+            p.inv_freq = inv_freq_; p.q_out = pf_qr_; p.k_cache = kc; p.v_cache = vc;
+            p.n_heads = c.n_heads; p.n_kv_heads = c.n_kv_heads; p.head_dim = c.head_dim; p.rope_dim = c.rope_dim;
+            p.max_ctx = opt_.max_ctx; p.pos0 = pos0; p.T = n; p.eps = c.eps;
+            attn_prep_seq(p, s);
+            AttnSeqArgs d{};
+            d.q = pf_qr_; d.qg = pf_qg_; d.k_cache = kc; d.v_cache = vc; d.out_h = pf_mixh_; d.out_f = nullptr;
+            d.n_heads = c.n_heads; d.n_kv_heads = c.n_kv_heads; d.max_ctx = opt_.max_ctx; d.pos0 = pos0; d.T = n;
+            attn_seq(d, s);
+            linear_seq(lp_, at.o, pf_mixh_, n, pf_y_, s);
+        }
+        add_f32(X, pf_y_, (size_t)n * H, s);
+        rmsnorm_rows_f16(X, L.post_norm, pf_xh_, H, n, c.eps, s);
+        linear_seq(lp_, L.gate, pf_xh_, n, pf_g_, s);
+        linear_seq(lp_, L.up, pf_xh_, n, pf_u_, s);
+        silu_mul_f16(pf_g_, pf_u_, pf_acth_, (size_t)n * c.inter, s);
+        linear_seq(lp_, L.down, pf_acth_, n, pf_y_, s);
+        add_f32(X, pf_y_, (size_t)n * H, s);
     }
 
     void prefill_chunk(const int* tokens, int n, int pos0, size_t hbase, int t0) {
@@ -190,54 +254,10 @@ class CudaEngine final : public Engine {
         pf_dump(0, n, t0, hbase);
         int li = 0;
         for (const Layer& L : layers_) {
-            rmsnorm_rows_f16(pf_x_, L.in_norm, pf_xh_, H, n, c.eps, s);
-            if (!L.attn) {
-                const GdnLayer& g = L.g;
-                const int C = g.qkv.N, VD = c.lin_v_heads * c.lin_v_dim;
-                linear_seq(lp_, g.qkv, pf_xh_, n, pf_qkv_, s);
-                linear_seq(lp_, g.z, pf_xh_, n, pf_z_, s);
-                linear_seq_dense(lp_, g.a, pf_xh_, n, pf_alpha_, s);
-                linear_seq_dense(lp_, g.b, pf_xh_, n, pf_beta_, s);
-                conv_seq(pf_qkv_, g.conv_w, conv_state_ + (size_t)L.idx_kind * C * 3, pf_conv_, C, n, s);
-                GdnSeqArgs a{};
-                a.conv_out = pf_conv_; a.alpha = pf_alpha_; a.beta_logit = pf_beta_; a.A_neg = g.A_neg;
-                a.dt_bias = g.dt_bias; a.z = pf_z_; a.norm_w = g.norm_w;
-                a.state = gdn_state_ + (size_t)L.idx_kind * c.lin_v_heads * c.lin_k_dim * c.lin_v_dim;
-                a.out_h = pf_mixh_; a.out_f = nullptr;
-                a.n_k_heads = c.lin_k_heads; a.n_v_heads = c.lin_v_heads; a.dk = c.lin_k_dim; a.dv = c.lin_v_dim;
-                a.T = n; a.eps = c.eps;
-                gdn_seq(a, s);
-                (void)VD;
-                linear_seq(lp_, g.out, pf_mixh_, n, pf_y_, s);
-            } else {
-                const AttnLayer& at = L.at;
-                linear_seq(lp_, at.q, pf_xh_, n, pf_qg_, s);
-                linear_seq(lp_, at.k, pf_xh_, n, pf_k_, s);
-                linear_seq(lp_, at.v, pf_xh_, n, pf_v_, s);
-                const size_t kv_layer = (size_t)c.n_kv_heads * opt_.max_ctx * c.head_dim;
-                float* kc = k_cache_ + L.idx_kind * kv_layer;
-                float* vc = v_cache_ + L.idx_kind * kv_layer;
-                AttnSeqPrepArgs p{};
-                p.qg = pf_qg_; p.k = pf_k_; p.v = pf_v_; p.q_norm = at.q_norm; p.k_norm = at.k_norm;
-                p.inv_freq = inv_freq_; p.q_out = pf_qr_; p.k_cache = kc; p.v_cache = vc;
-                p.n_heads = c.n_heads; p.n_kv_heads = c.n_kv_heads; p.head_dim = c.head_dim; p.rope_dim = c.rope_dim;
-                p.max_ctx = opt_.max_ctx; p.pos0 = pos0; p.T = n; p.eps = c.eps;
-                attn_prep_seq(p, s);
-                AttnSeqArgs d{};
-                d.q = pf_qr_; d.qg = pf_qg_; d.k_cache = kc; d.v_cache = vc; d.out_h = pf_mixh_; d.out_f = nullptr;
-                d.n_heads = c.n_heads; d.n_kv_heads = c.n_kv_heads; d.max_ctx = opt_.max_ctx; d.pos0 = pos0; d.T = n;
-                attn_seq(d, s);
-                linear_seq(lp_, at.o, pf_mixh_, n, pf_y_, s);
-            }
-            add_f32(pf_x_, pf_y_, (size_t)n * H, s);
-            rmsnorm_rows_f16(pf_x_, L.post_norm, pf_xh_, H, n, c.eps, s);
-            linear_seq(lp_, L.gate, pf_xh_, n, pf_g_, s);
-            linear_seq(lp_, L.up, pf_xh_, n, pf_u_, s);
-            silu_mul_f16(pf_g_, pf_u_, pf_acth_, (size_t)n * c.inter, s);
-            linear_seq(lp_, L.down, pf_acth_, n, pf_y_, s);
-            add_f32(pf_x_, pf_y_, (size_t)n * H, s);
+            prefill_layer(L, n, pos0, pf_x_);
             pf_dump(++li, n, t0, hbase);
         }
+        if (mtp_pf_) mtp_prefill_chunk(tokens, n, pos0, mtp_pf_last_ && t0 + n >= mtp_pf_T_);
         if (opt_.dump_hidden) {  // test mode: logits for every token of the chunk (final norm + head per row)
             for (int tt = 0; tt < n; ++tt) {
                 QV_CUDA_CHECK(cudaMemcpyAsync(x_, pf_x_ + (size_t)tt * H, H * 4, cudaMemcpyDeviceToDevice, s));
@@ -259,6 +279,7 @@ class CudaEngine final : public Engine {
           *pf_qr_ = nullptr, *pf_g_ = nullptr, *pf_u_ = nullptr;
     __half *pf_xh_ = nullptr, *pf_mixh_ = nullptr, *pf_acth_ = nullptr;
     int* pf_tok_ = nullptr;
+    float* pf_m_ = nullptr;
 
     void ensure_prefill_buffers() {
         if (pf_chunk_) return;
@@ -285,6 +306,7 @@ class CudaEngine final : public Engine {
         pf_u_ = dalloc<float>((size_t)Tc * c.inter);
         pf_acth_ = dalloc<__half>((size_t)Tc * c.inter);
         pf_tok_ = dalloc<int>(Tc);
+        if (opt_.mtp) pf_m_ = dalloc<float>((size_t)Tc * c.hidden);
     }
 
     int argmax() override {
@@ -303,14 +325,284 @@ class CudaEngine final : public Engine {
         QV_CUDA_CHECK(cudaMemsetAsync(conv_state_, 0, conv_bytes_, stream_));
         QV_CUDA_CHECK(cudaMemsetAsync(gdn_state_, 0, gdn_bytes_, stream_));
         hidden_.clear();
+        mtp_ready_ = -1;
         QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
     }
+    void mtp_stats(MtpStats& s) const override { s = mtp_st_; }
+    void set_mtp_enabled(bool on) override { mtp_on_ = on && opt_.mtp; mtp_ready_ = -1; }
     const std::vector<float>& hidden_dump() const override { return hidden_; }
     const std::vector<float>& logits_dump() const override { return logits_all_; }
     std::vector<float> logits_all_;
     void sync() override { QV_CUDA_CHECK(cudaStreamSynchronize(stream_)); }
     size_t device_bytes_weights() const override { return weights_bytes_; }
     size_t device_bytes_state() const override { return state_bytes_; }
+
+    // =============================================================================================================
+    // MTP speculative decoding (exact greedy). Head semantics as in the CPU engine (docs/CPU_OPTIMIZATION.md): for
+    // position q with final-normed main hidden h_q and next token t_{q+1}: x = fc([pre_norm_e(embed(t_{q+1})) |
+    // pre_norm_h(h_q)]); one attention+MLP decoder layer at RoPE position q (own KV slot); mtp.norm; lm_head -> draft
+    // for t_{q+2}. Cycle: verify [cur, d1..dD] with ONE weight pass (gemv_q8_multi, bit-identical per token to the
+    // 1-token kernel; attention/conv/GDN/norm kernels are the 1-token kernels run per token in order), accept the
+    // longest prefix of drafts equal to the model's own argmax, roll the recurrent state back from per-token snapshots.
+    // The MTP head itself need not be bit exact (only proposes), so its batch/chain use the multi-token GEMV freely.
+    // =============================================================================================================
+    static constexpr int NTM_MAX = 4;
+    Layer mtp_L_{};
+    QMat mtp_fc_{};
+    const float *mtp_norm_ = nullptr, *mtp_pre_e_ = nullptr, *mtp_pre_h_ = nullptr;
+    int mtp_ready_ = -1;  // MTP KV + hlast_ valid for context [0, mtp_ready_)
+    bool mtp_on_ = true, mtp_pf_ = false;
+    int mtp_pf_T_ = 0;
+    bool mtp_pf_last_ = true;
+    bool mtp_prof_ = false;
+    MtpStats mtp_st_;
+    int NTM_ = 2;
+    // verify buffers (token-major, token t at +t*stride)
+    float *vx_, *vxn_, *vqkv_, *vconv_, *vz_, *valpha_, *vbeta_, *vmix_, *vqg_, *vkb_, *vvb_, *vqr_, *vg_, *vu_, *vact_,
+        *vlogits_;
+    Q8Buf vxq_{};
+    float *me_, *mcat_, *mhid_, *mlogits_, *hlast_;
+    int *d_v_, *d_m_, *d_draft_, *d_varg_, *h_a_, *h_b_, *h_res_;  // d_v_: [tok NTM | pos NTM]; d_m_: [tok | pos | chain pos]
+    float *snap_gdn_ = nullptr, *snap_conv_ = nullptr;
+    cudaGraphExec_t vgraph_[NTM_MAX + 1] = {};
+
+    void alloc_mtp() {
+        const Config& c = cfg_;
+        const int N = NTM_ = opt_.mtp_depth + 1, H = c.hidden, V = c.vocab;
+        const int C = 2 * c.lin_k_heads * c.lin_k_dim + c.lin_v_heads * c.lin_v_dim;
+        const int VD = c.lin_v_heads * c.lin_v_dim;
+        const int MIXS = std::max(VD, c.n_heads * c.head_dim);
+        vx_ = dalloc<float>((size_t)N * H);
+        vxn_ = dalloc<float>((size_t)N * H);
+        vqkv_ = dalloc<float>((size_t)N * C);
+        vconv_ = dalloc<float>((size_t)N * C);
+        vz_ = dalloc<float>((size_t)N * VD);
+        valpha_ = dalloc<float>((size_t)N * c.lin_v_heads);
+        vbeta_ = dalloc<float>((size_t)N * c.lin_v_heads);
+        vmix_ = dalloc<float>((size_t)N * MIXS);
+        vqg_ = dalloc<float>((size_t)N * 2 * c.n_heads * c.head_dim);
+        vkb_ = dalloc<float>((size_t)N * c.n_kv_heads * c.head_dim);
+        vvb_ = dalloc<float>((size_t)N * c.n_kv_heads * c.head_dim);
+        vqr_ = dalloc<float>((size_t)N * c.n_heads * c.head_dim);
+        vg_ = dalloc<float>((size_t)N * c.inter);
+        vu_ = dalloc<float>((size_t)N * c.inter);
+        vact_ = dalloc<float>((size_t)N * c.inter);
+        vlogits_ = dalloc<float>((size_t)N * V);
+        const int Kmax = std::max(c.inter, 2 * c.n_heads * c.head_dim);
+        vxq_.q = dalloc<int>((size_t)N * Kmax / 4);
+        vxq_.d = dalloc<float>((size_t)N * Kmax / 32);
+        vxq_.sum = dalloc<float>((size_t)N * Kmax / 32);
+        vxq_.qsum = dalloc<int>((size_t)N * Kmax / 32);
+        me_ = dalloc<float>((size_t)N * H);
+        mcat_ = dalloc<float>((size_t)N * 2 * H);
+        mhid_ = dalloc<float>(H);
+        mlogits_ = dalloc<float>(V);
+        hlast_ = dalloc<float>(H);
+        d_v_ = dalloc<int>(2 * N);
+        d_m_ = dalloc<int>(3 * N);
+        d_draft_ = dalloc<int>(N);
+        d_varg_ = dalloc<int>(N);
+        QV_CUDA_CHECK(cudaMallocHost(&h_a_, 2 * N * sizeof(int)));
+        QV_CUDA_CHECK(cudaMallocHost(&h_b_, 3 * N * sizeof(int)));
+        QV_CUDA_CHECK(cudaMallocHost(&h_res_, 2 * N * sizeof(int)));
+        snap_gdn_ = dalloc<float>((size_t)(N - 1) * gdn_bytes_ / 4);
+        snap_conv_ = dalloc<float>((size_t)(N - 1) * conv_bytes_ / 4);
+        const char* e = std::getenv("QV_MTP_PROF");
+        mtp_prof_ = e && e[0] == '1';
+    }
+
+    static Q8Buf q8at(const Q8Buf& b, int K, int t) {
+        Q8Buf r;
+        r.q = b.q + (size_t)t * (K >> 2);
+        r.d = b.d + (size_t)t * (K >> 5);
+        r.sum = b.sum + (size_t)t * (K >> 5);
+        r.qsum = b.qsum + (size_t)t * (K >> 5);
+        return r;
+    }
+
+    // one decoder layer for NT rows held in vx_ (residual, in place); row t sits at position dpos[t]
+    void layer_multi(const Layer& L, int NT, const int* dpos, bool snap) {
+        const Config& c = cfg_;
+        cudaStream_t s = stream_;
+        const int H = c.hidden, I = c.inter;
+        for (int t = 0; t < NT; ++t)
+            { Q8Buf q = q8at(vxq_, H, t); rmsnorm(vx_ + (size_t)t * H, L.in_norm, vxn_ + (size_t)t * H, xs_, H, c.eps, s, &q); }
+        if (!L.attn) {
+            const GdnLayer& g = L.g;
+            const int C = g.qkv.N, VD = g.z.N, Hv = c.lin_v_heads;
+            const size_t MIXS = std::max(c.lin_v_heads * c.lin_v_dim, c.n_heads * c.head_dim);
+            gemv_q8_multi(g.qkv, vxq_, NT, vqkv_, nullptr, s);
+            gemv_q8_multi(g.z, vxq_, NT, vz_, nullptr, s);
+            for (int t = 0; t < NT; ++t) gemv_f16_dual(g.a, g.b, vxn_ + (size_t)t * H, valpha_ + (size_t)t * Hv, vbeta_ + (size_t)t * Hv, s);
+            float* cs = conv_state_ + (size_t)L.idx_kind * C * 3;
+            float* gs = gdn_state_ + (size_t)L.idx_kind * Hv * c.lin_k_dim * c.lin_v_dim;
+            for (int t = 0; t < NT; ++t) {
+                const bool sn = snap && t < NT - 1;
+                conv_step(vqkv_ + (size_t)t * C, g.conv_w, cs, vconv_ + (size_t)t * C, C, s,
+                          sn ? snap_conv_ + (size_t)t * (conv_bytes_ / 4) + (size_t)L.idx_kind * C * 3 : nullptr);
+                GdnStepArgs a{vconv_ + (size_t)t * C, valpha_ + (size_t)t * Hv, vbeta_ + (size_t)t * Hv, g.A_neg, g.dt_bias,
+                              vz_ + (size_t)t * VD, g.norm_w, gs, vmix_ + t * MIXS,
+                              c.lin_k_heads, c.lin_v_heads, c.lin_k_dim, c.lin_v_dim, c.eps, q8at(vxq_, g.out.K, t)};
+                if (sn) a.snap = snap_gdn_ + (size_t)t * (gdn_bytes_ / 4) + (size_t)L.idx_kind * Hv * c.lin_k_dim * c.lin_v_dim;
+                gdn_step(a, s);
+            }
+            gemv_q8_multi(g.out, vxq_, NT, vx_, vx_, s);
+        } else {
+            const AttnLayer& at = L.at;
+            const size_t MIXS = std::max(c.lin_v_heads * c.lin_v_dim, c.n_heads * c.head_dim);
+            const size_t QGN = 2 * c.n_heads * c.head_dim, KN = c.n_kv_heads * c.head_dim, QRN = c.n_heads * c.head_dim;
+            gemv_q8_multi(at.q, vxq_, NT, vqg_, nullptr, s);
+            gemv_q8_multi(at.k, vxq_, NT, vkb_, nullptr, s);
+            gemv_q8_multi(at.v, vxq_, NT, vvb_, nullptr, s);
+            const size_t kv_layer = (size_t)c.n_kv_heads * opt_.max_ctx * c.head_dim;
+            float* kc = k_cache_ + L.idx_kind * kv_layer;
+            float* vc = v_cache_ + L.idx_kind * kv_layer;
+            for (int t = 0; t < NT; ++t) {
+                AttnPrepArgs p{vqg_ + t * QGN, vkb_ + t * KN, vvb_ + t * KN, at.q_norm, at.k_norm, inv_freq_, vqr_ + t * QRN,
+                               kc, vc, c.n_heads, c.n_kv_heads, c.head_dim, c.rope_dim, opt_.max_ctx, dpos + t, c.eps};
+                attn_prep(p, s);
+                AttnDecodeArgs d{vqr_ + t * QRN, vqg_ + t * QGN, kc, vc, nullptr, vmix_ + t * MIXS, c.n_heads, c.n_kv_heads,
+                                 opt_.max_ctx, dpos + t, q8at(vxq_, at.o.K, t)};
+                d.part = part_;
+                attn_decode(d, s);
+            }
+            gemv_q8_multi(at.o, vxq_, NT, vx_, vx_, s);
+        }
+        for (int t = 0; t < NT; ++t)
+            { Q8Buf q = q8at(vxq_, H, t); rmsnorm(vx_ + (size_t)t * H, L.post_norm, vxn_ + (size_t)t * H, xs_, H, c.eps, s, &q); }
+        gemv_q8_multi(L.gate, vxq_, NT, vg_, nullptr, s);
+        gemv_q8_multi(L.up, vxq_, NT, vu_, nullptr, s);
+        for (int t = 0; t < NT; ++t) {
+            Q8Buf q = q8at(vxq_, I, t);
+            silu_mul(vg_ + (size_t)t * I, vu_ + (size_t)t * I, vact_ + (size_t)t * I, xs_, I, s, &q);
+        }
+        gemv_q8_multi(L.down, vxq_, NT, vx_, vx_, s);
+    }
+
+    // verify: tokens/positions already in d_v_ ([tok NT | pos NT]); logits rows -> vlogits_, per-row argmax -> d_varg_,
+    // final-normed hidden rows -> vxn_, GDN/conv snapshots after tokens 0..NT-2 -> snap_*.
+    void verify_forward(int NT) {
+        const Config& c = cfg_;
+        cudaStream_t s = stream_;
+        const int H = c.hidden, V = c.vocab;
+        const int* dpos = d_v_ + NTM_;
+        for (int t = 0; t < NT; ++t) embed(embed_, d_v_ + t, vx_ + (size_t)t * H, s);
+        for (const Layer& L : layers_) layer_multi(L, NT, dpos, true);
+        for (int t = 0; t < NT; ++t)
+            { Q8Buf q = q8at(vxq_, H, t); rmsnorm(vx_ + (size_t)t * H, final_norm_, vxn_ + (size_t)t * H, xs_, H, c.eps, s, &q); }
+        gemv_q8_multi(head_, vxq_, NT, vlogits_, nullptr, s);
+        for (int t = 0; t < NT; ++t) argmax_advance(vlogits_ + (size_t)t * V, V, d_varg_ + t, nullptr, nullptr, s);
+    }
+
+    // MTP head over nt rows: next tokens at dnext[0..nt) (device), main hidden rows hid (normed, stride H), RoPE/KV
+    // positions dpos[0..nt). Writes the MTP KV of those positions; draft of the last row -> dout, its normed MTP output
+    // -> mhid_ (input of a chained draft).
+    void mtp_run(int nt, const int* dnext, const float* hid, const int* dpos, int* dout) {
+        const Config& c = cfg_;
+        cudaStream_t s = stream_;
+        const int H = c.hidden, V = c.vocab;
+        for (int t = 0; t < nt; ++t) {
+            embed(embed_, dnext + t, me_ + (size_t)t * H, s);
+            rmsnorm(me_ + (size_t)t * H, mtp_pre_e_, mcat_ + (size_t)t * 2 * H, nullptr, H, c.eps, s, nullptr);
+            rmsnorm(hid + (size_t)t * H, mtp_pre_h_, mcat_ + (size_t)t * 2 * H + H, nullptr, H, c.eps, s, nullptr);
+        }
+        quantize_q8(mcat_, nt * 2 * H, vxq_, s);
+        gemv_q8_multi(mtp_fc_, vxq_, nt, vx_, nullptr, s);
+        layer_multi(mtp_L_, nt, dpos, false);
+        rmsnorm(vx_ + (size_t)(nt - 1) * H, mtp_norm_, mhid_, xs_, H, c.eps, s, &xq_);
+        gemv_q8(head_, xq_, mlogits_, nullptr, s);
+        argmax_advance(mlogits_, V, dout, nullptr, nullptr, s);
+    }
+
+    // update MTP KV for rows (positions q0..q0+nt-1, next tokens nxt[], hidden rows hid) and draft Dd tokens -> d_draft_
+    void mtp_draft(int nt, const int* nxt, const float* hid, int q0, int Dd) {
+        for (int t = 0; t < nt; ++t) { h_b_[t] = nxt[t]; h_b_[NTM_ + t] = q0 + t; }
+        for (int j = 1; j < Dd; ++j) h_b_[2 * NTM_ + j - 1] = q0 + nt - 1 + j;
+        QV_CUDA_CHECK(cudaMemcpyAsync(d_m_, h_b_, 3 * NTM_ * sizeof(int), cudaMemcpyHostToDevice, stream_));
+        mtp_run(nt, d_m_, hid, d_m_ + NTM_, d_draft_);
+        for (int j = 1; j < Dd; ++j) mtp_run(1, d_draft_ + j - 1, mhid_, d_m_ + 2 * NTM_ + j - 1, d_draft_ + j);
+    }
+
+    // after the final-norm rows of a prefill chunk: fill the MTP KV for the chunk's positions
+    void mtp_prefill_chunk(const int* tokens, int n, int pos0, bool last) {
+        const Config& c = cfg_;
+        cudaStream_t s = stream_;
+        const int H = c.hidden;
+        rmsnorm_rows_f32(pf_x_, final_norm_, pf_y_, H, n, c.eps, s);
+        if (last) QV_CUDA_CHECK(cudaMemcpyAsync(hlast_, pf_y_ + (size_t)(n - 1) * H, H * 4, cudaMemcpyDeviceToDevice, s));
+        const int nf = last ? n - 1 : n;  // the last prompt token's successor is not known yet
+        if (nf <= 0) return;
+        QV_CUDA_CHECK(cudaMemcpyAsync(pf_tok_, tokens + 1, nf * sizeof(int), cudaMemcpyHostToDevice, s));
+        QV_CUDA_CHECK(cudaStreamSynchronize(s));
+        embed_rows(embed_, pf_tok_, nf, pf_m_, s);
+        mtp_cat_rows_f16(pf_m_, pf_y_, mtp_pre_e_, mtp_pre_h_, pf_acth_, H, nf, c.eps, s);
+        linear_seq(lp_, mtp_fc_, pf_acth_, nf, pf_m_, s);
+        prefill_layer(mtp_L_, nf, pos0, pf_m_);
+    }
+
+    void decode_mtp(int first, int start_pos, int n, std::vector<int>& out) {
+        using clk = std::chrono::steady_clock;
+        auto ms = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+        const Config& c = cfg_;
+        const int H = c.hidden, V = c.vocab, D = opt_.mtp_depth;
+        out.resize(n);
+        int cur = first, p = start_pos, produced = 0;
+        auto t0 = clk::now();
+        int Dd = std::min(D, n - 1);
+        mtp_draft(1, &cur, hlast_, p - 1, Dd);
+        if (mtp_prof_) { QV_CUDA_CHECK(cudaStreamSynchronize(stream_)); mtp_st_.draft_ms += ms(t0, clk::now()); }
+        while (produced < n) {
+            const int NT = std::min(D + 1, n - produced);
+            if (NT == 1 || p + 2 * D + 3 >= opt_.max_ctx) {  // tail / context end: plain step (state stays identical to plain decode)
+                t0 = clk::now();
+                h_tp_[0] = cur;
+                h_tp_[1] = p;
+                QV_CUDA_CHECK(cudaMemcpyAsync(d_tok_, h_tp_, 2 * sizeof(int), cudaMemcpyHostToDevice, stream_));
+                forward();
+                QV_CUDA_CHECK(cudaMemcpyAsync(hlast_, xn_, H * 4, cudaMemcpyDeviceToDevice, stream_));
+                cur = argmax();
+                out[produced++] = cur;
+                p += 1;
+                mtp_st_.plain_steps++;
+                mtp_st_.plain_ms += ms(t0, clk::now());
+                continue;
+            }
+            t0 = clk::now();
+            for (int t = 0; t < NTM_; ++t) h_a_[NTM_ + t] = p + t;
+            h_a_[0] = cur;
+            QV_CUDA_CHECK(cudaMemcpyAsync(d_v_, h_a_, 2 * NTM_ * sizeof(int), cudaMemcpyHostToDevice, stream_));
+            QV_CUDA_CHECK(cudaMemcpyAsync(d_v_ + 1, d_draft_, (NT - 1) * sizeof(int), cudaMemcpyDeviceToDevice, stream_));
+            QV_CUDA_CHECK(cudaMemcpyAsync(h_res_ + NTM_, d_draft_, (NT - 1) * sizeof(int), cudaMemcpyDeviceToHost, stream_));
+            run_verify(NT);
+            QV_CUDA_CHECK(cudaMemcpyAsync(h_res_, d_varg_, NT * sizeof(int), cudaMemcpyDeviceToHost, stream_));
+            QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
+            auto t1 = clk::now();
+            int m = 0;
+            while (m < NT - 1 && h_res_[m] == h_res_[NTM_ + m]) ++m;
+            mtp_st_.verify_ms += ms(t0, t1);
+            mtp_st_.cycles++;
+            mtp_st_.drafted += NT - 1;
+            mtp_st_.accepted += m;
+            for (int j = 0; j <= m; ++j) out[produced++] = h_res_[j];
+            QV_CUDA_CHECK(cudaMemcpyAsync(logits_, vlogits_ + (size_t)m * V, (size_t)V * 4, cudaMemcpyDeviceToDevice, stream_));
+            QV_CUDA_CHECK(cudaMemcpyAsync(hlast_, vxn_ + (size_t)m * H, (size_t)H * 4, cudaMemcpyDeviceToDevice, stream_));
+            if (m < NT - 1) {  // roll the recurrent state back to "after token m"
+                QV_CUDA_CHECK(cudaMemcpyAsync(conv_state_, snap_conv_ + (size_t)m * (conv_bytes_ / 4), conv_bytes_, cudaMemcpyDeviceToDevice, stream_));
+                QV_CUDA_CHECK(cudaMemcpyAsync(gdn_state_, snap_gdn_ + (size_t)m * (gdn_bytes_ / 4), gdn_bytes_, cudaMemcpyDeviceToDevice, stream_));
+            }
+            cur = h_res_[m];
+            if (produced < n) {
+                Dd = std::min(D, n - produced - 1);
+                if (Dd > 0) mtp_draft(m + 1, h_res_, vxn_, p, Dd);
+            }
+            p += m + 1;
+            if (mtp_prof_) { QV_CUDA_CHECK(cudaStreamSynchronize(stream_)); mtp_st_.draft_ms += ms(t1, clk::now()); }
+        }
+        QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
+        mtp_ready_ = p;
+    }
+
+    void run_verify(int NT) { verify_forward(NT); }
 
    private:
     EngineOptions opt_;
@@ -442,6 +734,29 @@ class CudaEngine final : public Engine {
         }
         n_gdn_ = ng;
         n_attn_ = na;
+        if (opt_.mtp) {
+            const std::string p = "mtp.layers.0.";
+            mtp_fc_ = qmat(mf, "mtp.fc.weight");
+            mtp_norm_ = f32(mf, "mtp.norm.weight");
+            mtp_pre_e_ = f32(mf, "mtp.pre_fc_norm_embedding.weight");
+            mtp_pre_h_ = f32(mf, "mtp.pre_fc_norm_hidden.weight");
+            Layer L{};
+            L.attn = true;
+            L.idx_kind = na;  // own KV cache slot after the main attention layers
+            L.in_norm = f32(mf, p + "input_layernorm.weight");
+            L.post_norm = f32(mf, p + "post_attention_layernorm.weight");
+            L.gate = qmat(mf, p + "mlp.gate_proj.weight");
+            L.up = qmat(mf, p + "mlp.up_proj.weight");
+            L.down = qmat(mf, p + "mlp.down_proj.weight");
+            L.at.q = qmat(mf, p + "self_attn.q_proj.weight");
+            L.at.k = qmat(mf, p + "self_attn.k_proj.weight");
+            L.at.v = qmat(mf, p + "self_attn.v_proj.weight");
+            L.at.o = qmat(mf, p + "self_attn.o_proj.weight");
+            L.at.q_norm = f32(mf, p + "self_attn.q_norm.weight");
+            L.at.k_norm = f32(mf, p + "self_attn.k_norm.weight");
+            mtp_L_ = L;
+            if (mtp_fc_.K != 2 * cfg_.hidden || mtp_fc_.N != cfg_.hidden) throw std::runtime_error("unexpected mtp.fc shape");
+        }
     }
     int n_gdn_ = 0, n_attn_ = 0;
 
@@ -452,7 +767,7 @@ class CudaEngine final : public Engine {
         gdn_bytes_ = (size_t)n_gdn_ * c.lin_v_heads * c.lin_k_dim * c.lin_v_dim * 4;
         conv_state_ = dalloc<float>(conv_bytes_ / 4);
         gdn_state_ = dalloc<float>(gdn_bytes_ / 4);
-        size_t kv = (size_t)n_attn_ * c.n_kv_heads * opt_.max_ctx * c.head_dim;
+        size_t kv = (size_t)(n_attn_ + (opt_.mtp ? 1 : 0)) * c.n_kv_heads * opt_.max_ctx * c.head_dim;
         k_cache_ = dalloc<float>(kv);
         v_cache_ = dalloc<float>(kv);
         x_ = dalloc<float>(c.hidden);
@@ -487,6 +802,7 @@ class CudaEngine final : public Engine {
             const char* e = std::getenv("QV_GEMV");
             q8_ = !(e && std::string(e) == "fp32");
         }
+        if (opt_.mtp) alloc_mtp();
         // inv_freq computed in fp32 exactly like torch: 1 / base ** (arange(0, dim, 2) / dim)
         std::vector<float> inv(c.rope_dim / 2);
         for (int i = 0; i < c.rope_dim / 2; ++i)

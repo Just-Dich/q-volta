@@ -198,14 +198,24 @@ __global__ void __launch_bounds__(WARPS * 32) gemv_q8_multi_kernel(QMat W, Q8Vec
     }
 }
 
-template <int BITS, int NT>
-static void multi_bits(const QMat& W, const Q8Vec& x, float* y, const float* res, cudaStream_t s) {
-    // rows per block: reuse each token's x loads across R rows (x traffic is NT x the weight bytes)
+template <int BITS, int NT, int WARPS>
+static void multi_launch(const QMat& W, const Q8Vec& x, float* y, const float* res, cudaStream_t s) {
+    // rows per block: reuse each token's x loads across R rows (x traffic is NT x the weight bytes). R does not
+    // change the arithmetic; WARPS must equal the warps of the 1-token kernel for this shape (accumulation order).
     static int Rsel = [] { const char* e = std::getenv("QV_MULTI_R"); return e ? std::atoi(e) : 0; }();
     int R = Rsel ? Rsel : (NT <= 2 ? 2 : 4);
-    if (R == 1) gemv_q8_multi_kernel<BITS, 1, 4, NT><<<W.N, 128, 0, s>>>(W, x, y, res);
-    else if (R == 2) gemv_q8_multi_kernel<BITS, 2, 4, NT><<<(W.N + 1) / 2, 128, 0, s>>>(W, x, y, res);
-    else gemv_q8_multi_kernel<BITS, 4, 4, NT><<<(W.N + 3) / 4, 128, 0, s>>>(W, x, y, res);
+    if (R == 1) gemv_q8_multi_kernel<BITS, 1, WARPS, NT><<<W.N, WARPS * 32, 0, s>>>(W, x, y, res);
+    else if (R == 2) gemv_q8_multi_kernel<BITS, 2, WARPS, NT><<<(W.N + 1) / 2, WARPS * 32, 0, s>>>(W, x, y, res);
+    else gemv_q8_multi_kernel<BITS, 4, WARPS, NT><<<(W.N + 3) / 4, WARPS * 32, 0, s>>>(W, x, y, res);
+}
+
+template <int BITS, int NT>
+static void multi_bits(const QMat& W, const Q8Vec& x, float* y, const float* res, cudaStream_t s) {
+    const int warps = gemv_q8_default_cfg(W).warps;
+    if (warps == 4) return multi_launch<BITS, NT, 4>(W, x, y, res, s);
+    if (warps == 2) return multi_launch<BITS, NT, 2>(W, x, y, res, s);
+    std::fprintf(stderr, "gemv_q8_multi: 1-token config warps=%d not supported (bit-exactness needs a match)\n", warps);
+    std::abort();
 }
 
 template <int NT>
@@ -227,8 +237,6 @@ void gemv_q8_multi(const QMat& W, const Q8Vec& x, int nt, float* y, const float*
         case 2: return multi_nt<2>(W, x, y, residual, s);
         case 3: return multi_nt<3>(W, x, y, residual, s);
         case 4: return multi_nt<4>(W, x, y, residual, s);
-        case 5: return multi_nt<5>(W, x, y, residual, s);
-        case 6: return multi_nt<6>(W, x, y, residual, s);
         case 8: return multi_nt<8>(W, x, y, residual, s);
         default: std::fprintf(stderr, "gemv_q8_multi: nt=%d not compiled\n", nt); std::abort();
     }

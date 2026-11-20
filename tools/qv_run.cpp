@@ -37,6 +37,7 @@ int main(int argc, char** argv) {
     std::string backend = "cpu";
 #endif
     int threads = 32;
+    int mtp_depth = 1;
     int n = 128, max_ctx = 4096, warm = 8, chunk = -1;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -51,6 +52,7 @@ int main(int argc, char** argv) {
         else if (a == "--prefill") use_prefill = true;
         else if (a == "--prefill-chunk") chunk = std::stoi(next());
         else if (a == "--mtp") mtp = true;
+        else if (a == "--mtp-depth") mtp_depth = std::stoi(next());
         else if (a == "--graph") graph = true;
         else if (a == "--n") n = std::stoi(next());
         else if (a == "--max-ctx") max_ctx = std::stoi(next());
@@ -65,6 +67,7 @@ int main(int argc, char** argv) {
     opt.dump_hidden = !golden.empty();
     opt.threads = threads;
     opt.mtp = mtp;
+    opt.mtp_depth = mtp_depth;
     std::unique_ptr<qv::Engine> eng;
     if (backend == "cpu") {
 #ifdef QV_HAVE_CPU
@@ -157,9 +160,9 @@ int main(int argc, char** argv) {
             eng->mtp_stats(ms_);
             if (mtp)
                 std::printf(", \"mtp\": {\"cycles\": %ld, \"accepted\": %ld, \"accept_rate\": %.4f, \"plain_steps\": %ld, "
-                            "\"draft_ms\": %.1f, \"verify_ms\": %.1f, \"plain_ms\": %.1f, \"prefill_mtp_ms\": %.1f}",
-                            ms_.cycles, ms_.accepted, ms_.cycles ? (double)ms_.accepted / ms_.cycles : 0.0, ms_.plain_steps,
-                            ms_.draft_ms, ms_.verify_ms, ms_.plain_ms, ms_.prefill_mtp_ms);
+                            "\"drafted\": %ld, \"draft_ms\": %.1f, \"verify_ms\": %.1f, \"plain_ms\": %.1f, \"prefill_mtp_ms\": %.1f}",
+                            ms_.cycles, ms_.accepted, ms_.drafted ? (double)ms_.accepted / ms_.drafted : 0.0, ms_.plain_steps,
+                            ms_.drafted, ms_.draft_ms, ms_.verify_ms, ms_.plain_ms, ms_.prefill_mtp_ms);
         }
         std::printf("}\n");
         return 0;

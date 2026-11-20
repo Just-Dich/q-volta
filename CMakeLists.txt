@@ -77,6 +77,11 @@ add_executable(test_attn_decode_split tests/test_attn_decode_split.cu)
 target_link_libraries(test_attn_decode_split PRIVATE qv_cuda)
 target_compile_options(test_attn_decode_split PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-gpu-targets>)
 add_test(NAME attn_decode_split COMMAND test_attn_decode_split)
+add_executable(test_cuda_mtp tests/test_cuda_mtp.cpp)
+target_link_libraries(test_cuda_mtp PRIVATE qv_cuda CUDA::cudart)
+# needs the model and the GPU; skips itself when the model is missing. Override: -DQV_MTP_TEST_MODEL=prefix-or-.qv
+set(QV_MTP_TEST_MODEL "/workspace/q-volta-models/qv/qwen38-27b-e0" CACHE STRING "model for test_cuda_mtp")
+add_test(NAME cuda_mtp COMMAND test_cuda_mtp ${QV_MTP_TEST_MODEL} 64 1,3 ${CMAKE_SOURCE_DIR}/benchmarks/prompts/code.i32)
 endif()
 
 option(QV_CPU "Build the CPU decode ops library (qv_cpu_ops)" ON)

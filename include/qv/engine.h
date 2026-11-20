@@ -13,14 +13,16 @@ struct EngineOptions {
     int max_ctx = 4096;
     int prefill_chunk = 2048;  // tokens per batched prefill chunk
     int threads = 32;          // CPU backend: worker threads incl. the caller (RAM bandwidth saturates near 32 here)
-    bool mtp = false;          // CPU backend: load the MTP head and use it for exact speculative greedy decoding
+    bool mtp = false;          // load the MTP head and use it for exact speculative greedy decoding (CPU and CUDA backends)
+    int mtp_depth = 1;         // CUDA backend: drafts per verify cycle (1..3); verify processes depth+1 tokens
     bool dump_hidden = false;  // record residual stream after embed + each layer (debug / golden tests)
 };
 
-// Counters of the MTP speculative decode path (CPU backend; all zero otherwise).
+// Counters of the MTP speculative decode path (all zero when MTP is off).
 struct MtpStats {
     long cycles = 0;      // verify passes
     long accepted = 0;    // drafts accepted
+    long drafted = 0;     // drafts verified (CUDA backend; CPU: == cycles)
     long plain_steps = 0; // single-token steps (tail of the generation)
     double draft_ms = 0, verify_ms = 0, plain_ms = 0, prefill_mtp_ms = 0;
 };
