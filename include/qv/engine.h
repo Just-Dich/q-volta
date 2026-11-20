@@ -42,6 +42,11 @@ class Engine {
     virtual const std::vector<float>& hidden_dump() const = 0;
     virtual const std::vector<float>& logits_dump() const = 0;  // per-token logits of prefill() when dump_hidden
     virtual void sync() = 0;
+    // research hooks (CPU backend, branch p9/tier): snapshot/restore the recurrent state (GDN + conv; KV is rewritten by replay),
+    // and switch single-token attention to sparse block retrieval ("off" or "sink,recent,block,k[,agg]").
+    virtual void state_save() {}
+    virtual void state_restore() {}
+    virtual void set_sparse(const std::string&) {}
     virtual void set_mtp_enabled(bool) {}  // runtime switch (needs EngineOptions::mtp at construction)
     virtual void mtp_stats(MtpStats& s) const { s = MtpStats(); }
     virtual size_t device_bytes_weights() const = 0;

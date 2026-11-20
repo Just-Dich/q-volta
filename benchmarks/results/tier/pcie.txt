@@ -1,0 +1,13 @@
+bandwidth (pinned, best of reps)
+  size      H2D GB/s   D2H GB/s
+    1 MB     11.75      12.66
+    8 MB     12.35      12.83
+   64 MB     12.44      12.82
+  256 MB     12.38      12.94
+small-copy latency, wall clock around memcpyAsync + event sync (median of 2000)
+   6144 B D2H                    median    6.9 us  p90    7.3 us
+   6144 B H2D                    median    7.8 us  p90    8.6 us
+   6144 B D2H, sync, H2D, sync   median   14.5 us  p90   15.2 us
+  25600 B D2H                    median    8.3 us  p90    8.6 us
+  25600 B H2D                    median    9.2 us  p90    9.5 us
+  25600 B D2H, sync, H2D, sync   median   17.6 us  p90   18.3 us

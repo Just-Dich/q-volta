@@ -1,0 +1,3 @@
+loaded in 1.3s: weights 12.63 GiB, state+scratch 4.15 GiB, device used 0.00 / 0.00 GiB
+[kvdump] 32736 tokens, 528 queries/layer -> /workspace/q-volta-models/scratch-tier/niah32k
+prefill 32736 tokens: 2276.4 s (14.4 tok/s)

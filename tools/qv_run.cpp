@@ -29,6 +29,9 @@ static std::vector<int> read_i32(const std::string& p) {
 }
 
 int main(int argc, char** argv) {
+    int tail = 0, gen_n = 0;
+    std::string sparse_list;  // --tail M: prefill all but the last M prompt tokens, then step() the M tokens (teacher forced) and dump
+                              // their logits to --out (fp32); --gen G then greedy-decodes G tokens and prints the ids (research probe)
     std::string model, golden, out, prompt;
     bool bench = false, graph = false, use_prefill = false, mtp = false;
 #ifdef QV_HAVE_CUDA
@@ -54,6 +57,9 @@ int main(int argc, char** argv) {
         else if (a == "--mtp") mtp = true;
         else if (a == "--mtp-depth") mtp_depth = std::stoi(next());
         else if (a == "--graph") graph = true;
+        else if (a == "--tail") tail = std::stoi(next());
+        else if (a == "--sparse-list") sparse_list = next();
+        else if (a == "--gen") gen_n = std::stoi(next());
         else if (a == "--n") n = std::stoi(next());
         else if (a == "--max-ctx") max_ctx = std::stoi(next());
         else if (a == "--warmup") warm = std::stoi(next());
@@ -93,6 +99,52 @@ int main(int argc, char** argv) {
                  eng->device_bytes_weights() / 1073741824.0, eng->device_bytes_state() / 1073741824.0,
                  (tot - fr) / 1073741824.0, tot / 1073741824.0);
 
+    if (tail > 0) {
+        std::vector<int> toks = read_i32(prompt);
+        const int N = (int)toks.size();
+        auto t1 = std::chrono::steady_clock::now();
+        eng->prefill(toks.data(), N - tail, 0);
+        double pre_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+        std::fprintf(stderr, "prefill %d tokens: %.1f s (%.1f tok/s)\n", N - tail, pre_s, (N - tail) / pre_s);
+        std::vector<float> lg;
+        eng->logits(lg);  // logits after token N-tail-1 (predicts toks[N-tail])
+        std::vector<float> lg0 = lg;
+        // configs: "off" or "sink,recent,block,k[,agg]" separated by ';' (default: whatever QV_SPARSE says = one run)
+        std::vector<std::string> cfgs;
+        for (size_t b = 0; b <= sparse_list.size();) {
+            size_t e = sparse_list.find(';', b);
+            if (e == std::string::npos) e = sparse_list.size();
+            cfgs.push_back(sparse_list.substr(b, e - b));
+            b = e + 1;
+        }
+        if (sparse_list.empty()) cfgs = {"env"};
+        eng->state_save();
+        for (size_t ci = 0; ci < cfgs.size(); ++ci) {
+            if (cfgs[ci] != "env") eng->set_sparse(cfgs[ci]);
+            eng->state_restore();
+            std::ofstream o(out + (cfgs.size() > 1 ? "." + std::to_string(ci) : ""), std::ios::binary);
+            o.write((const char*)lg0.data(), lg0.size() * 4);
+            auto t2 = std::chrono::steady_clock::now();
+            for (int p = N - tail; p < N; ++p) {
+                eng->step(toks[p], p);
+                eng->logits(lg);
+                o.write((const char*)lg.data(), lg.size() * 4);
+            }
+            double st_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t2).count();
+            std::printf("{\"cfg\": \"%s\", \"tail_ms_per_step\": %.1f", cfgs[ci].c_str(), st_s * 1e3 / tail);
+            if (gen_n > 0) {
+                std::vector<int> g;
+                int first = eng->argmax();
+                eng->decode_greedy(first, N, gen_n, g, false);
+                std::printf(", \"gen\": [%d", first);
+                for (int x : g) std::printf(", %d", x);
+                std::printf("]");
+            }
+            std::printf("}\n");
+            std::fflush(stdout);
+        }
+        return 0;
+    }
     if (!golden.empty()) {
         std::vector<int> toks = read_i32(golden);
         std::ofstream o(out, std::ios::binary);
