@@ -7,7 +7,7 @@ __device__ __forceinline__ float clamp_h(float v) { return fminf(fmaxf(v, -65504
 // grid = (ceil(K/256), T)
 __global__ void embed_rows_kernel(QMat E, const int* __restrict__ toks, float* __restrict__ out) {
     const int row = toks[blockIdx.y];
-    const int C = E.K >> 5, G = E.K >> 6;
+    const int C = E.K >> 5, G = E.K >> E.gshift, GS = E.gshift - 5;
     float* o = out + (size_t)blockIdx.y * E.K;
     for (int k = blockIdx.x * blockDim.x + threadIdx.x; k < E.K; k += gridDim.x * blockDim.x) {
         const int c = k >> 5, i = k & 31;
@@ -21,7 +21,7 @@ __global__ void embed_rows_kernel(QMat E, const int* __restrict__ toks, float* _
             case 6: q = ((w[i & 3] >> (4 * (i >> 2))) & 15u) | (((w[4 + (i & 1)] >> (2 * (i >> 1))) & 3u) << 4); break;
             default: q = ((w[i & 3] >> (4 * (i >> 2))) & 15u) | (((w[4 + (i & 3)] >> (4 * (i >> 2))) & 15u) << 4);
         }
-        const float2 sm = __half22float2(E.sm[(size_t)row * G + (c >> 1)]);
+        const float2 sm = load_sm(E, row, G, c >> GS);
         o[k] = sm.x * (float)q + sm.y;
     }
 }

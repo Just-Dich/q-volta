@@ -27,7 +27,9 @@ struct TensorInfo {
     std::vector<int64_t> shape;
     uint64_t off = 0, nbytes = 0;        // dense
     uint64_t off_q = 0, nbytes_q = 0;    // quant words
-    uint64_t off_sm = 0, nbytes_sm = 0;  // quant (scale,min) fp16 pairs
+    uint64_t off_sm = 0, nbytes_sm = 0;  // quant (scale,min) fp16 pairs, or meta8: uint16 (s8 | z8<<8)
+    bool meta8 = false;                  // meta8 encoding: + fp16 row scales at off_rs (see tools/qv_quant.py)
+    uint64_t off_rs = 0, nbytes_rs = 0;
 };
 
 struct ModelFile {

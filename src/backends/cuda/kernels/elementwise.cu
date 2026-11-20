@@ -45,7 +45,7 @@ void rmsnorm(const float* x, const float* w, float* out, float* xs32, int n, flo
 // Dequantize one embedding row (token id read from device memory) into out[K].
 __global__ void embed_kernel(QMat E, const int* __restrict__ tok, float* __restrict__ out) {
     const int row = *tok;
-    const int C = E.K >> 5, G = E.K >> 6;
+    const int C = E.K >> 5, G = E.K >> E.gshift, GS = E.gshift - 5;
     for (int k = blockIdx.x * blockDim.x + threadIdx.x; k < E.K; k += gridDim.x * blockDim.x) {
         int c = k >> 5, i = k & 31;
         const uint32_t* w = E.q + ((size_t)row * C + c) * E.bits;
@@ -59,7 +59,7 @@ __global__ void embed_kernel(QMat E, const int* __restrict__ tok, float* __restr
             case 6: q = ((w[i & 3] >> (4 * (i >> 2))) & 15u) | (((w[4 + (i & 1)] >> (2 * (i >> 1))) & 3u) << 4); break;
             default: q = ((w[i & 3] >> (4 * (i >> 2))) & 15u) | (((w[4 + (i & 3)] >> (4 * (i >> 2))) & 15u) << 4);
         }
-        float2 sm = __half22float2(E.sm[(size_t)row * G + (c >> 1)]);
+        float2 sm = load_sm(E, row, G, c >> GS);
         out[k] = sm.x * (float)q + sm.y;
     }
 }

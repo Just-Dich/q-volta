@@ -38,7 +38,7 @@ __global__ void __launch_bounds__(WARPS * 32) gemv_q_kernel(QMat W, const float*
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row0 = blockIdx.x * R;
     const int C = W.K >> 5;
-    const int G = W.K >> 6;
+    const int G = W.K >> W.gshift, GS = W.gshift - 5;
     float acc[R];
 #pragma unroll
     for (int r = 0; r < R; ++r) acc[r] = 0.f;
@@ -63,7 +63,7 @@ __global__ void __launch_bounds__(WARPS * 32) gemv_q_kernel(QMat W, const float*
                 float d = 0.f;
 #pragma unroll
                 for (int i = 0; i < 32; ++i) d = fmaf(u2f(qval<BITS>(w, i)), xv[i], d);
-                float2 sm = __half22float2(W.sm[(size_t)row * G + (c >> 1)]);
+                float2 sm = load_sm(W, row, G, c >> GS);
                 acc[r] = fmaf(sm.x, d, fmaf(sm.y, xs, acc[r]));
             }
         }

@@ -5,6 +5,7 @@
 // as a short sequence of parallel regions on a spin-barrier pool; the projections of one region are flattened into a
 // single list of row chunks (dynamic claiming) and small elementwise/quantize/conv/residual work is fused into the
 // chunk epilogues so a GDN layer needs 5 dispatches and an attention layer 7.
+#include <deque>
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -441,13 +442,46 @@ class CpuEngine final : public Engine {
         base_ = (const char*)map_;
     }
     bool owned_ = false;
+    // group-128 tensors: the CPU kernels use 64-groups, so (scale,min) of each 128-group is duplicated into two 64-groups
+    // at load (identical arithmetic to the GPU g128 path; costs 0.25 bit/weight of RAM, no kernel change).
+    std::deque<std::vector<uint16_t>> sm_expanded_;
     QMatC qmat(const ModelFile& mf, const std::string& n) {
         const TensorInfo& t = mf.at(n);
         if (t.kind != Kind::Quant) throw std::runtime_error(n + " is not quantized");
-        if (t.group != 64) throw std::runtime_error("group 64 only");
+        if (t.group != 64 && t.group != 128) throw std::runtime_error("group must be 64 or 128");
         QMatC m;
         m.q = (const uint32_t*)(base_ + t.off_q);
         m.sm = (const uint16_t*)(base_ + t.off_sm);
+        if (t.group == 128 || t.meta8) {
+            // CPU kernels want fp16 (scale,min) per 64-group: expand g128 and/or decode meta8 (same fp32 formula as the
+            // CUDA load_sm), then round to fp16.
+            const int G = (int)(t.shape[1] / t.group);
+            const size_t rep = t.group / 64, rows = (size_t)t.shape[0];
+            std::vector<uint16_t> ex(rows * G * rep * 2);
+            const uint16_t* sm8 = (const uint16_t*)(base_ + t.off_sm);
+            const uint16_t* rs = t.meta8 ? (const uint16_t*)(base_ + t.off_rs) : nullptr;
+            const float zlo = -0.25f * (float)((1 << t.bits) - 1), zst = (float)(1.5 * (double)((1 << t.bits) - 1) / 255.0);
+            for (size_t r = 0; r < rows; ++r)
+                for (int g = 0; g < G; ++g) {
+                    uint16_t sh, mh;
+                    if (t.meta8) {
+                        const unsigned v = sm8[r * G + g];
+                        const float sc = (float)(v & 255u) * (_cvtsh_ss(rs[r]) / 255.0f);
+                        const float z = (float)(v >> 8) * zst + zlo;
+                        sh = _cvtss_sh(sc, 0);
+                        mh = _cvtss_sh(-(sc * z), 0);
+                    } else {
+                        sh = m.sm[(r * G + g) * 2];
+                        mh = m.sm[(r * G + g) * 2 + 1];
+                    }
+                    for (size_t d = 0; d < rep; ++d) {
+                        ex[((r * G + g) * rep + d) * 2] = sh;
+                        ex[((r * G + g) * rep + d) * 2 + 1] = mh;
+                    }
+                }
+            sm_expanded_.push_back(std::move(ex));
+            m.sm = sm_expanded_.back().data();
+        }
         m.N = (int)t.shape[0];
         m.K = (int)t.shape[1];
         m.bits = t.bits;

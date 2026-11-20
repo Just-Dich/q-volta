@@ -9,9 +9,8 @@ import os, struct, sys, shutil
 
 ALIGN = 2 << 20
 
-def main():
-    prefix = sys.argv[1]
-    out = sys.argv[2] if len(sys.argv) > 2 else prefix + ".qv"
+def pack(prefix, out=None, delete_src=False):
+    out = out or prefix + ".qv"
     js = open(prefix + ".qv.json", "rb").read()
     hdr = 24 + len(js)
     data_off = (hdr + ALIGN - 1) // ALIGN * ALIGN
@@ -24,6 +23,13 @@ def main():
             shutil.copyfileobj(b, o, 64 << 20)
     os.replace(tmp, out)
     print(f"wrote {out}: {os.path.getsize(out)} bytes, data_off={data_off}")
+    if delete_src:
+        os.remove(prefix + ".qv.json")
+        os.remove(prefix + ".qv.bin")
+
+
+def main():
+    pack(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)
 
 if __name__ == "__main__":
     main()

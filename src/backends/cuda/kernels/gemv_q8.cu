@@ -43,7 +43,7 @@ __global__ void __launch_bounds__(WARPS * 32) gemv_q8_kernel(QMat W, Q8Vec xv, f
     constexpr int ZP = 1 << (BITS - 1);
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row0 = blockIdx.x * R;
-    const int C = W.K >> 5, G = W.K >> 6;
+    const int C = W.K >> 5, G = W.K >> W.gshift, GS = W.gshift - 5;
     float acc[R];
 #pragma unroll
     for (int r = 0; r < R; ++r) acc[r] = 0.f;
@@ -67,7 +67,7 @@ __global__ void __launch_bounds__(WARPS * 32) gemv_q8_kernel(QMat W, Q8Vec xv, f
                 for (int b = 0; b < 8; ++b) d = dp4a_us(qword<BITS>(w, b), xw[b], d);
                 // centre q on zp = 2^(BITS-1): the activation-quantization error then multiplies (q - zp), not q
                 d -= ZP * qs;
-                const float2 sm = __half22float2(W.sm[(size_t)row * G + (c >> 1)]);
+                const float2 sm = load_sm(W, row, G, c >> GS);
                 acc[r] = fmaf(sm.x * dx, (float)d, fmaf(fmaf(sm.x, (float)ZP, sm.y), xs, acc[r]));
             }
         }
@@ -139,7 +139,7 @@ __global__ void __launch_bounds__(WARPS * 32) gemv_q8_multi_kernel(QMat W, Q8Vec
     constexpr int ZP = 1 << (BITS - 1);
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row0 = blockIdx.x * R;
-    const int C = W.K >> 5, G = W.K >> 6;
+    const int C = W.K >> 5, G = W.K >> W.gshift, GS = W.gshift - 5;
     float acc[NT][R];
 #pragma unroll
     for (int t = 0; t < NT; ++t)
@@ -158,7 +158,7 @@ __global__ void __launch_bounds__(WARPS * 32) gemv_q8_multi_kernel(QMat W, Q8Vec
             for (int b = 0; b < BITS; ++b) w[b] = __ldg(wp + b);
 #pragma unroll
             for (int b = 0; b < 8; ++b) qw[r][b] = qword<BITS>(w, b);
-            sm[r] = __half22float2(W.sm[(size_t)row * G + (c >> 1)]);
+            sm[r] = load_sm(W, row, G, c >> GS);
         }
 #pragma unroll
         for (int t = 0; t < NT; ++t) {

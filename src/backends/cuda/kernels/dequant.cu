@@ -19,7 +19,8 @@ __global__ void __launch_bounds__(256) dequant_kernel(QMat W, int row0, long lon
     uint32_t w[BITS];
 #pragma unroll
     for (int b = 0; b < BITS; ++b) w[b] = __ldg(wp + b);
-    const float2 sm = __half22float2(W.sm[gchunk >> 1]);
+    const long long crow = gchunk / C;
+    const float2 sm = load_sm(W, (size_t)crow, (size_t)(W.K >> W.gshift), (size_t)((gchunk - crow * C) >> (W.gshift - 5)));
     const int base = 8 * sub;
 
     // plane layout per bits: list of (width, shift, first word)

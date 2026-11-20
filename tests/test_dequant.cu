@@ -32,13 +32,13 @@ static void pack_chunk(const int* q, int bits, uint32_t* w) {
     }
   }
 }
-static void ref_dequant(const uint32_t* qw, const __half2* sm, int N, int K, int bits, std::vector<__half>& out) {
+static void ref_dequant(const uint32_t* qw, const __half2* sm, int N, int K, int bits, int grp, std::vector<__half>& out) {
   out.resize((size_t)N * K);
-  int C = K / 32, G = K / 64, q[32];
+  int C = K / 32, G = K / grp, cpg = grp / 32, q[32];
   for (int n = 0; n < N; ++n)
     for (int c = 0; c < C; ++c) {
       unpack_chunk(qw + ((size_t)n * C + c) * bits, bits, q);
-      float2 s = __half22float2(sm[(size_t)n * G + c / 2]);
+      float2 s = __half22float2(sm[(size_t)n * G + c / cpg]);
       for (int i = 0; i < 32; ++i) out[(size_t)n * K + c * 32 + i] = __float2half_rn(s.x * (float)q[i] + s.y);
     }
 }
@@ -50,10 +50,10 @@ static size_t cmp_bits(const std::vector<__half>& a, const std::vector<__half>& 
   return bad;
 }
 
-static int run_case(const char* tag, const std::vector<uint32_t>& qw, const std::vector<__half2>& sm, int N, int K, int bits,
+static int run_case(const char* tag, const std::vector<uint32_t>& qw, const std::vector<__half2>& sm, int N, int K, int bits, int grp,
                     bool gemv_check, std::mt19937& rng) {
-  std::vector<__half> ref; ref_dequant(qw.data(), sm.data(), N, K, bits, ref);
-  QMat W{up(qw), up(sm), N, K, bits};
+  std::vector<__half> ref; ref_dequant(qw.data(), sm.data(), N, K, bits, grp, ref);
+  QMat W{up(qw), up(sm), N, K, bits, grp == 128 ? 7 : 6};
   __half* d; cudaMalloc(&d, (size_t)N * K * 2);
   dequant_rows_f16(W, 0, N, d, 0);
   QV_CUDA_CHECK(cudaDeviceSynchronize());
@@ -87,12 +87,41 @@ static int run_case(const char* tag, const std::vector<uint32_t>& qw, const std:
   return !ok;
 }
 
+// meta8 (8-bit scale + 8-bit zero point + fp16 row scale): host decode with the kernel's fp32 formula, bit-exact fp16 output
+static int test_meta8(std::mt19937& rng) {
+  int fails = 0;
+  for (int bits : {3, 4}) for (int K : {5120, 17408}) {
+    const int N = 300, C = K / 32, G = K / 128;
+    std::vector<uint32_t> qw((size_t)N * C * bits); int q[32];
+    for (size_t i = 0; i < (size_t)N * C; ++i) { for (auto& v : q) v = rng() & ((1 << bits) - 1); pack_chunk(q, bits, &qw[i * bits]); }
+    std::vector<uint16_t> sm8((size_t)N * G); for (auto& v : sm8) v = (uint16_t)((1 + rng() % 255) | ((rng() % 256) << 8));
+    std::vector<__half> rs(N); for (auto& v : rs) v = __float2half(0.01f + 0.0001f * (rng() % 100));
+    const float zlo = -0.25f * ((1 << bits) - 1), zst = (float)(1.5 * ((1 << bits) - 1) / 255.0);
+    std::vector<__half> ref((size_t)N * K);
+    for (int n = 0; n < N; ++n) for (int c = 0; c < C; ++c) {
+      unpack_chunk(&qw[((size_t)n * C + c) * bits], bits, q);
+      unsigned v = sm8[(size_t)n * G + c / 4];
+      float sc = (float)(v & 255u) * (__half2float(rs[n]) / 255.0f), z = std::fmaf((float)(v >> 8), zst, zlo), mn = -(sc * z);
+      for (int i = 0; i < 32; ++i) ref[(size_t)n * K + c * 32 + i] = __float2half_rn(std::fmaf(sc, (float)q[i], mn));
+    }
+    QMat W{up(qw), nullptr, N, K, bits, 7};
+    W.sm8 = up(sm8); W.rs = up(rs); W.zlo = zlo; W.zstep = zst;
+    __half* d; cudaMalloc(&d, (size_t)N * K * 2);
+    dequant_rows_f16(W, 0, N, d, 0); QV_CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<__half> got((size_t)N * K); cudaMemcpy(got.data(), d, got.size() * 2, cudaMemcpyDeviceToHost);
+    size_t bad = cmp_bits(ref, got);
+    std::printf("meta8 g128 bits=%d K=%5d N=%d mismatches=%zu %s\n", bits, K, N, bad, bad == 0 ? "OK" : "FAIL");
+    fails += bad != 0; cudaFree(d); cudaFree((void*)W.q); cudaFree((void*)W.sm8); cudaFree((void*)W.rs);
+  }
+  return fails;
+}
+
 int main(int argc, char** argv) {
-  std::mt19937 rng(1234); int fails = 0;
+  std::mt19937 rng(1234); int fails = test_meta8(rng);
   // (1) random packed matrices
-  for (int bits : {3, 4, 6}) for (int K : {5120, 17408}) for (int N : {256, 1000, 17408}) {
+  for (int grp : {64, 128}) for (int bits : {3, 4, 6}) for (int K : {5120, 17408}) for (int N : {256, 1000, 17408}) {
     if ((size_t)N * K > 100000000) continue;  // keep host reference fast
-    int C = K / 32, G = K / 64;
+    int C = K / 32, G = K / grp;
     std::vector<uint32_t> qw((size_t)N * C * bits); std::vector<__half2> sm((size_t)N * G);
     int q[32];
     for (size_t i = 0; i < (size_t)N * C; ++i) {
@@ -101,7 +130,7 @@ int main(int argc, char** argv) {
     }
     std::uniform_real_distribution<float> u(-1.f, 1.f);
     for (auto& s : sm) s = __floats2half2_rn(u(rng) * 0.1f, u(rng));
-    fails += run_case("random", qw, sm, N, K, bits, N <= 1000 || K == 5120, rng);
+    fails += run_case(grp == 64 ? "random g64" : "random g128", qw, sm, N, K, bits, grp, N <= 1000 || K == 5120, rng);
   }
   // (2) real tensors
   std::string prefix = argc > 1 ? argv[1] : "/workspace/q-volta-models/qv/qwen38-27b-e0";
@@ -119,7 +148,7 @@ int main(int argc, char** argv) {
       std::vector<uint32_t> qw(ti.nbytes_q / 4); std::vector<__half2> sm(ti.nbytes_sm / 4);
       bin.seekg(ti.off_q); bin.read((char*)qw.data(), ti.nbytes_q);
       bin.seekg(ti.off_sm); bin.read((char*)sm.data(), ti.nbytes_sm);
-      fails += run_case(name.c_str(), qw, sm, N, K, ti.bits, N * (size_t)K < 100000000, rng);
+      fails += run_case(name.c_str(), qw, sm, N, K, ti.bits, ti.group, N * (size_t)K < 100000000, rng);
     }
     if (!got3 || !got4) { std::printf("FAIL: real tensors not found (3bit=%d 4bit=%d)\n", got3, got4); ++fails; }
   } catch (std::exception& e) { std::printf("FAIL: model load: %s\n", e.what()); ++fails; }

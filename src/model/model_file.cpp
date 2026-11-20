@@ -86,6 +86,12 @@ ModelFile ModelFile::open(const std::string& prefix_in) {
             ti.nbytes_q = v["nbytes_q"].i64();
             ti.off_sm = v["off_sm"].i64() + rebase;
             ti.nbytes_sm = v["nbytes_sm"].i64();
+            if (v.has("meta")) {
+                if (v["meta"].str() != "s8z8") throw std::runtime_error("unknown quant meta encoding: " + v["meta"].str());
+                ti.meta8 = true;
+                ti.off_rs = v["off_rs"].i64() + rebase;
+                ti.nbytes_rs = v["nbytes_rs"].i64();
+            }
         } else {
             ti.kind = k == "f32" ? Kind::F32 : Kind::F16;
             ti.off = v["off"].i64() + rebase;

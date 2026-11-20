@@ -702,13 +702,21 @@ class CudaEngine final : public Engine {
     QMat qmat(const ModelFile& mf, const std::string& n) {
         const TensorInfo& t = mf.at(n);
         if (t.kind != Kind::Quant) throw std::runtime_error(n + " is not quantized");
-        if (t.group != 64) throw std::runtime_error("group 64 only");
+        if (t.group != 64 && t.group != 128) throw std::runtime_error("group must be 64 or 128");
         QMat m;
         m.q = (const uint32_t*)(weights_ + t.off_q);
         m.sm = (const __half2*)(weights_ + t.off_sm);
+        if (t.meta8) {
+            m.sm = nullptr;
+            m.sm8 = (const uint16_t*)(weights_ + t.off_sm);
+            m.rs = (const __half*)(weights_ + t.off_rs);
+            m.zlo = -0.25f * (float)((1 << t.bits) - 1);
+            m.zstep = (float)(1.5 * (double)((1 << t.bits) - 1) / 255.0);
+        }
         m.N = (int)t.shape[0];
         m.K = (int)t.shape[1];
         m.bits = t.bits;
+        m.gshift = t.group == 128 ? 7 : 6;
         return m;
     }
     const float* f32(const ModelFile& mf, const std::string& n) {
