@@ -1,6 +1,6 @@
 import urllib.request,json,time,pathlib,sys
 label=sys.argv[1]; rows=[]
-prompts=[('code','Напиши на Python функцию binary_search для отсортированного списка. Добавь короткий пример вызова. Только код.'),('prose','Объясни простыми словами, почему сменяются времена года на Земле. Расскажи о наклоне оси и разнице между полушариями.')]
+prompts=[('code','Write a Python function binary_search for a sorted list. Add a short usage example. Code only.'),('prose','Explain in simple words why the seasons change on Earth. Mention the axial tilt and the difference between hemispheres.')]
 for kind,prompt in prompts:
  payload={'model':'qwen3.8-27b','messages':[{'role':'user','content':prompt}],'max_tokens':128,'temperature':0,'stream':True,'chat_template_kwargs':{'enable_thinking':False}}
  start=time.monotonic();first=None;parts=[];timings=None;err=None

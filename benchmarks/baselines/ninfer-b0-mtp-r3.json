@@ -1,45 +1,45 @@
 {
-  "label": "b0-mtp-r3",
-  "rows": [
-    {
-      "kind": "code",
-      "ttft": 0.19479432003572583,
-      "elapsed": 1.3886161157861352,
-      "timings": {
-        "cache_n": 0,
-        "draft_n": 98,
-        "draft_n_accepted": 94,
-        "predicted_ms": 1193.621077,
-        "predicted_n": 128,
-        "predicted_per_second": 106.39892546066359,
-        "predicted_per_token_ms": 9.398591157480315,
-        "prompt_ms": 131.553147,
-        "prompt_n": 37,
-        "prompt_per_second": 281.2551492971886,
-        "prompt_per_token_ms": 3.555490459459459
-      },
-      "text": "```python\ndef binary_search(arr, target):\n    left, right = 0, len(arr) - 1\n    while left <= right:\n        mid = (left + right) // 2\n        if arr[mid] == target:\n            return mid\n        elif arr[mid] < target:\n            left = mid + 1\n        else:\n            right = mid - 1\n    return -1\n\n# Пример вызова\nprint(binary_search([1, 3, 5, 7, 9], 5))  # Вывод: 2\n```",
-      "error": null
-    },
-    {
-      "kind": "prose",
-      "ttft": 0.1652185507118702,
-      "elapsed": 2.0068459366448224,
-      "timings": {
-        "cache_n": 0,
-        "draft_n": 153,
-        "draft_n_accepted": 76,
-        "predicted_ms": 1841.380003,
-        "predicted_n": 128,
-        "predicted_per_second": 68.97001150935166,
-        "predicted_per_token_ms": 14.499055141732283,
-        "prompt_ms": 136.830216,
-        "prompt_n": 47,
-        "prompt_per_second": 343.49138204970745,
-        "prompt_per_token_ms": 2.911281191489362
-      },
-      "text": "Представь, что Земля — это не просто шар, который крутится вокруг Солнца, а **наклоненный мяч**.\n\nВот простое объяснение того, почему у нас меняются времена года:\n\n### 1. Наклон оси (главная причина)\nЗемля вращается вокруг своей воображаемой оси (как волчок). Но эта ось **не стоит вертикально** (перпендикулярно к орбите), а наклонена примерно на **23,5 градуса**.\n\n*   Если бы ось была строго вертикальной, все точки Земли получали бы одинаковое",
-      "error": null
-    }
-  ]
+ "label": "b0-mtp-r3",
+ "rows": [
+  {
+   "kind": "code",
+   "ttft": 0.19479432003572583,
+   "elapsed": 1.3886161157861352,
+   "timings": {
+    "cache_n": 0,
+    "draft_n": 98,
+    "draft_n_accepted": 94,
+    "predicted_ms": 1193.621077,
+    "predicted_n": 128,
+    "predicted_per_second": 106.39892546066359,
+    "predicted_per_token_ms": 9.398591157480315,
+    "prompt_ms": 131.553147,
+    "prompt_n": 37,
+    "prompt_per_second": 281.2551492971886,
+    "prompt_per_token_ms": 3.555490459459459
+   },
+   "text": "<omitted: model output was in Russian; timings kept>",
+   "error": null
+  },
+  {
+   "kind": "prose",
+   "ttft": 0.1652185507118702,
+   "elapsed": 2.0068459366448224,
+   "timings": {
+    "cache_n": 0,
+    "draft_n": 153,
+    "draft_n_accepted": 76,
+    "predicted_ms": 1841.380003,
+    "predicted_n": 128,
+    "predicted_per_second": 68.97001150935166,
+    "predicted_per_token_ms": 14.499055141732283,
+    "prompt_ms": 136.830216,
+    "prompt_n": 47,
+    "prompt_per_second": 343.49138204970745,
+    "prompt_per_token_ms": 2.911281191489362
+   },
+   "text": "<omitted: model output was in Russian; timings kept>",
+   "error": null
+  }
+ ]
 }
