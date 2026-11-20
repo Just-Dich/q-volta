@@ -33,6 +33,10 @@ Constraints to honour now: keep the .qv format layout-agnostic (CPU backend repa
 layout); dispatch at runtime on HWCAP (NEON, dotprod, i8mm, bf16; SVE only if exposed); weights stay quantized (no fp16 expand).
 No aarch64 toolchain/qemu/device in this environment (2026-11-19) -> ARM numbers cannot be claimed until one is available.
 
+## MANDATORY (user 2026-11-20): beat competitors on PREFILL; 256K context on one V100 16GB
+256K = native max_position_embeddings. KV = 64 KiB/token fp16 (16 GiB @256K). Needs 4-bit KV AND weights+scratch <= ~11.3 GiB (now 13.28). 128K fits only with <=4.5-bit KV.
+Plan rows C1-C5, P1-P5 in ~/autoresearch-runs/q-volta/PLAN.md. Never claim a context length untested (NIAH + ppl at that length). Context vs quality is a profile trade-off.
+
 ## Commands
 ```
 cmake -S . -B build -G Ninja -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc && ninja -C build
