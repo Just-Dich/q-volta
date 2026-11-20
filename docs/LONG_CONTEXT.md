@@ -32,7 +32,7 @@ measured inputs) or *extrapolation* (fit beyond the measured range). Raw results
 CPU engine (`src/runtime/cpu_engine.cpp`, E0 weights, fp32 KV) with two debug hooks, both off unless an env var is set (see the comment block
 in the engine): `QV_KVDUMP=dir[,qstride]` writes fp16 K/V of all 16 attention layers plus the post-norm/RoPE queries of every 64th position
 (from 1023) and of the last 32 positions; `QV_SPARSE=sink,recent,block,k[,agg]` (or `qv_run --sparse-list`) switches single-token attention to
-sink + recent window + top-k 64-token blocks ranked by the Quest bound. `qv_run_cpu --tail T --sparse-list "cfg;cfg" [--gen G]` prefills all
+sink + recent window + top-k 64-token blocks ranked by the Quest bound. `qv_run_cpu --tail T --sparse-list "cfg;cfg" [--sparse-gen G]` prefills all
 but the last T tokens densely, snapshots the recurrent state and replays the T tokens for every config (KL/top-1/ppl; greedy generation).
 Prompts (`tools/make_longprompt.py`, wikitext-2 test text, Qwen tokenizer): `wiki32k` (first 32,768 tokens) and `niah32k` (32,768 tokens of the same
 text with `The secret passphrase for the vault is "amber-falcon-7421". Remember it.` inserted at token 16,361 (50%), question at the end).

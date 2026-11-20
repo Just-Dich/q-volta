@@ -21,6 +21,8 @@ bit-plane packed, asymmetric group-64 RTN; E0 bit plan mlp 3-bit, gdn/attn 4-bit
 - Real decode 51.1 tok/s (51.6 graph), VRAM 13.58 GiB, vs NInfer 45.4 plain (quality NOT yet compared: ours ppl 8.47->9.51, KL 0.122)
 - pi-adapter merged build running: logs/convert-pi-e0.log
 
+- int4 KV cache (branch p9/kv4): `--kv fp32|fp16|int4`; 18 KiB/token vs 128; ppl +-0.1%, passkey 6/6 to 32K, MTP exact, max_ctx 139K measured (fp32 18K); see docs/PERFORMANCE.md "int4 KV cache"
+
 ## MANDATORY: pi adapter (harness-hub/Qwen3.8-27B-pi-adapted)
 LoRA r=32 alpha=64 on MLP (64 layers) + attn q/k/v/o (16 layers); files in /workspace/q-volta-models/pi-adapter.
 Build: `python3 -I tools/convert.py --lora /workspace/q-volta-models/pi-adapter --out .../qv/qwen38-27b-pi-e0 --eval-dir .../qv/eval-pi-e0`

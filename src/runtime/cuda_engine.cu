@@ -132,14 +132,16 @@ class CudaEngine final : public Engine {
                 mv(at.k, xn_, kb_, nullptr);
                 mv(at.v, xn_, vb_, nullptr);
                 const size_t kv_layer = (size_t)c.n_kv_heads * opt_.max_ctx * c.head_dim;
-                float* kc = k_cache_ + L.idx_kind * kv_layer;
-                float* vc = v_cache_ + L.idx_kind * kv_layer;
+                float* kc = kv4_on_ ? nullptr : k_cache_ + L.idx_kind * kv_layer;
+                float* vc = kv4_on_ ? nullptr : v_cache_ + L.idx_kind * kv_layer;
                 AttnPrepArgs p{qg_, kb_, vb_, at.q_norm, at.k_norm, inv_freq_, qr_, kc, vc,
                                c.n_heads, c.n_kv_heads, c.head_dim, c.rope_dim, opt_.max_ctx, d_pos_, c.eps};
+                p.kv4 = kv4_of(L.idx_kind);
                 attn_prep(p, s);
                 AttnDecodeArgs d{qr_, qg_, kc, vc, nullptr, mix_, c.n_heads, c.n_kv_heads, opt_.max_ctx, d_pos_,
                                  q8_ ? xq_ : Q8Buf{}};
                 d.part = part_;
+                d.kv4 = p.kv4;
                 attn_decode(d, s);
                 if (!q8_) prep(mix_, at.o.K, false);
                 mv(at.o, mix_, x_, x_);
@@ -222,9 +224,10 @@ class CudaEngine final : public Engine {
             linear_seq(lp_, at.k, pf_xh_, n, pf_k_, s);
             linear_seq(lp_, at.v, pf_xh_, n, pf_v_, s);
             const size_t kv_layer = (size_t)c.n_kv_heads * opt_.max_ctx * c.head_dim;
-            float* kc = k_cache_ + L.idx_kind * kv_layer;
-            float* vc = v_cache_ + L.idx_kind * kv_layer;
+            float* kc = kv4_on_ ? nullptr : k_cache_ + L.idx_kind * kv_layer;
+            float* vc = kv4_on_ ? nullptr : v_cache_ + L.idx_kind * kv_layer;
             AttnSeqPrepArgs p{};
+            p.kv4 = kv4_of(L.idx_kind); p.stage_k = pf_sk_; p.stage_v = pf_sv_;
             p.qg = pf_qg_; p.k = pf_k_; p.v = pf_v_; p.q_norm = at.q_norm; p.k_norm = at.k_norm;
             p.inv_freq = inv_freq_; p.q_out = pf_qr_; p.k_cache = kc; p.v_cache = vc;
             p.n_heads = c.n_heads; p.n_kv_heads = c.n_kv_heads; p.head_dim = c.head_dim; p.rope_dim = c.rope_dim;
@@ -233,6 +236,7 @@ class CudaEngine final : public Engine {
             AttnSeqArgs d{};
             d.q = pf_qr_; d.qg = pf_qg_; d.k_cache = kc; d.v_cache = vc; d.out_h = pf_mixh_; d.out_f = nullptr;
             d.n_heads = c.n_heads; d.n_kv_heads = c.n_kv_heads; d.max_ctx = opt_.max_ctx; d.pos0 = pos0; d.T = n;
+            d.kv4 = p.kv4; d.stage_k = pf_sk_; d.stage_v = pf_sv_;
             attn_seq(d, s);
             linear_seq(lp_, at.o, pf_mixh_, n, pf_y_, s);
         }
@@ -259,6 +263,17 @@ class CudaEngine final : public Engine {
             pf_dump(++li, n, t0, hbase);
         }
         if (mtp_pf_) mtp_prefill_chunk(tokens, n, pos0, mtp_pf_last_ && t0 + n >= mtp_pf_T_);
+        if (opt_.row_logits) {  // eval mode: logits of every row to the callback
+            std::vector<float> lg(c.vocab);
+            for (int tt = 0; tt < n; ++tt) {
+                QV_CUDA_CHECK(cudaMemcpyAsync(x_, pf_x_ + (size_t)tt * H, H * 4, cudaMemcpyDeviceToDevice, s));
+                rmsnorm(x_, final_norm_, xn_, xs_, H, c.eps, s, q8_ ? &xq_ : nullptr);
+                mv(head_, xn_, logits_, nullptr);
+                QV_CUDA_CHECK(cudaMemcpyAsync(lg.data(), logits_, (size_t)c.vocab * 4, cudaMemcpyDeviceToHost, s));
+                QV_CUDA_CHECK(cudaStreamSynchronize(s));
+                opt_.row_logits(pos0 + tt, lg.data());
+            }
+        }
         if (opt_.dump_hidden) {  // test mode: logits for every token of the chunk (final norm + head per row)
             for (int tt = 0; tt < n; ++tt) {
                 QV_CUDA_CHECK(cudaMemcpyAsync(x_, pf_x_ + (size_t)tt * H, H * 4, cudaMemcpyDeviceToDevice, s));
@@ -278,7 +293,7 @@ class CudaEngine final : public Engine {
     float *pf_x_ = nullptr, *pf_y_ = nullptr, *pf_qkv_ = nullptr, *pf_conv_ = nullptr, *pf_z_ = nullptr,
           *pf_alpha_ = nullptr, *pf_beta_ = nullptr, *pf_qg_ = nullptr, *pf_k_ = nullptr, *pf_v_ = nullptr,
           *pf_qr_ = nullptr, *pf_g_ = nullptr, *pf_u_ = nullptr;
-    __half *pf_xh_ = nullptr, *pf_mixh_ = nullptr, *pf_acth_ = nullptr;
+    __half *pf_xh_ = nullptr, *pf_mixh_ = nullptr, *pf_acth_ = nullptr, *pf_sk_ = nullptr, *pf_sv_ = nullptr;
     int* pf_tok_ = nullptr;
     float* pf_m_ = nullptr;
 
@@ -307,6 +322,10 @@ class CudaEngine final : public Engine {
         pf_u_ = dalloc<float>((size_t)Tc * c.inter);
         pf_acth_ = dalloc<__half>((size_t)Tc * c.inter);
         pf_tok_ = dalloc<int>(Tc);
+        if (kv4_on_) {  // fp16 staging of the chunk's post-RoPE K / V (shared by all attention layers)
+            pf_sk_ = dalloc<__half>((size_t)Tc * c.n_kv_heads * c.head_dim);
+            pf_sv_ = dalloc<__half>((size_t)Tc * c.n_kv_heads * c.head_dim);
+        }
         if (opt_.mtp) pf_m_ = dalloc<float>((size_t)Tc * c.hidden);
     }
 
@@ -460,14 +479,16 @@ class CudaEngine final : public Engine {
             gemv_q8_multi(at.k, vxq_, NT, vkb_, nullptr, s);
             gemv_q8_multi(at.v, vxq_, NT, vvb_, nullptr, s);
             const size_t kv_layer = (size_t)c.n_kv_heads * opt_.max_ctx * c.head_dim;
-            float* kc = k_cache_ + L.idx_kind * kv_layer;
-            float* vc = v_cache_ + L.idx_kind * kv_layer;
+            float* kc = kv4_on_ ? nullptr : k_cache_ + L.idx_kind * kv_layer;
+            float* vc = kv4_on_ ? nullptr : v_cache_ + L.idx_kind * kv_layer;
             AttnPrepArgs p{vqg_, vkb_, vvb_, at.q_norm, at.k_norm, inv_freq_, vqr_, kc, vc,
                            c.n_heads, c.n_kv_heads, c.head_dim, c.rope_dim, opt_.max_ctx, dpos, c.eps};
             p.nt = NT; p.qg_stride = QGN; p.k_stride = KN; p.q_stride = QRN;
+            p.kv4 = kv4_of(L.idx_kind);
             attn_prep(p, s);
             AttnDecodeArgs d{vqr_, vqg_, kc, vc, nullptr, vmix_, c.n_heads, c.n_kv_heads, opt_.max_ctx, dpos, vxq_};
             d.part = vpart_;
+            d.kv4 = p.kv4;
             d.nt = NT; d.q_stride = QRN; d.qg_stride = QGN; d.out_stride = MIXS; d.q8_k = at.o.K;
             d.part_stride = (size_t)c.n_heads * ATTN_MAX_SPLITS * (c.head_dim + 2);
             attn_decode(d, s);
@@ -644,6 +665,12 @@ class CudaEngine final : public Engine {
     // state
     float *conv_state_ = nullptr, *gdn_state_ = nullptr, *k_cache_ = nullptr, *v_cache_ = nullptr;
     size_t conv_bytes_ = 0, gdn_bytes_ = 0;
+    // int4 KV (EngineOptions::kv_int4)
+    bool kv4_on_ = false;
+    uint8_t* kv4_blocks_ = nullptr;
+    __half *kv4_ring_k_ = nullptr, *kv4_ring_v_ = nullptr;
+    std::vector<Kv4Layer> kv4_;
+    Kv4Layer kv4_of(int idx) const { return kv4_on_ ? kv4_[idx] : Kv4Layer{}; }
     // scratch
     float *x_, *xn_, *xs_, *qkv_, *z_, *alpha_, *beta_, *conv_out_, *mix_, *qg_, *kb_, *vb_, *qr_, *part_, *g_, *u_,
         *act_, *logits_, *inv_freq_;
@@ -803,9 +830,32 @@ class CudaEngine final : public Engine {
         gdn_bytes_ = (size_t)n_gdn_ * c.lin_v_heads * c.lin_k_dim * c.lin_v_dim * 4;
         conv_state_ = dalloc<float>(conv_bytes_ / 4);
         gdn_state_ = dalloc<float>(gdn_bytes_ / 4);
-        size_t kv = (size_t)(n_attn_ + (opt_.mtp ? 1 : 0)) * c.n_kv_heads * opt_.max_ctx * c.head_dim;
-        k_cache_ = dalloc<float>(kv);
-        v_cache_ = dalloc<float>(kv);
+        kv4_on_ = opt_.kv_mode != 0;
+        const int n_kv_layers = n_attn_ + (opt_.mtp ? 1 : 0);
+        if (kv4_on_) {
+            if (c.head_dim != KV4_D || c.n_kv_heads * 6 != c.n_heads) throw std::runtime_error("int4/fp16 KV needs head_dim 256, 6 q heads per kv head");
+            const bool exact = opt_.kv_mode == 2;  // fp16 KV: full-length fp16 ring, no quantization
+            const int nblk = exact ? 1 : (opt_.max_ctx + KV4_BLK - 1) / KV4_BLK;
+            const int ring_n = exact ? opt_.max_ctx : KV4_RING;
+            kv4_blocks_ = dalloc<uint8_t>((size_t)n_kv_layers * c.n_kv_heads * nblk * KV4_REC_BYTES);
+            kv4_ring_k_ = dalloc<__half>((size_t)n_kv_layers * c.n_kv_heads * ring_n * KV4_D);
+            kv4_ring_v_ = dalloc<__half>((size_t)n_kv_layers * c.n_kv_heads * ring_n * KV4_D);
+            for (int i = 0; i < n_kv_layers; ++i) {
+                Kv4Layer l;
+                l.blocks = kv4_blocks_ + (size_t)i * c.n_kv_heads * nblk * KV4_REC_BYTES;
+                l.ring_k = kv4_ring_k_ + (size_t)i * c.n_kv_heads * ring_n * KV4_D;
+                l.ring_v = kv4_ring_v_ + (size_t)i * c.n_kv_heads * ring_n * KV4_D;
+                l.nblocks = nblk;
+                l.kmode = opt_.kv4_kmode;
+                l.ring_n = ring_n;
+                l.exact = exact;
+                kv4_.push_back(l);
+            }
+        } else {
+            size_t kv = (size_t)n_kv_layers * c.n_kv_heads * opt_.max_ctx * c.head_dim;
+            k_cache_ = dalloc<float>(kv);
+            v_cache_ = dalloc<float>(kv);
+        }
         x_ = dalloc<float>(c.hidden);
         xn_ = dalloc<float>(c.hidden);
         xs_ = dalloc<float>(std::max(c.inter, 2 * c.n_heads * c.head_dim) / 32 + 32);

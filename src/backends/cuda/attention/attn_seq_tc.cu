@@ -38,8 +38,57 @@ struct KvSrcF32 {
     const float* k;
     const float* v;
     int max_ctx;
+    // int4 KV (kv4.h): when kv4.blocks != nullptr keys are read per `quant` variant: dequantized from the block records
+    // (quant) or from the fp16 window (chunk staging for key >= pos0, ring otherwise); k/v are unused.
+    Kv4Layer kv4;
+    const __half *stage_k, *stage_v;
+    int pos0, Hkv;
     struct Frag { float4 x[C::NF]; };
-    __device__ __forceinline__ void fetch(Frag& f, bool is_v, int kvh, int k0, int n, int tid) const {
+    static __device__ __forceinline__ float2 h2f(uint32_t u) {
+        __half2 h = *reinterpret_cast<__half2*>(&u);
+        return make_float2(__low2float(h), __high2float(h));
+    }
+    __device__ __forceinline__ float4 load4_kv4(bool is_v, bool quant, int kvh, int key, int c4) const {
+        if (!quant) {
+            const __half* base;
+            if (key >= pos0) base = (is_v ? stage_v : stage_k) + ((size_t)(key - pos0) * Hkv + kvh) * D;
+            else base = (is_v ? kv4.ring_v : kv4.ring_k) + ((size_t)kvh * kv4.ring_n + kv4_slot(kv4, key)) * D;
+            uint2 u = *reinterpret_cast<const uint2*>(base + c4 * 4);
+            float2 x = h2f(u.x), y = h2f(u.y);
+            return make_float4(x.x, x.y, y.x, y.y);
+        }
+        const uint8_t* rec = kv4_rec(kv4, kvh, key >> 6);
+        const int t = key & 63;
+        if (!is_v) {
+            const uint32_t w = *reinterpret_cast<const uint32_t*>(rec + KV4_REC_K + t * 128 + (c4 & 31) * 4) >> ((c4 >> 5) * 16);
+            float sc[4], zr[4];
+            if (kv4.kmode == 0) {
+                uint4 u = reinterpret_cast<const uint4*>(rec + KV4_REC_KP)[c4];
+                float2 p0 = h2f(u.x), p1 = h2f(u.y), p2 = h2f(u.z), p3 = h2f(u.w);
+                sc[0] = p0.x; zr[0] = p0.y; sc[1] = p1.x; zr[1] = p1.y; sc[2] = p2.x; zr[2] = p2.y; sc[3] = p3.x; zr[3] = p3.y;
+            } else {
+                float2 p = h2f(reinterpret_cast<const uint32_t*>(rec + KV4_REC_KP)[t * 4 + (c4 >> 4)]);
+                sc[0] = sc[1] = sc[2] = sc[3] = p.x; zr[0] = zr[1] = zr[2] = zr[3] = p.y;
+            }
+            return make_float4(fmaf((float)(w & 15u), sc[0], zr[0]), fmaf((float)((w >> 4) & 15u), sc[1], zr[1]),
+                               fmaf((float)((w >> 8) & 15u), sc[2], zr[2]), fmaf((float)((w >> 12) & 15u), sc[3], zr[3]));
+        }
+        const float2 p = h2f(reinterpret_cast<const uint32_t*>(rec + KV4_REC_VP)[t * 4 + (c4 >> 4)]);
+        const int sh = (c4 >> 5) * 4;
+        const uint8_t* col = rec + KV4_REC_V + ((c4 * 4) & 127) * 64 + t;
+        return make_float4(fmaf((float)((col[0] >> sh) & 15u), p.x, p.y), fmaf((float)((col[64] >> sh) & 15u), p.x, p.y),
+                           fmaf((float)((col[128] >> sh) & 15u), p.x, p.y), fmaf((float)((col[192] >> sh) & 15u), p.x, p.y));
+    }
+    __device__ __forceinline__ void fetch(Frag& f, bool is_v, int kvh, int k0, int n, int tid, bool quant) const {
+        if (kv4.blocks) {
+#pragma unroll
+            for (int u = 0; u < C::NF; ++u) {
+                int idx = tid + u * C::NT, j = idx / (D / 4), c4 = idx % (D / 4), key = k0 + j;
+                f.x[u] = ((C::NF * C::NT == C::KT * (D / 4) || idx < C::KT * (D / 4)) && key < n) ? load4_kv4(is_v, quant, kvh, key, c4)
+                                                                                                  : make_float4(0.f, 0.f, 0.f, 0.f);
+            }
+            return;
+        }
         const float* base = (is_v ? v : k) + ((size_t)kvh * max_ctx) * D;
 #pragma unroll
         for (int u = 0; u < C::NF; ++u) {
@@ -106,12 +155,27 @@ __global__ void __launch_bounds__(C::NT, 1) attn_seq_tc_kernel(AttnSeqArgs a, Kv
 #pragma unroll
         for (int c = 0; c < C::CPW; ++c) wmma::fill_fragment(O[r][c], 0.f);
 
+    // int4 window rule: a tile is read quantized by rows whose kv4_q(lim+1) > k0 and from the fp16 window by the others. A tile
+    // needed in both variants is processed as two consecutive steps (quantized first); rows not owning the variant see the whole
+    // step as masked, which the online softmax treats as an empty tile.
+    const bool kv4on = src.kv4.blocks != nullptr;
+    const int Qlo = kv4on ? kv4_q(src.kv4, a.pos0 + q0 + 1) : 0, Qhi = kv4on ? kv4_q(src.kv4, a.pos0 + min(q0 + TQ - 1, a.T - 1) + 1) : 0;
+    const int row_q = kv4on ? kv4_q(src.kv4, lim + 1) : 0;  // this softmax row's window start
+    auto has_q = [&](int k) { return k < Qhi; };
+    auto has_f = [&](int k) { return k >= Qlo; };
     typename KvSrcF32<C>::Frag fr;
-    src.fetch(fr, false, kvh, 0, n, tid);  // first K tile
-    for (int k0 = 0; k0 < n; k0 += KT) {
+    int k0 = 0;
+    bool var = has_q(0);  // current step's variant (true = quantized)
+    src.fetch(fr, false, kvh, 0, n, tid, var);  // first K tile
+    while (k0 < n) {
         __syncthreads();  // previous PV finished reading KV
+        // next step
+        int nk0 = k0 + KT;
+        bool nvar;
+        if (var && has_f(k0)) { nk0 = k0; nvar = false; } else nvar = has_q(nk0);
+        const bool both = has_q(k0) && has_f(k0);
         src.store(fr, KV, tid);
-        src.fetch(fr, true, kvh, k0, n, tid);  // V tile in flight during S
+        src.fetch(fr, true, kvh, k0, n, tid, var);  // V tile in flight during S
         __syncthreads();
         if constexpr (C::SPLITD) {  // S = Q K^T: warp -> key tile (warp%KTN), D half (warp/KTN), all row tiles
             const int kt = warp % C::KTN, dh = warp / C::KTN;
@@ -149,7 +213,7 @@ __global__ void __launch_bounds__(C::NT, 1) attn_seq_tc_kernel(AttnSeqArgs a, Kv
         }
         __syncthreads();  // scores complete; K tile free
         src.store(fr, KV, tid);  // V tile
-        if (k0 + KT < n) src.fetch(fr, false, kvh, k0 + KT, n, tid);  // next K tile in flight during softmax + PV
+        if (nk0 < n) src.fetch(fr, false, kvh, nk0, n, tid, nvar);  // next K tile in flight during softmax + PV
         if (sm_active) {
             float sv[SU];
             float mx = -INFINITY;
@@ -157,7 +221,7 @@ __global__ void __launch_bounds__(C::NT, 1) attn_seq_tc_kernel(AttnSeqArgs a, Kv
             for (int u = 0; u < SU; ++u) {
                 int c = ssub + 4 * u;
                 float x = (C::SPLITD ? S[srow * LDS + c] + S1[srow * LDS + c] : S[srow * LDS + c]) * (0.0625f * 1.4426950408889634f);  // log2 domain
-                sv[u] = (k0 + c <= lim) ? x : -INFINITY;
+                sv[u] = (k0 + c <= lim && (!both || ((k0 < row_q) == var))) ? x : -INFINITY;
                 mx = fmaxf(mx, sv[u]);
             }
             mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
@@ -206,6 +270,8 @@ __global__ void __launch_bounds__(C::NT, 1) attn_seq_tc_kernel(AttnSeqArgs a, Kv
                 for (int c = 0; c < C::CPW; ++c) wmma::mma_sync(O[r][c], af, b[c], O[r][c]);
             }
         }
+        k0 = nk0;
+        var = nvar;
     }
     __syncthreads();  // l_s final
 #pragma unroll
@@ -237,7 +303,8 @@ void launch(const AttnSeqArgs& a, cudaStream_t s) {
         init = true;
     }
     dim3 grid((a.T + C::TQ - 1) / C::TQ, a.n_kv_heads);
-    attn_seq_tc_kernel<C><<<grid, C::NT, C::SMEM, s>>>(a, KvSrcF32<C>{a.k_cache, a.v_cache, a.max_ctx});
+    attn_seq_tc_kernel<C><<<grid, C::NT, C::SMEM, s>>>(a, KvSrcF32<C>{a.k_cache, a.v_cache, a.max_ctx, a.kv4, a.stage_k, a.stage_v, a.pos0, a.n_kv_heads});
+    if (a.kv4.blocks) kv4_ring_commit(a.kv4, a.n_kv_heads, a.stage_k, a.stage_v, a.pos0, a.T, s);  // after the reads of the old ring
 }
 }  // namespace
 
