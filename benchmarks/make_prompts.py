@@ -3,8 +3,8 @@ import json, sys, numpy as np
 from transformers import AutoTokenizer
 tok = AutoTokenizer.from_pretrained("/workspace/q-volta-models/Qwen3.8-27B")
 P = {  # identical to /workspace/bench-qwen27.py (pre-existing NInfer runs)
- "code": "Напиши на Python функцию binary_search для отсортированного списка. Добавь короткий пример вызова. Только код.",
- "prose": "Объясни простыми словами, почему сменяются времена года на Земле. Расскажи о наклоне оси и разнице между полушариями.",
+ "code": "Write a Python function binary_search for a sorted list. Add a short usage example. Code only.",
+ "prose": "Explain in simple words why the seasons change on Earth. Mention the axial tilt and the difference between hemispheres.",
 }
 for k, v in P.items():
     ids = tok.apply_chat_template([{"role": "user", "content": v}], add_generation_prompt=True, tokenize=True,

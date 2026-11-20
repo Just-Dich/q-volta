@@ -13,8 +13,8 @@ args = [BIN, MODEL, "--model-id", "qwen3.8-27b", "--device", "0", "--host", "127
         "--gdn-state-fp16", "--host-cache-mib", "512", "--prefill-chunk", "512"]
 args += ["--spec", "none"] if label == "base" else ["--spec", "mtp", "--draft-tokens", "3"]
 PROMPTS = {
- "code": "Напиши на Python функцию binary_search для отсортированного списка. Добавь короткий пример вызова. Только код.",
- "prose": "Объясни простыми словами, почему сменяются времена года на Земле. Расскажи о наклоне оси и разнице между полушариями.",
+ "code": "Write a Python function binary_search for a sorted list. Add a short usage example. Code only.",
+ "prose": "Explain in simple words why the seasons change on Earth. Mention the axial tilt and the difference between hemispheres.",
 }
 env = dict(os.environ, CUDA_VISIBLE_DEVICES="0")
 log = open(f"/workspace/q-volta/logs/ninfer-{label}.log", "w")
