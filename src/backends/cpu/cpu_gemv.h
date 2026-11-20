@@ -102,6 +102,12 @@ void gemm_q(const QMatC& W, const Q8Batch& X, int T, float* Y, size_t ldy, int r
 // Multi-threaded over the pool: dynamic claims of 8 rows; each claimed block handles all T tokens.
 void gemm_q_par(ThreadPool& pool, const QMatC& W, const Q8Batch& X, int T, float* Y, size_t ldy);
 
+// Multi-token GEMV for T <= 4 tokens (decode-time batches, e.g. speculative verification): weight planes are unpacked once
+// per row/group and applied to every token with exactly the arithmetic of gemv_q, so Y[t] is BIT-IDENTICAL to
+// gemv_q(W, x_t). (gemm_q is faster for large T but sums the weight-min term in a different order.)
+void gemv_multi_q(const QMatC& W, const Q8Batch& X, int T, float* Y, size_t ldy, int row0, int row1);
+void gemv_multi_q_par(ThreadPool& pool, const QMatC& W, const Q8Batch& X, int T, float* Y, size_t ldy);
+
 // Multi-threaded: rows split statically over the pool (multiples of 4 rows per thread).
 void gemv_q_par(ThreadPool& pool, const QMatC& W, const Q8ActC& x, float* y);
 

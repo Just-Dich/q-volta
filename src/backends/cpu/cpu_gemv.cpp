@@ -4,8 +4,14 @@
 
 #include <cmath>
 #include <cstring>
+#include <stdexcept>
+#include <vector>
 
 namespace qv::cpu {
+
+namespace {
+[[noreturn]] void throw_too_many_tokens() { throw std::invalid_argument("gemv_multi_q: T > 4"); }
+}  // namespace
 
 void quantize_act_q8(const float* x, int K, Q8ActC& out) {
     out.K = K;
@@ -214,6 +220,75 @@ void rows_kernel(const QMatC& W, const Q8ActC& x, float* y, int r0) {
         y[r0 + r] = hsum(accf[r]) + _mm_cvtss_f32(accm[r]);
 }
 
+
+// Multi-token GEMV: identical arithmetic (operation for operation) to rows_kernel for each token, but the weight bit
+// planes of a row/group are unpacked once and applied to T tokens (T <= 4). Results are bit-identical to gemv_q per token,
+// which is what exact speculative-decoding verification needs (gemm_q differs in the weight-min summation order).
+template <int BITS, int R, int T>
+void rows_kernel_multi(const QMatC& W, const Q8Batch& X, float* Y, size_t ldy, int r0) {
+    const int G = W.K / 64;
+    const size_t rw = W.row_words();
+    const uint32_t* wp[R];
+    const uint16_t* sp[R];
+    __m256 accf[R][T];
+    __m128 accm[R][T];
+    for (int r = 0; r < R; ++r) {
+        wp[r] = W.q + (size_t)(r0 + r) * rw;
+        sp[r] = W.sm + (size_t)(r0 + r) * G * 2;
+        for (int t = 0; t < T; ++t) { accf[r][t] = _mm256_setzero_ps(); accm[r][t] = _mm_setzero_ps(); }
+    }
+    constexpr int PF = 64;
+    for (int g = 0; g < G; ++g) {
+        __m256i xlo[T], xhi[T];
+        __m256 dvec[T];
+        __m128 ssum[T];
+        for (int t = 0; t < T; ++t) {
+            const int8_t* xq = X.q.data() + (size_t)t * X.K;
+            const float* ds = X.ds.data() + (size_t)t * X.G * 4;
+            xlo[t] = _mm256_loadu_si256((const __m256i*)(xq + 64 * g));
+            xhi[t] = _mm256_loadu_si256((const __m256i*)(xq + 64 * g + 32));
+            const __m128 dsg = _mm_loadu_ps(ds + 4 * g);
+            dvec[t] = _mm256_insertf128_ps(_mm256_castps128_ps256(_mm_shuffle_ps(dsg, dsg, 0x00)), _mm_shuffle_ps(dsg, dsg, 0x55), 1);
+            ssum[t] = _mm_add_ss(_mm_shuffle_ps(dsg, dsg, 2), _mm_shuffle_ps(dsg, dsg, 3));
+        }
+        const __m256i ones = _mm256_set1_epi16(1);
+        for (int r = 0; r < R; ++r) {
+            const uint32_t* p = wp[r] + (size_t)g * 2 * BITS;
+            _mm_prefetch((const char*)(p + PF), _MM_HINT_T0);
+            __m256i lo, hi;
+            unpack_group<BITS>(p, lo, hi);
+            uint32_t smw;
+            std::memcpy(&smw, sp[r] + 2 * g, 4);
+            const __m128 tt = _mm_cvtph_ps(_mm_cvtsi32_si128((int)smw));
+            const __m256 sc = _mm256_broadcastss_ps(tt);
+            for (int t = 0; t < T; ++t) {
+                const __m256i s = _mm256_add_epi16(_mm256_maddubs_epi16(lo, xlo[t]), _mm256_maddubs_epi16(hi, xhi[t]));
+                const __m256i d = _mm256_madd_epi16(s, ones);
+                accm[r][t] = _mm_add_ps(accm[r][t], _mm_mul_ss(_mm_shuffle_ps(tt, tt, 1), ssum[t]));
+                accf[r][t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d), _mm256_mul_ps(dvec[t], sc), accf[r][t]);
+            }
+        }
+    }
+    for (int r = 0; r < R; ++r)
+        for (int t = 0; t < T; ++t) Y[(size_t)t * ldy + r0 + r] = hsum(accf[r][t]) + _mm_cvtss_f32(accm[r][t]);
+}
+
+template <int BITS, int T>
+void multi_bits_T(const QMatC& W, const Q8Batch& X, float* Y, size_t ldy, int row0, int row1) {
+    int r = row0;
+    for (; r + 4 <= row1; r += 4) rows_kernel_multi<BITS, 4, T>(W, X, Y, ldy, r);
+    for (; r < row1; ++r) rows_kernel_multi<BITS, 1, T>(W, X, Y, ldy, r);
+}
+template <int BITS>
+void multi_bits(const QMatC& W, const Q8Batch& X, int T, float* Y, size_t ldy, int row0, int row1) {
+    switch (T) {
+        case 1: multi_bits_T<BITS, 1>(W, X, Y, ldy, row0, row1); break;
+        case 2: multi_bits_T<BITS, 2>(W, X, Y, ldy, row0, row1); break;
+        case 3: multi_bits_T<BITS, 3>(W, X, Y, ldy, row0, row1); break;
+        default: multi_bits_T<BITS, 4>(W, X, Y, ldy, row0, row1); break;
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 // Batched GEMM. Loop nest per claimed row block (RB rows, one thread):
 //   for K chunk (KCG groups):  unpack RB rows x KCG groups -> int8 buffer (once)
@@ -411,6 +486,35 @@ void gemm_q(const QMatC& W, const Q8Batch& X, int T, float* Y, size_t ldy, int r
         }
         default: break;
     }
+}
+
+void gemv_multi_q(const QMatC& W, const Q8Batch& X, int T, float* Y, size_t ldy, int row0, int row1) {
+    if (T <= 0) return;
+    if (T > 4) throw_too_many_tokens();
+    switch (W.bits) {
+        case 2: multi_bits<2>(W, X, T, Y, ldy, row0, row1); break;
+        case 3: multi_bits<3>(W, X, T, Y, ldy, row0, row1); break;
+        case 4: multi_bits<4>(W, X, T, Y, ldy, row0, row1); break;
+        case 5: multi_bits<5>(W, X, T, Y, ldy, row0, row1); break;
+        case 6: multi_bits<6>(W, X, T, Y, ldy, row0, row1); break;
+        default: {  // 8 bit: per-token GEMV
+            Q8ActC a;
+            a.K = X.K;
+            a.q.resize((size_t)X.K);
+            a.ds.resize((size_t)X.G * 4);
+            std::vector<float> y((size_t)W.N);
+            for (int t = 0; t < T; ++t) {
+                std::memcpy(a.q.data(), X.q.data() + (size_t)t * X.K, X.K);
+                std::memcpy(a.ds.data(), X.ds.data() + (size_t)t * X.G * 4, (size_t)X.G * 16);
+                gemv_q(W, a, y.data(), row0, row1);
+                for (int r = row0; r < row1; ++r) Y[(size_t)t * ldy + r] = y[r];
+            }
+        }
+    }
+}
+
+void gemv_multi_q_par(ThreadPool& pool, const QMatC& W, const Q8Batch& X, int T, float* Y, size_t ldy) {
+    pool.parallel_for_dyn((size_t)W.N, [&](size_t b, size_t e, int) { gemv_multi_q(W, X, T, Y, ldy, (int)b, (int)e); }, 16);
 }
 
 void gemm_q_par(ThreadPool& pool, const QMatC& W, const Q8Batch& X, int T, float* Y, size_t ldy) {

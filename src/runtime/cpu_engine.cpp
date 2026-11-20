@@ -148,12 +148,15 @@ class CpuEngine final : public Engine {
 
     void step(int token, int pos) override {
         if (pos >= opt_.max_ctx) throw std::runtime_error("context overflow");
+        mtp_ready_ = -1;
         forward(token, pos, true);
     }
 
     void prefill(const int* tokens, int T, int pos0) override {
         if (pos0 + T > opt_.max_ctx) throw std::runtime_error("context overflow");
         if (T <= 0) return;
+        mtp_prefill_ = opt_.mtp && mtp_on_ && !opt_.dump_hidden && (pos0 == 0 || pos0 == mtp_ready_);
+        mtp_ready_ = -1;
         if (std::getenv("QV_PREFILL_STEP")) {  // reference path: token-by-token (identical to step())
             for (int t = 0; t < T; ++t) {
                 const bool need = opt_.dump_hidden || t == T - 1;
@@ -163,11 +166,13 @@ class CpuEngine final : public Engine {
             return;
         }
         prefill_batched(tokens, T, pos0);
+        if (mtp_prefill_) mtp_ready_ = pos0 + T;
     }
 
     void decode_greedy(int first, int start_pos, int n, std::vector<int>& out, bool) override {
         if (start_pos + n > opt_.max_ctx) throw std::runtime_error("context overflow");
         out.resize(n);
+        if (opt_.mtp && mtp_on_ && n >= 2 && mtp_ready_ == start_pos) { decode_mtp(first, start_pos, n, out); return; }
         int tok = first;
         for (int i = 0; i < n; ++i) {
             forward(tok, start_pos + i, true);
@@ -176,14 +181,15 @@ class CpuEngine final : public Engine {
         }
     }
 
-    int argmax() override {
+    int argmax() override { return argmax_of(logits_.data()); }
+    int argmax_of(const float* lg) {
         QV_PHASE(P_ARGMAX);
         const int V = cfg_.vocab, nt = pool_.size();
         std::vector<float>& bv = arg_val_;
         std::vector<int>& bi = arg_idx_;
         bv.assign(nt, -INFINITY);
         bi.assign(nt, 0x7fffffff);
-        pool_.parallel_for((size_t)V, [&](size_t b, size_t e, int t) { argmax_range(logits_.data(), (int)b, (int)e, &bv[t], &bi[t]); }, 64);
+        pool_.parallel_for((size_t)V, [&](size_t b, size_t e, int t) { argmax_range(lg, (int)b, (int)e, &bv[t], &bi[t]); }, 64);
         int r;
         argmax_merge(bv.data(), bi.data(), nt, &r);
         return r;
@@ -194,7 +200,10 @@ class CpuEngine final : public Engine {
         std::memset(gdn_state_.data(), 0, gdn_state_.size() * 4);
         hidden_.clear();
         logits_all_.clear();
+        mtp_ready_ = -1;
     }
+    void mtp_stats(MtpStats& s) const override { s = mtp_st_; }
+    void set_mtp_enabled(bool on) override { mtp_on_ = on && opt_.mtp; mtp_ready_ = -1; }
     const std::vector<float>& hidden_dump() const override { return hidden_; }
     const std::vector<float>& logits_dump() const override { return logits_all_; }
     void sync() override {}
@@ -225,6 +234,17 @@ class CpuEngine final : public Engine {
     std::vector<int> arg_idx_;
     Q8ActC xq_, xq_mix_, xq_act_;
     std::vector<float> hidden_, logits_all_;
+    // ---- MTP speculative decoding
+    Layer mtp_L_{};
+    QMatC mtp_fc_{};
+    const float *mtp_norm_ = nullptr, *mtp_pre_e_ = nullptr, *mtp_pre_h_ = nullptr;
+    int mtp_ready_ = -1;        // MTP KV + mtp_hid_last_ valid for context [0, mtp_ready_)
+    bool mtp_prefill_ = false;
+    bool mtp_on_ = true;
+    bool mtp_hid_pre_ = false;  // QV_MTP_HIDDEN=pre: feed the pre-final-norm residual instead of the normed hidden
+    std::vector<float> mtp_hid_last_, mtp_logits_, vlog_, mh_, mhc_, gdn_alt_, conv_alt_;
+    bool spec_snap_ = false;    // pb_gdn: keep the recurrent state after token 0 of a 2-token verify in *_alt_
+    MtpStats mtp_st_;
     int splits_ = 64;
     std::vector<Job> jobs_;
 
@@ -341,6 +361,31 @@ class CpuEngine final : public Engine {
         }
         n_gdn_ = ng;
         n_attn_ = na;
+        if (opt_.mtp) {
+            const std::string p = "mtp.layers.0.";
+            mtp_fc_ = qmat(mf, "mtp.fc.weight");
+            mtp_norm_ = f32(mf, "mtp.norm.weight");
+            mtp_pre_e_ = f32(mf, "mtp.pre_fc_norm_embedding.weight");
+            mtp_pre_h_ = f32(mf, "mtp.pre_fc_norm_hidden.weight");
+            Layer L{};
+            L.attn = true;
+            L.idx_kind = na;  // own KV cache slot after the main attention layers
+            L.in_norm = f32(mf, p + "input_layernorm.weight");
+            L.post_norm = f32(mf, p + "post_attention_layernorm.weight");
+            L.gate = qmat(mf, p + "mlp.gate_proj.weight");
+            L.up = qmat(mf, p + "mlp.up_proj.weight");
+            L.down = qmat(mf, p + "mlp.down_proj.weight");
+            L.at.q = qmat(mf, p + "self_attn.q_proj.weight");
+            L.at.k = qmat(mf, p + "self_attn.k_proj.weight");
+            L.at.v = qmat(mf, p + "self_attn.v_proj.weight");
+            L.at.o = qmat(mf, p + "self_attn.o_proj.weight");
+            L.at.q_norm = f32(mf, p + "self_attn.q_norm.weight");
+            L.at.k_norm = f32(mf, p + "self_attn.k_norm.weight");
+            mtp_L_ = L;
+            if (mtp_fc_.K != 2 * cfg_.hidden || mtp_fc_.N != cfg_.hidden) throw std::runtime_error("unexpected mtp.fc shape");
+            const char* hm = std::getenv("QV_MTP_HIDDEN");
+            mtp_hid_pre_ = hm && std::string(hm) == "pre";
+        }
     }
 
     static void prep_q8(Q8ActC& a, int K) {
@@ -355,7 +400,7 @@ class CpuEngine final : public Engine {
         const int VD = c.lin_v_heads * c.lin_v_dim, QD = c.n_heads * c.head_dim;
         conv_state_.assign((size_t)n_gdn_ * conv_C * 3, 0.f);
         gdn_state_.assign((size_t)n_gdn_ * c.lin_v_heads * c.lin_k_dim * c.lin_v_dim, 0.f);
-        const size_t kv = (size_t)n_attn_ * c.n_kv_heads * opt_.max_ctx * c.head_dim;
+        const size_t kv = (size_t)(n_attn_ + (opt_.mtp ? 1 : 0)) * c.n_kv_heads * opt_.max_ctx * c.head_dim;
         k_cache_ = (float*)std::calloc(kv, 4);
         v_cache_ = (float*)std::calloc(kv, 4);
         if (!k_cache_ || !v_cache_) throw std::runtime_error("KV cache allocation failed");
@@ -363,6 +408,14 @@ class CpuEngine final : public Engine {
         x_.assign(c.hidden, 0.f); xn_.assign(c.hidden, 0.f);
         qkv_.assign(conv_C, 0.f); conv_out_.assign(conv_C, 0.f);
         z_.assign(VD, 0.f); alpha_.assign(c.lin_v_heads, 0.f); beta_.assign(c.lin_v_heads, 0.f);
+        if (opt_.mtp) {
+            gdn_alt_.assign(gdn_state_.size(), 0.f);
+            conv_alt_.assign(conv_state_.size(), 0.f);
+            mtp_hid_last_.assign(c.hidden, 0.f);
+            mtp_logits_.assign(c.vocab, 0.f);
+            vlog_.assign((size_t)2 * c.vocab, 0.f);
+            mh_.assign((size_t)2 * c.hidden, 0.f);
+        }
         mix_.assign(std::max(VD, QD), 0.f);
         qg_.assign(2 * QD, 0.f); kb_.assign(c.n_kv_heads * c.head_dim, 0.f); vb_.assign(kb_.size(), 0.f);
         qr_.assign(QD, 0.f);
@@ -454,7 +507,7 @@ class CpuEngine final : public Engine {
     struct PB {  // chunk scratch
         int Tc = 0;
         std::vector<float> x, xn, qkv, conv, z, al, be, mix, qg, kb, vb, qr, part, g, u, tmp, rope;
-        Q8Batch xq, xqmix, xqact;
+        Q8Batch xq, xqmix, xqact, xqfc;
     } pb_;
 
     template <class F>
@@ -469,7 +522,12 @@ class CpuEngine final : public Engine {
     }
     bool diag_gemv_ = std::getenv("QV_DIAG_GEMV") != nullptr;  // debug: per-token gemv_q instead of gemm_q
     void gemm(const QMatC& W, const Q8Batch& xb, int Tn, float* y) {
-        if (!diag_gemv_) { gemm_q_par(pool_, W, xb, Tn, y, (size_t)W.N); return; }
+        if (!diag_gemv_) {
+            // <= 4 tokens (decode-time batches): bit-exact multi-token GEMV; larger: tiled GEMM
+            if (Tn <= 4) gemv_multi_q_par(pool_, W, xb, Tn, y, (size_t)W.N);
+            else gemm_q_par(pool_, W, xb, Tn, y, (size_t)W.N);
+            return;
+        }
         Q8ActC a; a.K = xb.K; a.q.resize(xb.K); a.ds.resize((size_t)xb.G * 4);
         std::vector<float> row(W.N);
         for (int t = 0; t < Tn; ++t) {
@@ -497,6 +555,7 @@ class CpuEngine final : public Engine {
         pb_.xq.resize(Tc, c.hidden);
         pb_.xqmix.resize(Tc, std::max(VD, QD));
         pb_.xqact.resize(Tc, c.inter);
+        if (opt_.mtp) pb_.xqfc.resize(Tc, 2 * c.hidden);
     }
 
     void prefill_batched(const int* tokens, int T, int pos0) {
@@ -528,23 +587,7 @@ class CpuEngine final : public Engine {
                 });
             });
             for (int li = 0; li < NL; ++li) {
-                const Layer& L = layers_[li];
-                pb_norm_quant(L.in_norm, Tn);
-                if (!L.attn) pb_gdn(L, Tn); else pb_attn(L, Tn, p0);
-                pb_norm_quant(L.post_norm, Tn);
-                timed(PP_GATE, [&] { gemm(L.gate, pb_.xq, Tn, pb_.g.data()); });
-                timed(PP_UP, [&] { gemm(L.up, pb_.xq, Tn, pb_.u.data()); });
-                timed(PP_ACT, [&] {
-                    par_tok(Tn, 1, [&](int b, int e) {
-                        for (int t = b; t < e; ++t) {
-                            float* g = pb_.g.data() + (size_t)t * c.inter;
-                            silu_mul_range(g, pb_.u.data() + (size_t)t * c.inter, g, 0, c.inter);
-                            pb_.xqact.quantize_row(t, g, c.inter);
-                        }
-                    });
-                });
-                timed(PP_DOWN, [&] { gemm(L.down, pb_.xqact, Tn, pb_.tmp.data()); });
-                pb_residual(Tn);
+                pb_layer(layers_[li], Tn, p0);
                 if (opt_.dump_hidden)
                     for (int t = 0; t < Tn; ++t)
                         std::memcpy(hidden_.data() + ((dump_tok0 + c0 + t) * (size_t)(NL + 1) + li + 1) * H, X + (size_t)t * H, H * 4);
@@ -562,7 +605,29 @@ class CpuEngine final : public Engine {
                     run_jobs();
                 });
             }
+            if (mtp_prefill_) mtp_prefill_chunk(tokens, T, c0, Tn, p0);
         }
+    }
+
+    // one decoder layer over the chunk in pb_.x (rope tables in pb_.rope must match positions p0..)
+    void pb_layer(const Layer& L, int Tn, int p0) {
+        const Config& c = cfg_;
+        pb_norm_quant(L.in_norm, Tn);
+        if (!L.attn) pb_gdn(L, Tn); else pb_attn(L, Tn, p0);
+        pb_norm_quant(L.post_norm, Tn);
+        timed(PP_GATE, [&] { gemm(L.gate, pb_.xq, Tn, pb_.g.data()); });
+        timed(PP_UP, [&] { gemm(L.up, pb_.xq, Tn, pb_.u.data()); });
+        timed(PP_ACT, [&] {
+            par_tok(Tn, 1, [&](int b, int e) {
+                for (int t = b; t < e; ++t) {
+                    float* g = pb_.g.data() + (size_t)t * c.inter;
+                    silu_mul_range(g, pb_.u.data() + (size_t)t * c.inter, g, 0, c.inter);
+                    pb_.xqact.quantize_row(t, g, c.inter);
+                }
+            });
+        });
+        timed(PP_DOWN, [&] { gemm(L.down, pb_.xqact, Tn, pb_.tmp.data()); });
+        pb_residual(Tn);
     }
 
     void pb_norm_quant(const float* w, int Tn) {
@@ -602,8 +667,13 @@ class CpuEngine final : public Engine {
         float* cs = conv_state_.data() + (size_t)L.idx_kind * C * 3;
         timed(PP_CONV, [&] {  // causal conv: sequential over tokens, parallel over channel blocks
             pool_.parallel_for_dyn((size_t)C, [&](size_t b, size_t e, int) {
-                for (int t = 0; t < Tn; ++t)
+                for (int t = 0; t < Tn; ++t) {
                     conv_step_range(pb_.qkv.data() + (size_t)t * C, g.conv_w, cs, pb_.conv.data() + (size_t)t * C, (int)b, (int)e);
+                    if (spec_snap_ && Tn == 2 && t == 0) {  // state after token 0 (rollback point of the speculative token)
+                        float* ca = conv_alt_.data() + (size_t)L.idx_kind * C * 3;
+                        std::memcpy(ca + b * 3, cs + b * 3, (e - b) * 3 * sizeof(float));
+                    }
+                }
             }, 128);
         });
         timed(PP_GDN, [&] {  // delta-rule recurrence: sequential over tokens, parallel over v-heads
@@ -614,6 +684,11 @@ class CpuEngine final : public Engine {
                               g.dt_bias, pb_.z.data() + (size_t)t * VD, g.norm_w, st, pb_.mix.data() + (size_t)t * mld,
                               c.lin_k_heads, Hv, c.lin_k_dim, dv, c.eps};
                     gdn_step_range(a, (int)b, (int)e);
+                    if (spec_snap_ && Tn == 2 && t == 0) {
+                        const size_t hs = (size_t)c.lin_k_dim * dv;
+                        float* ga = gdn_alt_.data() + (size_t)L.idx_kind * Hv * hs;
+                        std::memcpy(ga + b * hs, st + b * hs, (e - b) * hs * sizeof(float));
+                    }
                 }
             }, 1);
         });
@@ -659,6 +734,27 @@ class CpuEngine final : public Engine {
             return AttnDecodeArgs{pb_.qr.data() + (size_t)t * QD, pb_.qg.data() + (size_t)t * 2 * QD, kc, vc, pb_.part.data() + (size_t)t * pf,
                                   pb_.mix.data() + (size_t)t * mld, Hq, Hkv, D, opt_.max_ctx, p0 + t + 1, 1};
         };
+        if (Tn <= 4) {
+            // decode-time batch: per token the same split-K attention as the single-token path (bit-identical results)
+            timed(PP_ATT, [&] {
+                for (int t = 0; t < Tn; ++t) {
+                    AttnDecodeArgs d{pb_.qr.data() + (size_t)t * QD, pb_.qg.data() + (size_t)t * 2 * QD, kc, vc, part_.data(),
+                                     pb_.mix.data() + (size_t)t * mld, Hq, Hkv, D, opt_.max_ctx, p0 + t + 1, splits_};
+                    const int ns = attn_active_splits(d.n_keys, splits_);
+                    pool_.parallel_for_dyn((size_t)Hkv * ns, [&](size_t b, size_t e, int) {
+                        for (size_t w = b; w < e; ++w) {
+                            const int item = (int)(w / ns) * splits_ + (int)(w % ns);
+                            attn_decode_range(d, item, item + 1);
+                        }
+                    }, 1);
+                    pool_.parallel_for_dyn((size_t)Hq, [&](size_t b, size_t e, int) { attn_merge_range(d, (int)b, (int)e); }, 1);
+                    pb_.xqmix.quantize_row(t, d.out, QD);
+                }
+            });
+            timed(PP_OUT, [&] { gemm(at.o, pb_.xqmix, Tn, pb_.tmp.data()); });
+            pb_residual(Tn);
+            return;
+        }
         timed(PP_ATT, [&] {  // item = (kv head, token); kv-head-major so one head's K/V stays cache-resident; causal keys per token
             pool_.parallel_for_dyn((size_t)Hkv * Tn, [&](size_t b, size_t e, int) {
                 for (size_t w = b; w < e; ++w) {
@@ -677,6 +773,126 @@ class CpuEngine final : public Engine {
         });
         timed(PP_OUT, [&] { gemm(at.o, pb_.xqmix, Tn, pb_.tmp.data()); });
         pb_residual(Tn);
+    }
+
+    // ---------------------------------------------------------------- MTP (multi-token prediction) speculative decoding
+    // Head semantics (Qwen3-Next / Qwen3.5 MTP, as in vLLM qwen3_next_mtp.py): for position q with main-model hidden h_q and
+    // the NEXT token t_{q+1}:  e = pre_fc_norm_embedding(embed(t_{q+1})), h = pre_fc_norm_hidden(h_q),
+    // x = fc(concat[e, h]); one full-attention decoder layer (own KV cache, RoPE position q); out = mtp.norm(x);
+    // logits = lm_head(out) predict t_{q+2}. h_q is the main model's final-norm output (QV_MTP_HIDDEN=pre: residual stream).
+    // Runs Tn consecutive positions pos0.. (next_tok[t] follows position pos0+t, hid = Tn rows of H floats) and writes
+    // their KV; if draft != nullptr also returns the greedy draft token of the last position.
+    void mtp_batch(const int* next_tok, const float* hid, int Tn, int pos0, int* draft) {
+        const Config& c = cfg_;
+        const int H = c.hidden;
+        pb_alloc(Tn);
+        par_tok(Tn, 1, [&](int b, int e) {
+            for (int t = b; t < e; ++t) {
+                float* xr = pb_.x.data() + (size_t)t * H;
+                float* cat = pb_.g.data() + (size_t)t * c.inter;
+                embed_row(embed_, next_tok[t], xr);
+                rmsnorm(xr, mtp_pre_e_, cat, H, c.eps);
+                rmsnorm(hid + (size_t)t * H, mtp_pre_h_, cat + H, H, c.eps);
+                pb_.xqfc.quantize_row(t, cat, 2 * H);
+                attn_rope_table(pos0 + t, inv_freq_.data(), c.rope_dim, pb_.rope.data() + (size_t)t * c.rope_dim);
+            }
+        });
+        gemm(mtp_fc_, pb_.xqfc, Tn, pb_.x.data());
+        pb_layer(mtp_L_, Tn, pos0);
+        if (draft) {
+            std::memcpy(x_.data(), pb_.x.data() + (size_t)(Tn - 1) * H, H * 4);
+            norm_quant(mtp_norm_);
+            jobs_.push_back(qjob(head_, xq_, mtp_logits_.data(), xn_.data()));
+            run_jobs();
+            *draft = argmax_of(mtp_logits_.data());
+        }
+    }
+
+    // after the main layers of prefill chunk [c0, c0+Tn): fill the MTP KV for the chunk's positions (needs hidden + next token)
+    void mtp_prefill_chunk(const int* tokens, int T, int c0, int Tn, int p0) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const int H = cfg_.hidden;
+        mhc_.resize((size_t)Tn * H);
+        par_tok(Tn, 1, [&](int b, int e) {
+            for (int t = b; t < e; ++t) {
+                const float* xr = pb_.x.data() + (size_t)t * H;
+                if (mtp_hid_pre_) std::memcpy(mhc_.data() + (size_t)t * H, xr, H * 4);
+                else rmsnorm(xr, final_norm_, mhc_.data() + (size_t)t * H, H, cfg_.eps);
+            }
+        });
+        const bool last = c0 + Tn == T;
+        if (last) std::memcpy(mtp_hid_last_.data(), mhc_.data() + (size_t)(Tn - 1) * H, H * 4);
+        const int nf = last ? Tn - 1 : Tn;  // the last prompt token's next token is not known yet
+        if (nf > 0) mtp_batch(tokens + c0 + 1, mhc_.data(), nf, p0, nullptr);
+        mtp_st_.prefill_mtp_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    }
+
+    // Main-model pass over [cur at p, draft at p+1] sharing one weight read. Logits of both rows -> vlog_, hidden rows -> mh_.
+    // GDN/conv state after token 0 is kept in the *_alt_ buffers (swap them in to roll the draft back).
+    void verify2(int cur, int draft, int p) {
+        const Config& c = cfg_;
+        const int H = c.hidden;
+        pb_alloc(2);
+        const int tk[2] = {cur, draft};
+        for (int t = 0; t < 2; ++t) {
+            embed_row(embed_, tk[t], pb_.x.data() + (size_t)t * H);
+            attn_rope_table(p + t, inv_freq_.data(), c.rope_dim, pb_.rope.data() + (size_t)t * c.rope_dim);
+        }
+        spec_snap_ = true;
+        for (const Layer& L : layers_) pb_layer(L, 2, p);
+        spec_snap_ = false;
+        if (mtp_hid_pre_) std::memcpy(mh_.data(), pb_.x.data(), (size_t)2 * H * 4);
+        pb_norm_quant(final_norm_, 2);
+        if (!mtp_hid_pre_) std::memcpy(mh_.data(), pb_.xn.data(), (size_t)2 * H * 4);
+        gemm(head_, pb_.xq, 2, vlog_.data());
+    }
+
+    void decode_mtp(int first, int start_pos, int n, std::vector<int>& out) {
+        using clk = std::chrono::steady_clock;
+        auto ms = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+        const int V = cfg_.vocab;
+        int cur = first, p = start_pos, produced = 0, draft = 0;
+        auto t0 = clk::now();
+        mtp_batch(&cur, mtp_hid_last_.data(), 1, p - 1, &draft);
+        mtp_st_.draft_ms += ms(t0, clk::now());
+        while (produced < n) {
+            if (n - produced == 1) {  // last token: a plain step keeps engine state identical to plain decode
+                t0 = clk::now();
+                forward(cur, p, true);
+                out[produced++] = argmax();
+                mtp_st_.plain_steps++;
+                mtp_st_.plain_ms += ms(t0, clk::now());
+                break;
+            }
+            t0 = clk::now();
+            verify2(cur, draft, p);
+            const int g0 = argmax_of(vlog_.data());
+            const bool ok = g0 == draft;
+            int g1 = 0;
+            if (ok) g1 = argmax_of(vlog_.data() + V);
+            auto t1 = clk::now();
+            mtp_st_.verify_ms += ms(t0, t1);
+            mtp_st_.cycles++;
+            if (ok) {
+                mtp_st_.accepted++;
+                out[produced++] = g0;
+                out[produced++] = g1;
+                std::memcpy(logits_.data(), vlog_.data() + V, (size_t)V * 4);
+                const int nt[2] = {draft, g1};
+                mtp_batch(nt, mh_.data(), 2, p, &draft);
+                p += 2;
+                cur = g1;
+            } else {
+                std::swap(gdn_state_, gdn_alt_);  // roll the recurrent state back to "after cur"; KV rows beyond p are overwritten later
+                std::swap(conv_state_, conv_alt_);
+                out[produced++] = g0;
+                std::memcpy(logits_.data(), vlog_.data(), (size_t)V * 4);
+                mtp_batch(&g0, mh_.data(), 1, p, &draft);
+                p += 1;
+                cur = g0;
+            }
+            mtp_st_.draft_ms += ms(t1, clk::now());
+        }
     }
 
     // ---------------------------------------------------------------- one token

@@ -60,3 +60,27 @@ Correctness: tests/test_cpu_gemm (gemm vs gemv_q per token <= 6.3e-7 rel); prefi
 bit-identical, i.e. the only prefill-vs-step numeric differences are gemm summation order and the attention split order. The int8-activation
 pipeline amplifies such 1e-7 differences chaotically (4e-4 after the first attention layer, 4-6% at layer 64 between two valid runs), so
 check_golden numbers move a little between runs (worst layer 0.078 step vs 0.097 prefill; top1 vs qsim 0.9524 for both).
+
+## MTP speculative decoding (branch p7/mtp, `qv_run --mtp`, `EngineOptions::mtp`)
+Uses the checkpoint's own MTP head (mtp.fc 10240->5120, one full-attention decoder layer with its own KV slot, mtp.norm, shared embed/lm_head).
+Semantics (as in vLLM qwen3_next_mtp): for position q with main hidden h_q and next token t_{q+1}: `x = fc(concat[pre_fc_norm_embedding(embed(t_{q+1})), pre_fc_norm_hidden(h_q)])`
+(embedding FIRST), layer at RoPE position q, `mtp.norm`, lm_head -> draft for t_{q+2}. h_q = final-norm output of the main model (QV_MTP_HIDDEN=pre selects the pre-norm residual; not tuned).
+Prefill also fills the MTP KV for the prompt (cost: +1.3..5% prefill time, see numbers).
+Decode cycle: verify `[cur, draft]` in one main-model pass (weights read once), accept if argmax(row0)==draft (then 2 tokens: row0 and row1), else 1 token and roll back.
+Rollback: attention KV is truncated by position; GDN recurrent state and conv state after token 0 are snapshotted inside the verify pass (per head / per channel block, in the same parallel region) into
+alt buffers and swapped in on rejection (O(1), no extra token pass).
+Exactness: verify uses `gemv_multi_q` (T<=4: weight planes unpacked once, per-token arithmetic identical op-for-op to `gemv_q`, so bit-identical; `gemm_q` is NOT, its weight-min term sums in another order)
+and per-token split-K attention with the same splits as the 1-token path. tests/test_cpu_gemv_multi (bit-identity), tests/test_cpu_mtp (ids MTP == plain). The last token of a generation is a plain step so engine state matches plain decode.
+
+Measured (E0 model, 32 threads, 97 generated tokens, greedy, one run each; same machine state, plain decode today is 2.65-2.78 tok/s, lower than the 3.9 recorded earlier, probably DRAM contention from other tenants; the plain/MTP ratio is what matters):
+| prompt | ctx | plain tok/s | MTP tok/s | speedup | acceptance | ids identical |
+|---|---|---|---|---|---|---|
+| chat-formatted (code request) | 39 | 2.78 | 4.46 | 1.60x | 0.939 (46/49) | yes |
+| real text (repo doc) | 128 | 2.78 | 4.09 | 1.47x | 0.827 | yes |
+| random tokens | 256 | 2.71 | 4.05 | 1.49x | 0.827 | yes |
+| real text | 512 | 2.67 | 4.15 | 1.55x | 0.882 | yes |
+| real text | 1536 | 2.65 | 3.86 | 1.46x | 0.793 | yes |
+| real text | 1880 | 2.63 | 3.75 | 1.43x | 0.778 | yes |
+(An earlier plain run at ctx 1880 gave 0.84 tok/s, a machine hiccup; it was repeated and the repeat is shown.)
+Cost split (ctx 39): verify pass 397 ms per 2-token cycle vs 360 ms for a plain 1-token step (1.10x), draft+MTP-KV update 31 ms per cycle (~9%). Falsification thresholds of H-MTP1 (acceptance < 0.35, verify > 1.5x step) were not met: hypothesis confirmed on this model.
+Note: "acceptance" = accepted drafts per verify cycle; tokens per cycle = 1 + acceptance. Random-token prompts still show 0.83 because the model's continuation is itself predictable text-like; a prompt of prose with high entropy would be lower (not measured). Draft lm_head restriction to top-k was not tried (draft is ~9% of a cycle; max gain <9%).
