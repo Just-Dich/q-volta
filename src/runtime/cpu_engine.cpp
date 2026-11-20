@@ -9,6 +9,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <immintrin.h>
+
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -120,6 +123,7 @@ class CpuEngine final : public Engine {
         map_weights(mf);
         bind(mf);
         alloc_state();
+        research_init();
         reset();
     }
     ~CpuEngine() override {
@@ -166,6 +170,7 @@ class CpuEngine final : public Engine {
             return;
         }
         prefill_batched(tokens, T, pos0);
+        research_dump(pos0 + T);
         if (mtp_prefill_) mtp_ready_ = pos0 + T;
     }
 
@@ -201,6 +206,16 @@ class CpuEngine final : public Engine {
         hidden_.clear();
         logits_all_.clear();
         mtp_ready_ = -1;
+    }
+    void state_save() override { conv_save_ = conv_state_; gdn_save_ = gdn_state_; }
+    void state_restore() override { conv_state_ = conv_save_; gdn_state_ = gdn_save_; mtp_ready_ = -1; }
+    void set_sparse(const std::string& v) override {
+        sp_ = SparseCfg();
+        if (v == "off" || v.empty()) return;
+        int a[5] = {64, 1024, 64, 16, 0};
+        const char* p = v.c_str();
+        for (int i = 0; i < 5 && *p; ++i) { a[i] = std::atoi(p); while (*p && *p != ',') ++p; if (*p) ++p; }
+        sp_.on = true; sp_.sink = a[0]; sp_.recent = a[1]; sp_.bs = a[2]; sp_.k = a[3]; sp_.agg = a[4];
     }
     void mtp_stats(MtpStats& s) const override { s = mtp_st_; }
     void set_mtp_enabled(bool on) override { mtp_on_ = on && opt_.mtp; mtp_ready_ = -1; }
@@ -247,6 +262,138 @@ class CpuEngine final : public Engine {
     MtpStats mtp_st_;
     int splits_ = 64;
     std::vector<Job> jobs_;
+
+    // ---- research hooks (branch p9/tier; debug only, both off unless the env var is set)
+    // QV_KVDUMP=dir[,qstride]: after prefill() write fp16 K/V of every attention layer (k_<i>.f16 / v_<i>.f16, [Hkv][n][D]),
+    //   the post-norm/rope queries of every qstride-th position (default 64, from pos 1023) plus the last 32 positions
+    //   (q_<i>.f16 [nq][Hq][D], qpos.i32) and meta.txt.
+    // QV_SPARSE=sink,recent,block,k[,agg]: single-token attention (step/decode path only, not prefill) attends to
+    //   sink + recent window + the top-k `block`-token blocks of the middle ranked per kv head by the Quest bound
+    //   sum_d max(q_d*kmin_d, q_d*kmax_d) (agg 0: sum over the q heads of the group, 1: max). Teacher-forced quality probe.
+    std::string kvdump_dir_;
+    int kvdump_qstride_ = 64;
+    std::vector<std::vector<float>> qsamp_, qlast_;
+    std::vector<int> qsamp_pos_, qlast_pos_ = std::vector<int>(32, -1);
+    struct SparseCfg { bool on = false; int sink = 64, recent = 1024, bs = 64, k = 16, agg = 0; } sp_;
+    std::vector<float> kcomp_, vcomp_, sp_score_, conv_save_, gdn_save_;
+    void research_init() {
+        if (const char* e = std::getenv("QV_KVDUMP")) {
+            std::string v = e;
+            const size_t c = v.find(',');
+            kvdump_dir_ = v.substr(0, c);
+            if (c != std::string::npos) kvdump_qstride_ = std::atoi(v.c_str() + c + 1);
+            qsamp_.assign(n_attn_, {});
+            qlast_.assign(n_attn_, std::vector<float>((size_t)32 * cfg_.n_heads * cfg_.head_dim, 0.f));
+        }
+        if (const char* e = std::getenv("QV_SPARSE")) {
+            int a[5] = {64, 1024, 64, 16, 0};
+            const char* p = e;
+            for (int i = 0; i < 5 && *p; ++i) { a[i] = std::atoi(p); while (*p && *p != ',') ++p; if (*p) ++p; }
+            sp_.on = true; sp_.sink = a[0]; sp_.recent = a[1]; sp_.bs = a[2]; sp_.k = a[3]; sp_.agg = a[4];
+        }
+    }
+    void research_capture_q(int layer_idx, int Tn, int p0) {
+        if (kvdump_dir_.empty()) return;
+        const size_t QD = (size_t)cfg_.n_heads * cfg_.head_dim;
+        for (int t = 0; t < Tn; ++t) {
+            const int pos = p0 + t;
+            const float* q = pb_.qr.data() + (size_t)t * QD;
+            if (pos >= 1023 && pos % kvdump_qstride_ == kvdump_qstride_ - 1) {
+                if (layer_idx == 0) qsamp_pos_.push_back(pos);
+                qsamp_[layer_idx].insert(qsamp_[layer_idx].end(), q, q + QD);
+            }
+            std::memcpy(qlast_[layer_idx].data() + (size_t)(pos % 32) * QD, q, QD * 4);
+            if (layer_idx == 0) qlast_pos_[pos % 32] = pos;
+        }
+    }
+    static void write_f16(FILE* f, const float* x, size_t n) {
+        std::vector<uint16_t> b(n);
+        size_t i = 0;
+        for (; i + 8 <= n; i += 8) _mm_storeu_si128((__m128i*)&b[i], _mm256_cvtps_ph(_mm256_loadu_ps(x + i), 0));
+        for (; i < n; ++i) b[i] = _cvtss_sh(x[i], 0);
+        std::fwrite(b.data(), 2, n, f);
+    }
+    void research_dump(int n) {
+        if (kvdump_dir_.empty()) return;
+        const Config& c = cfg_;
+        const size_t D = c.head_dim, QD = (size_t)c.n_heads * D, kv_layer = (size_t)c.n_kv_heads * opt_.max_ctx * D;
+        std::vector<int> lastp;
+        for (int p = std::max(0, n - 32); p < n; ++p) lastp.push_back(p);
+        for (int l = 0; l < n_attn_; ++l) {
+            for (int w = 0; w < 3; ++w) {
+                char fn[512];
+                std::snprintf(fn, sizeof fn, "%s/%c_%d.f16", kvdump_dir_.c_str(), "kvq"[w], l);
+                FILE* f = std::fopen(fn, "wb");
+                if (!f) throw std::runtime_error(std::string("cannot write ") + fn);
+                if (w < 2) {
+                    const float* base = (w == 0 ? k_cache_ : v_cache_) + l * kv_layer;
+                    for (int g = 0; g < c.n_kv_heads; ++g) write_f16(f, base + (size_t)g * opt_.max_ctx * D, (size_t)n * D);
+                } else {
+                    write_f16(f, qsamp_[l].data(), qsamp_[l].size());
+                    for (int p : lastp) write_f16(f, qlast_[l].data() + (size_t)(p % 32) * QD, QD);
+                }
+                std::fclose(f);
+            }
+        }
+        std::vector<int> qp = qsamp_pos_;
+        qp.insert(qp.end(), lastp.begin(), lastp.end());
+        char fn[512];
+        std::snprintf(fn, sizeof fn, "%s/qpos.i32", kvdump_dir_.c_str());
+        FILE* f = std::fopen(fn, "wb"); std::fwrite(qp.data(), 4, qp.size(), f); std::fclose(f);
+        std::snprintf(fn, sizeof fn, "%s/meta.txt", kvdump_dir_.c_str());
+        f = std::fopen(fn, "w");
+        std::fprintf(f, "n=%d layers=%d hkv=%d hq=%d d=%d nq=%zu\n", n, n_attn_, c.n_kv_heads, c.n_heads, c.head_dim, qp.size());
+        std::fclose(f);
+        std::fprintf(stderr, "[kvdump] %d tokens, %zu queries/layer -> %s\n", n, qp.size(), kvdump_dir_.c_str());
+    }
+    // Sparse selection for one token (see QV_SPARSE). Returns false when the context is too short (dense attention).
+    bool sparse_select(const float* kc, const float* vc, int n, int& Ns) {
+        const Config& c = cfg_;
+        const int D = c.head_dim, Hkv = c.n_kv_heads, Hq = c.n_heads, G = Hq / Hkv, bs = sp_.bs;
+        const int rstart = ((n - sp_.recent) / bs) * bs, b0 = sp_.sink / bs, nb = rstart / bs - b0;
+        if (rstart <= sp_.sink || nb <= sp_.k) return false;
+        sp_score_.assign((size_t)Hkv * nb, 0.f);
+        pool_.parallel_for_dyn((size_t)Hkv * nb, [&](size_t b, size_t e, int) {
+            for (size_t w = b; w < e; ++w) {
+                const int g = (int)(w / nb), blk = b0 + (int)(w % nb);
+                float mn[256], mx[256];
+                const float* K = kc + ((size_t)g * opt_.max_ctx + (size_t)blk * bs) * D;
+                for (int d = 0; d < D; ++d) mn[d] = mx[d] = K[d];
+                for (int j = 1; j < bs; ++j)
+                    for (int d = 0; d < D; ++d) { mn[d] = std::min(mn[d], K[(size_t)j * D + d]); mx[d] = std::max(mx[d], K[(size_t)j * D + d]); }
+                float agg = sp_.agg ? -INFINITY : 0.f;
+                for (int h = 0; h < G; ++h) {
+                    const float* q = qr_.data() + (size_t)(g * G + h) * D;
+                    float s = 0.f;
+                    for (int d = 0; d < D; ++d) s += std::max(q[d] * mn[d], q[d] * mx[d]);
+                    agg = sp_.agg ? std::max(agg, s) : agg + s;
+                }
+                sp_score_[w] = agg;
+            }
+        }, 4);
+        Ns = sp_.sink + (n - rstart) + sp_.k * bs;
+        kcomp_.resize((size_t)Hkv * Ns * D); vcomp_.resize((size_t)Hkv * Ns * D);
+        std::vector<int> idx(nb);
+        for (int g = 0; g < Hkv; ++g) {
+            for (int i = 0; i < nb; ++i) idx[i] = i;
+            const float* sc = sp_score_.data() + (size_t)g * nb;
+            std::nth_element(idx.begin(), idx.begin() + sp_.k, idx.end(), [&](int a, int b) { return sc[a] > sc[b]; });
+            std::sort(idx.begin(), idx.begin() + sp_.k);
+            float* ko = kcomp_.data() + (size_t)g * Ns * D;
+            float* vo = vcomp_.data() + (size_t)g * Ns * D;
+            const float* ki = kc + (size_t)g * opt_.max_ctx * D;
+            const float* vi = vc + (size_t)g * opt_.max_ctx * D;
+            auto put = [&](int from, int cnt) {
+                std::memcpy(ko, ki + (size_t)from * D, (size_t)cnt * D * 4);
+                std::memcpy(vo, vi + (size_t)from * D, (size_t)cnt * D * 4);
+                ko += (size_t)cnt * D; vo += (size_t)cnt * D;
+            };
+            put(0, sp_.sink);
+            for (int i = 0; i < sp_.k; ++i) put((b0 + idx[i]) * bs, bs);
+            put(rstart, n - rstart);
+        }
+        return true;
+    }
 
     static std::vector<int> pool_cpus() {
         std::vector<int> v;
@@ -729,6 +876,7 @@ class CpuEngine final : public Engine {
                 }
             }, 8);
         });
+        research_capture_q(L.idx_kind, Tn, p0);
         const size_t pf = attn_part_floats(Hq, 1, D);
         auto targs = [&](int t) {
             return AttnDecodeArgs{pb_.qr.data() + (size_t)t * QD, pb_.qg.data() + (size_t)t * 2 * QD, kc, vc, pb_.part.data() + (size_t)t * pf,
@@ -997,8 +1145,11 @@ class CpuEngine final : public Engine {
         }
         {
             QV_PHASE(P_ATTN);
-            AttnDecodeArgs d{qr_.data(), qg_.data(), kc, vc, part_.data(), mix_.data(), Hq, Hkv, D, opt_.max_ctx,
-                             pos + 1, splits_};
+            const float *Ku = kc, *Vu = vc;
+            int mcx = opt_.max_ctx, nkeys = pos + 1, Ns = 0;
+            if (sp_.on && sparse_select(kc, vc, pos + 1, Ns)) { Ku = kcomp_.data(); Vu = vcomp_.data(); mcx = Ns; nkeys = Ns; }
+            AttnDecodeArgs d{qr_.data(), qg_.data(), Ku, Vu, part_.data(), mix_.data(), Hq, Hkv, D, mcx,
+                             nkeys, splits_};
             const int ns = attn_active_splits(d.n_keys, splits_);
             pool_.parallel_for_dyn((size_t)Hkv * ns, [&](size_t b, size_t e, int) {
                 for (size_t w = b; w < e; ++w) {
