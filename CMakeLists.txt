@@ -28,6 +28,7 @@ add_library(qv_cuda STATIC
   src/backends/cuda/kernels/linear_prefill.cu
   src/backends/cuda/kernels/elementwise_seq.cu
   src/backends/cuda/recurrent/gdn.cu
+  src/backends/cuda/recurrent/gdn_seq.cu
   src/backends/cuda/attention/attn.cu
   src/backends/cuda/attention/attn_seq.cu
   src/runtime/cuda_engine.cu)
@@ -58,3 +59,7 @@ add_executable(test_attn_seq tests/test_attn_seq.cu)
 target_link_libraries(test_attn_seq PRIVATE qv_cuda)
 target_compile_options(test_attn_seq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-gpu-targets>)
 add_test(NAME attn_seq COMMAND test_attn_seq)
+add_executable(test_gdn_seq tests/test_gdn_seq.cu)
+target_link_libraries(test_gdn_seq PRIVATE qv_cuda)
+target_compile_options(test_gdn_seq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-gpu-targets>)
+add_test(NAME gdn_seq COMMAND test_gdn_seq)
