@@ -146,5 +146,5 @@ pessimistic versus the standalone engine figures (~3.9 tok/s decode, ~20 tok/s p
 | ~120-token prompt | 136 | 4.58 s | 2.71 tok/s |
 | same, `qwen38-27b-pi-e0` model | 19 / 136 | 0.83 s / 4.56 s | 2.82 / 2.81 tok/s |
 
-Model load: 1.3-2 s with a warm page cache (the CPU engine maps the weights). HTTP/JSON/tokenizer overhead is negligible next to
-the engine (tokenizing a prompt is microseconds-to-milliseconds). No CUDA numbers: the GPU was not used.
+Model load: 1.3-2 s with a warm page cache (the CPU engine maps the weights).
+No CUDA numbers: the GPU was not used.
