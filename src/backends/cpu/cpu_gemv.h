@@ -45,13 +45,15 @@ struct QMatC {
 // Quantized activation. For group g (64 values) the int8 bytes q[64g .. 64g+63] are stored permuted:
 // natural index n = 32*c + 8*b + a (c: 32-chunk 0..1, b 0..3, a 0..7) lives at
 //   pos = (a >= 4 ? 32 : 0) + 16*c + 4*(a & 3) + b.
-// ds[2g] = d_g (scale), ds[2g+1] = xsum_g (fp32 sum of the unquantized x group).
+// Scales are per 32-element sub-group (like the GPU): ds[4g..4g+3] = (d_c0, d_c1, xsum_c0, xsum_c1) of group g;
+// sub-group c is natural indices 32c..32c+31. Both sub-groups share the weight (scale,min) of the 64-group.
 struct Q8ActC {
     int K = 0;
     std::vector<int8_t> q;
     std::vector<float> ds;
-    float d(int g) const { return ds[2 * g]; }
-    float sum(int g) const { return ds[2 * g + 1]; }
+    // sg = 32-element sub-group index (0..K/32-1)
+    float d(int sg) const { return ds[4 * (sg >> 1) + (sg & 1)]; }
+    float sum(int sg) const { return ds[4 * (sg >> 1) + 2 + (sg & 1)]; }
 };
 
 // natural in-group index -> stored position

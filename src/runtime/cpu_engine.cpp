@@ -325,7 +325,7 @@ class CpuEngine final : public Engine {
     static void prep_q8(Q8ActC& a, int K) {
         a.K = K;
         a.q.assign((size_t)K, 0);
-        a.ds.assign((size_t)(K / 64) * 2, 0.f);
+        a.ds.assign((size_t)(K / 64) * 4, 0.f);
     }
 
     void alloc_state() {

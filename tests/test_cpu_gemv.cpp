@@ -62,12 +62,14 @@ static void run_case(int N, int K, int bits, std::mt19937_64& rng, ThreadPool* p
     quantize_act_q8(x.data(), K, a);
     // sanity of activation quantizer against scalar
     for (int g = 0; g < G; ++g) {
-        float amax = 0, s = 0;
-        for (int i = 0; i < 64; ++i) { amax = std::fmax(amax, std::fabs(x[g * 64 + i])); s += x[g * 64 + i]; }
-        const float dx = amax / 127.f;
-        CHECK(a.d(g) == dx, "d mismatch g=%d", g);
-        CHECK(std::fabs(a.sum(g) - s) <= 1e-4f * (1.f + std::fabs(s)), "sum mismatch g=%d", g);
+        for (int c = 0; c < 2; ++c) {
+            float amax = 0, s = 0;
+            for (int i = 0; i < 32; ++i) { amax = std::fmax(amax, std::fabs(x[g * 64 + 32 * c + i])); s += x[g * 64 + 32 * c + i]; }
+            CHECK(a.d(2 * g + c) == amax / 127.f, "d mismatch g=%d c=%d", g, c);
+            CHECK(std::fabs(a.sum(2 * g + c) - s) <= 1e-4f * (1.f + std::fabs(s)), "sum mismatch g=%d c=%d", g, c);
+        }
         for (int i = 0; i < 64; ++i) {
+            const float dx = a.d(2 * g + (i >> 5));
             const int e = dx > 0 ? (int)std::nearbyint(x[g * 64 + i] / dx) : 0;
             if (a.q[g * 64 + q8_perm(i)] != e) { CHECK(false, "xq mismatch g=%d i=%d", g, i); g = G; break; }
         }
@@ -81,9 +83,11 @@ static void run_case(int N, int K, int bits, std::mt19937_64& rng, ThreadPool* p
         double acc = 0;
         for (int g = 0; g < G; ++g) {
             const double sc = h2f(sm[((size_t)n * G + g) * 2]), mn = h2f(sm[((size_t)n * G + g) * 2 + 1]);
-            long long dot = 0;
-            for (int i = 0; i < 64; ++i) dot += (long long)qu[(size_t)n * K + g * 64 + i] * a.q[g * 64 + q8_perm(i)];
-            acc += sc * (double)a.d(g) * (double)dot + mn * (double)a.sum(g);
+            for (int c = 0; c < 2; ++c) {
+                long long dot = 0;
+                for (int i = 32 * c; i < 32 * c + 32; ++i) dot += (long long)qu[(size_t)n * K + g * 64 + i] * a.q[g * 64 + q8_perm(i)];
+                acc += sc * (double)a.d(2 * g + c) * (double)dot + mn * (double)a.sum(2 * g + c);
+            }
         }
         ref[n] = acc;
     }
