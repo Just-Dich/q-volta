@@ -14,8 +14,9 @@ A native CPU backend (x86 AVX2, later ARM/NEON) is planned and deliberately **no
 
 ## Known limitations (read before comparing)
 - **Quality is behind the strongest baseline**: E0 is plain round-to-nearest (+12% wikitext perplexity vs BF16); the comparison engine is +0.3%. Part of our decode lead is simply fewer bytes read. Improving quantization is the next big item.
-- No MTP/speculative decoding yet; no server/CLI; KV cache is fp32 (about 20K tokens fit); long-context (128K/256K) is untested.
-- `src/tokenizer/` is unfinished and untested.
+- No MTP/speculative decoding yet; KV cache is fp32 (about 20K tokens fit); long-context (128K/256K) is untested.
+- OpenAI-compatible server `qv_server` (CPU backend tested; CUDA backend compiles, not run in the server tests): see docs/SERVER.md. No tool calling, no n>1, no vision. One request at a time.
+- Tokenizer matches the `tokenizers` library on 509/509 test strings (498/509 vs transformers AutoTokenizer: combining-mark cases differ, documented).
 - The pi LoRA adapter's effect is partly blurred by 3-bit rounding; runtime LoRA is planned.
 
 ## Build and test
