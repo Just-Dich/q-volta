@@ -67,3 +67,8 @@ add_executable(test_attn_decode_split tests/test_attn_decode_split.cu)
 target_link_libraries(test_attn_decode_split PRIVATE qv_cuda)
 target_compile_options(test_attn_decode_split PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-gpu-targets>)
 add_test(NAME attn_decode_split COMMAND test_attn_decode_split)
+
+option(QV_CPU "Build the CPU decode ops library (qv_cpu_ops)" ON)
+if(QV_CPU)
+  add_subdirectory(src/backends/cpu)
+endif()
