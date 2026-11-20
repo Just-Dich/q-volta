@@ -12,6 +12,8 @@ __global__ void __launch_bounds__(256) rmsnorm_kernel(const float* __restrict__ 
                                                       float* __restrict__ out, float* __restrict__ xs32, int n,
                                                       float eps, Q8Buf q8) {
     __shared__ float red[32];
+    x += (size_t)blockIdx.y * n;  // token row (nt > 1: MTP verify); q8 chunks continue token-major
+    out += (size_t)blockIdx.y * n;
     float ss = 0.f;
     const float4* x4 = reinterpret_cast<const float4*>(x);
     for (int i = threadIdx.x; i < n / 4; i += blockDim.x) {
@@ -27,16 +29,17 @@ __global__ void __launch_bounds__(256) rmsnorm_kernel(const float* __restrict__ 
     const float v = x[i] * r * w[i];
     out[i] = v;
     if (q8.q) {
-        q8_store_chunk(v, c, q8);
+        q8_store_chunk(v, c + blockIdx.y * (n / 32), q8);
     } else {
         float s = warp_sum(v);
         if (xs32 && lane == 0) xs32[c] = s;
     }
 }
 
-void rmsnorm(const float* x, const float* w, float* out, float* xs32, int n, float eps, cudaStream_t s, const Q8Buf* q8) {
+void rmsnorm(const float* x, const float* w, float* out, float* xs32, int n, float eps, cudaStream_t s, const Q8Buf* q8,
+             int nt) {
     const int blocks = (n / 32 + NORM_CHUNKS_PER_BLOCK - 1) / NORM_CHUNKS_PER_BLOCK;
-    rmsnorm_kernel<<<blocks, 32 * NORM_CHUNKS_PER_BLOCK, 0, s>>>(x, w, out, xs32, n, eps, q8 ? *q8 : Q8Buf{});
+    rmsnorm_kernel<<<dim3(blocks, nt), 32 * NORM_CHUNKS_PER_BLOCK, 0, s>>>(x, w, out, xs32, n, eps, q8 ? *q8 : Q8Buf{});
 }
 
 // Dequantize one embedding row (token id read from device memory) into out[K].

@@ -91,6 +91,25 @@ void mtp_cat_rows_f16(const float* emb, const float* hid, const float* w_e, cons
     mtp_cat_kernel<<<T, 256, 0, s>>>(emb, hid, w_e, w_h, out, n, eps);
 }
 
+__global__ void __launch_bounds__(256) mtp_cat_f32_kernel(const float* __restrict__ emb, const float* __restrict__ hid,
+                                                         const float* __restrict__ we, const float* __restrict__ wh,
+                                                         float* __restrict__ out, int n, float eps) {
+    __shared__ float red[32];
+    const float* e = emb + (size_t)blockIdx.x * n;
+    const float* h = hid + (size_t)blockIdx.x * n;
+    float* o = out + (size_t)blockIdx.x * 2 * n;
+    float s1 = 0.f, s2 = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) { s1 += e[i] * e[i]; s2 += h[i] * h[i]; }
+    const float r1 = rsqrtf(block_sum(s1, red) / n + eps);
+    const float r2 = rsqrtf(block_sum(s2, red) / n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) { o[i] = e[i] * r1 * we[i]; o[n + i] = h[i] * r2 * wh[i]; }
+}
+
+void mtp_cat_rows_f32(const float* emb, const float* hid, const float* w_e, const float* w_h, float* out, int n, int T,
+                      float eps, cudaStream_t s) {
+    mtp_cat_f32_kernel<<<T, 256, 0, s>>>(emb, hid, w_e, w_h, out, n, eps);
+}
+
 __global__ void silu_mul_f16_kernel(const float* __restrict__ g, const float* __restrict__ u, __half* __restrict__ out,
                                     size_t total) {
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;

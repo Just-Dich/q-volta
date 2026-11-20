@@ -5,7 +5,7 @@
 namespace qv::cuda {
 // q8 != nullptr: also emit the int8 GEMV input (fused quantization)
 void rmsnorm(const float* x, const float* w, float* out, float* xs32, int n, float eps, cudaStream_t s,
-             const Q8Buf* q8 = nullptr);
+             const Q8Buf* q8 = nullptr, int nt = 1);  // nt rows token-major (xs32 unused when nt > 1)
 void embed(const QMat& E, const int* tok, float* out, cudaStream_t s);
 void silu_mul(const float* g, const float* u, float* out, float* xs32, int n, cudaStream_t s, const Q8Buf* q8 = nullptr);
 void argmax(const float* x, int n, int* out, cudaStream_t s);

@@ -12,6 +12,8 @@ __global__ void __launch_bounds__(D) qk_prep_kernel(AttnPrepArgs a) {
     __shared__ float red[32];
     __shared__ float buf[D];
     const int b = blockIdx.x, t = threadIdx.x;
+    a.qg += (size_t)blockIdx.y * a.qg_stride; a.k += (size_t)blockIdx.y * a.k_stride; a.v += (size_t)blockIdx.y * a.k_stride;
+    a.q_out += (size_t)blockIdx.y * a.q_stride; a.pos += blockIdx.y;
     const bool is_q = b < a.n_heads;
     const int h = is_q ? b : b - a.n_heads;
     float x = is_q ? a.qg[h * 2 * D + t] : a.k[h * D + t];
@@ -39,7 +41,7 @@ __global__ void __launch_bounds__(D) qk_prep_kernel(AttnPrepArgs a) {
 
 void attn_prep(const AttnPrepArgs& a, cudaStream_t s) {
     if (a.head_dim != 256) { std::fprintf(stderr, "attn: head_dim 256 only\n"); std::abort(); }
-    qk_prep_kernel<256><<<a.n_heads + a.n_kv_heads, 256, 0, s>>>(a);
+    qk_prep_kernel<256><<<dim3(a.n_heads + a.n_kv_heads, a.nt), 256, 0, s>>>(a);
 }
 
 // One block per q head; scores kept in a global scratch row [n_heads][max_ctx].
@@ -120,6 +122,7 @@ __global__ void __launch_bounds__(D) attn_split_kernel(AttnDecodeArgs a) {
     constexpr int G = SK_G;
     __shared__ float ps[G][SK_TK];  // scores, then probabilities
     __shared__ float alpha_s[G];
+    a.q += (size_t)blockIdx.z * a.q_stride; a.part += blockIdx.z * a.part_stride; a.pos += blockIdx.z;
     const int g = blockIdx.x, sp = blockIdx.y, S = gridDim.y;
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const int n = *a.pos + 1;
@@ -225,6 +228,10 @@ __global__ void __launch_bounds__(D) attn_split_kernel(AttnDecodeArgs a) {
 template <int D>
 __global__ void __launch_bounds__(D) attn_combine_kernel(AttnDecodeArgs a, int S) {
     const int h = blockIdx.x, t = threadIdx.x;
+    a.part += blockIdx.y * a.part_stride; a.pos += blockIdx.y; a.qg += (size_t)blockIdx.y * a.qg_stride;
+    a.out += (size_t)blockIdx.y * a.out_stride;
+    if (a.q8.q) { a.q8.q += (size_t)blockIdx.y * (a.q8_k >> 2); a.q8.d += (size_t)blockIdx.y * (a.q8_k >> 5);
+                  a.q8.sum += (size_t)blockIdx.y * (a.q8_k >> 5); a.q8.qsum += (size_t)blockIdx.y * (a.q8_k >> 5); }
     const int n = *a.pos + 1;
     const int chunk = sk_chunk(n, S);
     const int ns = min(S, (n + chunk - 1) / chunk);  // splits that own at least one key (>= 1)
@@ -251,8 +258,8 @@ void attn_decode(const AttnDecodeArgs& a, cudaStream_t s) {
         std::fprintf(stderr, "attn_decode: split-K needs n_heads == 6*n_kv_heads and max_splits >= 1\n");
         std::abort();
     }
-    attn_split_kernel<256><<<dim3(a.n_kv_heads, a.max_splits), 256, 0, s>>>(a);
-    attn_combine_kernel<256><<<a.n_heads, 256, 0, s>>>(a, a.max_splits);
+    attn_split_kernel<256><<<dim3(a.n_kv_heads, a.max_splits, a.nt), 256, 0, s>>>(a);
+    attn_combine_kernel<256><<<dim3(a.n_heads, a.nt), 256, 0, s>>>(a, a.max_splits);
 }
 
 }  // namespace qv::cuda

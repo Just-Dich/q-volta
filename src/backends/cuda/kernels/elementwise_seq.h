@@ -17,6 +17,10 @@ void rmsnorm_rows_f32(const float* x, const float* w, float* out, int n, int T, 
 void mtp_cat_rows_f16(const float* emb, const float* hid, const float* w_e, const float* w_h, __half* out, int n, int T,
                       float eps, cudaStream_t s);
 
+// fp32 variant: out[t] (2n floats) = [ rmsnorm(emb[t], w_e) | rmsnorm(hid[t], w_h) ]
+void mtp_cat_rows_f32(const float* emb, const float* hid, const float* w_e, const float* w_h, float* out, int n, int T,
+                      float eps, cudaStream_t s);
+
 // out[i] = fp16(clamp(silu(g[i]) * u[i]))  over `total` elements
 void silu_mul_f16(const float* g, const float* u, __half* out, size_t total, cudaStream_t s);
 

@@ -17,10 +17,16 @@ struct GdnStepArgs {
     int n_k_heads, n_v_heads, dk, dv;
     float eps;
     Q8Buf q8;  // if q8.q: also emit the out_proj int8 input
-    float* snap = nullptr;  // if set: additionally write the updated state here (same layout; MTP rollback snapshot)
+    float* snap = nullptr;  // MTP verify (nt > 1): receives the state after tokens 0..nt-2 (token tk at + tk*snap_stride)
+    int nt = 1;             // token rows processed back to back; conv_out/alpha/beta/z/out are token-major
+    size_t snap_stride = 0; // floats between snapshots
+    int conv_stride = 0;    // floats per conv_out row
+    int out_stride = 0;     // floats per out row (q8 rows use Hv*dv/32 chunks)
 };
 
 void conv_step(const float* in, const float* w, float* state, float* out, int C, cudaStream_t s, float* snap = nullptr);
+void conv_step_multi(const float* in, const float* w, float* state, float* out, int C, int nt, float* snap,
+                     size_t snap_stride, cudaStream_t s);
 void gdn_step(const GdnStepArgs& a, cudaStream_t s);
 
 }  // namespace qv::cuda

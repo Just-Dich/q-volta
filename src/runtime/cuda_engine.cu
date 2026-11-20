@@ -59,6 +59,7 @@ class CudaEngine final : public Engine {
         if (h_tp_) cudaFreeHost(h_tp_);
         if (opt_.mtp) { cudaFreeHost(h_a_); cudaFreeHost(h_b_); cudaFreeHost(h_res_); }
         for (auto g : vgraph_) if (g) cudaGraphExecDestroy(g);
+        for (auto g : mgraph_) if (g) cudaGraphExecDestroy(g);
         for (void* p : allocs_) cudaFree(p);
         cudaFree(weights_);
         cudaStreamDestroy(stream_);
@@ -361,7 +362,7 @@ class CudaEngine final : public Engine {
     float *vx_, *vxn_, *vqkv_, *vconv_, *vz_, *valpha_, *vbeta_, *vmix_, *vqg_, *vkb_, *vvb_, *vqr_, *vg_, *vu_, *vact_,
         *vlogits_;
     Q8Buf vxq_{};
-    float *me_, *mcat_, *mhid_, *mlogits_, *hlast_;
+    float *me_, *mcat_, *mhid_, *mlogits_, *hlast_, *vpart_;
     int *d_v_, *d_m_, *d_draft_, *d_varg_, *h_a_, *h_b_, *h_res_;  // d_v_: [tok NTM | pos NTM]; d_m_: [tok | pos | chain pos]
     float *snap_gdn_ = nullptr, *snap_conv_ = nullptr;
     cudaGraphExec_t vgraph_[NTM_MAX + 1] = {};
@@ -393,6 +394,7 @@ class CudaEngine final : public Engine {
         vxq_.d = dalloc<float>((size_t)N * Kmax / 32);
         vxq_.sum = dalloc<float>((size_t)N * Kmax / 32);
         vxq_.qsum = dalloc<int>((size_t)N * Kmax / 32);
+        vpart_ = dalloc<float>((size_t)N * c.n_heads * ATTN_MAX_SPLITS * (c.head_dim + 2));
         me_ = dalloc<float>((size_t)N * H);
         mcat_ = dalloc<float>((size_t)N * 2 * H);
         mhid_ = dalloc<float>(H);
@@ -409,6 +411,10 @@ class CudaEngine final : public Engine {
         snap_conv_ = dalloc<float>((size_t)(N - 1) * conv_bytes_ / 4);
         const char* e = std::getenv("QV_MTP_PROF");
         mtp_prof_ = e && e[0] == '1';
+        const char* g = std::getenv("QV_MTP_GRAPH");
+        mtp_graph_ = !(g && g[0] == '0');
+        argmax_advance(logits_, V, d_varg_, nullptr, nullptr, stream_);  // allocates the argmax scratch before any graph capture
+        QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
     }
 
     static Q8Buf q8at(const Q8Buf& b, int K, int t) {
@@ -420,62 +426,57 @@ class CudaEngine final : public Engine {
         return r;
     }
 
-    // one decoder layer for NT rows held in vx_ (residual, in place); row t sits at position dpos[t]
+    // one decoder layer for NT rows held in vx_ (residual, in place); row t sits at position dpos[t]. Every elementwise /
+    // recurrent / attention kernel runs all NT rows in one launch with the exact per-row arithmetic of the 1-token path.
     void layer_multi(const Layer& L, int NT, const int* dpos, bool snap) {
         const Config& c = cfg_;
         cudaStream_t s = stream_;
         const int H = c.hidden, I = c.inter;
-        for (int t = 0; t < NT; ++t)
-            { Q8Buf q = q8at(vxq_, H, t); rmsnorm(vx_ + (size_t)t * H, L.in_norm, vxn_ + (size_t)t * H, xs_, H, c.eps, s, &q); }
+        rmsnorm(vx_, L.in_norm, vxn_, xs_, H, c.eps, s, &vxq_, NT);
         if (!L.attn) {
             const GdnLayer& g = L.g;
             const int C = g.qkv.N, VD = g.z.N, Hv = c.lin_v_heads;
-            const size_t MIXS = std::max(c.lin_v_heads * c.lin_v_dim, c.n_heads * c.head_dim);
+            const int MIXS = std::max(c.lin_v_heads * c.lin_v_dim, c.n_heads * c.head_dim);
             gemv_q8_multi(g.qkv, vxq_, NT, vqkv_, nullptr, s);
             gemv_q8_multi(g.z, vxq_, NT, vz_, nullptr, s);
-            for (int t = 0; t < NT; ++t) gemv_f16_dual(g.a, g.b, vxn_ + (size_t)t * H, valpha_ + (size_t)t * Hv, vbeta_ + (size_t)t * Hv, s);
+            gemv_f16_dual(g.a, g.b, vxn_, valpha_, vbeta_, s, NT);
             float* cs = conv_state_ + (size_t)L.idx_kind * C * 3;
             float* gs = gdn_state_ + (size_t)L.idx_kind * Hv * c.lin_k_dim * c.lin_v_dim;
-            for (int t = 0; t < NT; ++t) {
-                const bool sn = snap && t < NT - 1;
-                conv_step(vqkv_ + (size_t)t * C, g.conv_w, cs, vconv_ + (size_t)t * C, C, s,
-                          sn ? snap_conv_ + (size_t)t * (conv_bytes_ / 4) + (size_t)L.idx_kind * C * 3 : nullptr);
-                GdnStepArgs a{vconv_ + (size_t)t * C, valpha_ + (size_t)t * Hv, vbeta_ + (size_t)t * Hv, g.A_neg, g.dt_bias,
-                              vz_ + (size_t)t * VD, g.norm_w, gs, vmix_ + t * MIXS,
-                              c.lin_k_heads, c.lin_v_heads, c.lin_k_dim, c.lin_v_dim, c.eps, q8at(vxq_, g.out.K, t)};
-                if (sn) a.snap = snap_gdn_ + (size_t)t * (gdn_bytes_ / 4) + (size_t)L.idx_kind * Hv * c.lin_k_dim * c.lin_v_dim;
-                gdn_step(a, s);
-            }
+            const size_t conv_snap_off = (size_t)L.idx_kind * C * 3;
+            const size_t gdn_snap_off = (size_t)L.idx_kind * Hv * c.lin_k_dim * c.lin_v_dim;
+            conv_step_multi(vqkv_, g.conv_w, cs, vconv_, C, NT, snap ? snap_conv_ + conv_snap_off : nullptr, conv_bytes_ / 4, s);
+            GdnStepArgs a{vconv_, valpha_, vbeta_, g.A_neg, g.dt_bias, vz_, g.norm_w, gs, vmix_,
+                          c.lin_k_heads, c.lin_v_heads, c.lin_k_dim, c.lin_v_dim, c.eps, vxq_};
+            if (g.out.K != VD || VD != Hv * c.lin_v_dim) throw std::runtime_error("gdn out_proj shape");
+            a.nt = NT; a.conv_stride = C; a.out_stride = MIXS; a.snap_stride = gdn_bytes_ / 4;
+            if (snap) a.snap = snap_gdn_ + gdn_snap_off;
+            gdn_step(a, s);
             gemv_q8_multi(g.out, vxq_, NT, vx_, vx_, s);
         } else {
             const AttnLayer& at = L.at;
-            const size_t MIXS = std::max(c.lin_v_heads * c.lin_v_dim, c.n_heads * c.head_dim);
-            const size_t QGN = 2 * c.n_heads * c.head_dim, KN = c.n_kv_heads * c.head_dim, QRN = c.n_heads * c.head_dim;
+            const int MIXS = std::max(c.lin_v_heads * c.lin_v_dim, c.n_heads * c.head_dim);
+            const int QGN = 2 * c.n_heads * c.head_dim, KN = c.n_kv_heads * c.head_dim, QRN = c.n_heads * c.head_dim;
             gemv_q8_multi(at.q, vxq_, NT, vqg_, nullptr, s);
             gemv_q8_multi(at.k, vxq_, NT, vkb_, nullptr, s);
             gemv_q8_multi(at.v, vxq_, NT, vvb_, nullptr, s);
             const size_t kv_layer = (size_t)c.n_kv_heads * opt_.max_ctx * c.head_dim;
             float* kc = k_cache_ + L.idx_kind * kv_layer;
             float* vc = v_cache_ + L.idx_kind * kv_layer;
-            for (int t = 0; t < NT; ++t) {
-                AttnPrepArgs p{vqg_ + t * QGN, vkb_ + t * KN, vvb_ + t * KN, at.q_norm, at.k_norm, inv_freq_, vqr_ + t * QRN,
-                               kc, vc, c.n_heads, c.n_kv_heads, c.head_dim, c.rope_dim, opt_.max_ctx, dpos + t, c.eps};
-                attn_prep(p, s);
-                AttnDecodeArgs d{vqr_ + t * QRN, vqg_ + t * QGN, kc, vc, nullptr, vmix_ + t * MIXS, c.n_heads, c.n_kv_heads,
-                                 opt_.max_ctx, dpos + t, q8at(vxq_, at.o.K, t)};
-                d.part = part_;
-                attn_decode(d, s);
-            }
+            AttnPrepArgs p{vqg_, vkb_, vvb_, at.q_norm, at.k_norm, inv_freq_, vqr_, kc, vc,
+                           c.n_heads, c.n_kv_heads, c.head_dim, c.rope_dim, opt_.max_ctx, dpos, c.eps};
+            p.nt = NT; p.qg_stride = QGN; p.k_stride = KN; p.q_stride = QRN;
+            attn_prep(p, s);
+            AttnDecodeArgs d{vqr_, vqg_, kc, vc, nullptr, vmix_, c.n_heads, c.n_kv_heads, opt_.max_ctx, dpos, vxq_};
+            d.part = vpart_;
+            d.nt = NT; d.q_stride = QRN; d.qg_stride = QGN; d.out_stride = MIXS; d.q8_k = at.o.K;
+            d.part_stride = (size_t)c.n_heads * ATTN_MAX_SPLITS * (c.head_dim + 2);
+            attn_decode(d, s);
             gemv_q8_multi(at.o, vxq_, NT, vx_, vx_, s);
         }
-        for (int t = 0; t < NT; ++t)
-            { Q8Buf q = q8at(vxq_, H, t); rmsnorm(vx_ + (size_t)t * H, L.post_norm, vxn_ + (size_t)t * H, xs_, H, c.eps, s, &q); }
+        rmsnorm(vx_, L.post_norm, vxn_, xs_, H, c.eps, s, &vxq_, NT);
         gemv_q8_multi(L.gate, vxq_, NT, vg_, nullptr, s);
         gemv_q8_multi(L.up, vxq_, NT, vu_, nullptr, s);
-        for (int t = 0; t < NT; ++t) {
-            Q8Buf q = q8at(vxq_, I, t);
-            silu_mul(vg_ + (size_t)t * I, vu_ + (size_t)t * I, vact_ + (size_t)t * I, xs_, I, s, &q);
-        }
+        silu_mul(vg_, vu_, vact_, xs_, NT * I, s, &vxq_);  // rows are contiguous; chunk numbering matches q8 row stride I/32
         gemv_q8_multi(L.down, vxq_, NT, vx_, vx_, s);
     }
 
@@ -486,10 +487,9 @@ class CudaEngine final : public Engine {
         cudaStream_t s = stream_;
         const int H = c.hidden, V = c.vocab;
         const int* dpos = d_v_ + NTM_;
-        for (int t = 0; t < NT; ++t) embed(embed_, d_v_ + t, vx_ + (size_t)t * H, s);
+        embed_rows(embed_, d_v_, NT, vx_, s);
         for (const Layer& L : layers_) layer_multi(L, NT, dpos, true);
-        for (int t = 0; t < NT; ++t)
-            { Q8Buf q = q8at(vxq_, H, t); rmsnorm(vx_ + (size_t)t * H, final_norm_, vxn_ + (size_t)t * H, xs_, H, c.eps, s, &q); }
+        rmsnorm(vx_, final_norm_, vxn_, xs_, H, c.eps, s, &vxq_, NT);
         gemv_q8_multi(head_, vxq_, NT, vlogits_, nullptr, s);
         for (int t = 0; t < NT; ++t) argmax_advance(vlogits_ + (size_t)t * V, V, d_varg_ + t, nullptr, nullptr, s);
     }
@@ -501,11 +501,8 @@ class CudaEngine final : public Engine {
         const Config& c = cfg_;
         cudaStream_t s = stream_;
         const int H = c.hidden, V = c.vocab;
-        for (int t = 0; t < nt; ++t) {
-            embed(embed_, dnext + t, me_ + (size_t)t * H, s);
-            rmsnorm(me_ + (size_t)t * H, mtp_pre_e_, mcat_ + (size_t)t * 2 * H, nullptr, H, c.eps, s, nullptr);
-            rmsnorm(hid + (size_t)t * H, mtp_pre_h_, mcat_ + (size_t)t * 2 * H + H, nullptr, H, c.eps, s, nullptr);
-        }
+        embed_rows(embed_, dnext, nt, me_, s);
+        mtp_cat_rows_f32(me_, hid, mtp_pre_e_, mtp_pre_h_, mcat_, H, nt, c.eps, s);
         quantize_q8(mcat_, nt * 2 * H, vxq_, s);
         gemv_q8_multi(mtp_fc_, vxq_, nt, vx_, nullptr, s);
         layer_multi(mtp_L_, nt, dpos, false);
@@ -519,8 +516,26 @@ class CudaEngine final : public Engine {
         for (int t = 0; t < nt; ++t) { h_b_[t] = nxt[t]; h_b_[NTM_ + t] = q0 + t; }
         for (int j = 1; j < Dd; ++j) h_b_[2 * NTM_ + j - 1] = q0 + nt - 1 + j;
         QV_CUDA_CHECK(cudaMemcpyAsync(d_m_, h_b_, 3 * NTM_ * sizeof(int), cudaMemcpyHostToDevice, stream_));
-        mtp_run(nt, d_m_, hid, d_m_ + NTM_, d_draft_);
-        for (int j = 1; j < Dd; ++j) mtp_run(1, d_draft_ + j - 1, mhid_, d_m_ + 2 * NTM_ + j - 1, d_draft_ + j);
+        // all arguments are device-resident and fixed per call kind -> each kind is captured once as a graph
+        const int kind = hid == hlast_ ? 0 : nt;  // 0: first draft of a decode call, 1..NTM: update from verify rows
+        graph_run(kind, [&] { mtp_run(nt, d_m_, hid, d_m_ + NTM_, d_draft_); });
+        for (int j = 1; j < Dd; ++j)
+            graph_run(NTM_ + j, [&] { mtp_run(1, d_draft_ + j - 1, mhid_, d_m_ + 2 * NTM_ + j - 1, d_draft_ + j); });
+    }
+
+    cudaGraphExec_t mgraph_[2 * NTM_MAX + 2] = {};
+    template <class F>
+    void graph_run(int id, F&& f) {
+        if (!mtp_graph_) { f(); return; }
+        if (!mgraph_[id]) {
+            QV_CUDA_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
+            f();
+            cudaGraph_t g;
+            QV_CUDA_CHECK(cudaStreamEndCapture(stream_, &g));
+            QV_CUDA_CHECK(cudaGraphInstantiate(&mgraph_[id], g, 0));
+            QV_CUDA_CHECK(cudaGraphDestroy(g));
+        }
+        QV_CUDA_CHECK(cudaGraphLaunch(mgraph_[id], stream_));
     }
 
     // after the final-norm rows of a prefill chunk: fill the MTP KV for the chunk's positions
@@ -602,7 +617,20 @@ class CudaEngine final : public Engine {
         mtp_ready_ = p;
     }
 
-    void run_verify(int NT) { verify_forward(NT); }
+    // The verify pass reads tokens/positions from device memory only, so it is captured once per row count and replayed.
+    bool mtp_graph_ = true;
+    void run_verify(int NT) {
+        if (!mtp_graph_) { verify_forward(NT); return; }
+        if (!vgraph_[NT]) {
+            QV_CUDA_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
+            verify_forward(NT);
+            cudaGraph_t g;
+            QV_CUDA_CHECK(cudaStreamEndCapture(stream_, &g));
+            QV_CUDA_CHECK(cudaGraphInstantiate(&vgraph_[NT], g, 0));
+            QV_CUDA_CHECK(cudaGraphDestroy(g));
+        }
+        QV_CUDA_CHECK(cudaGraphLaunch(vgraph_[NT], stream_));
+    }
 
    private:
     EngineOptions opt_;

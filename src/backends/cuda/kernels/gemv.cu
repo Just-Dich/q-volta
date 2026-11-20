@@ -167,6 +167,9 @@ __global__ void __launch_bounds__(256) gemv_f16_dual_kernel(DMat16 A, DMat16 B, 
     const bool first = blockIdx.x < A.N;
     const DMat16& W = first ? A : B;
     const int row = first ? blockIdx.x : blockIdx.x - A.N;
+    x += (size_t)blockIdx.y * A.K;  // token row (nt > 1: MTP verify); x stride = K, outputs stride = N
+    ya += (size_t)blockIdx.y * A.N;
+    yb += (size_t)blockIdx.y * B.N;
     const uint2* w = reinterpret_cast<const uint2*>(W.w + (size_t)row * W.K);  // 4 halves per load
     const float4* xv = reinterpret_cast<const float4*>(x);
     float acc = 0.f;
@@ -181,8 +184,8 @@ __global__ void __launch_bounds__(256) gemv_f16_dual_kernel(DMat16 A, DMat16 B, 
     if (threadIdx.x == 0) (first ? ya : yb)[row] = acc;
 }
 
-void gemv_f16_dual(const DMat16& A, const DMat16& B, const float* x, float* ya, float* yb, cudaStream_t s) {
-    gemv_f16_dual_kernel<<<A.N + B.N, 256, 0, s>>>(A, B, x, ya, yb);
+void gemv_f16_dual(const DMat16& A, const DMat16& B, const float* x, float* ya, float* yb, cudaStream_t s, int nt) {
+    gemv_f16_dual_kernel<<<dim3(A.N + B.N, nt), 256, 0, s>>>(A, B, x, ya, yb);
 }
 
 void gemv_f16(const DMat16& W, const float* x, float* y, cudaStream_t s) {

@@ -15,8 +15,10 @@ struct AttnPrepArgs {
     float* k_cache;         // [Hkv][max_ctx][D]
     float* v_cache;
     int n_heads, n_kv_heads, head_dim, rope_dim, max_ctx;
-    const int* pos;  // device scalar (graph-capturable)
+    const int* pos;  // device scalar (graph-capturable); row y of an nt-row launch uses pos[y]
     float eps;
+    // nt > 1 (MTP verify): nt rows in one launch, row y reads/writes at +y*stride (floats); per-row positions pos[y]
+    int nt = 1, qg_stride = 0, k_stride = 0, q_stride = 0;
 };
 
 struct AttnDecodeArgs {
@@ -34,11 +36,14 @@ struct AttnDecodeArgs {
     // Layout: [Hq][S][D] partial accumulators followed by [Hq][S][2] (m, l). No zero-init and no counters needed.
     float* part = nullptr;
     int max_splits = 80;  // number of key splits launched per kv head (fixed => graph-capturable); must match scratch
+    // nt > 1: nt rows in one launch (row z: q/qg/out + z*stride, pos[z], part + z*part_stride, q8 rows of q8_k elements)
+    int nt = 1, q_stride = 0, qg_stride = 0, out_stride = 0, q8_k = 0;
+    size_t part_stride = 0;
 };
 
 constexpr int ATTN_MAX_SPLITS = 80;  // default; total CTAs = n_kv_heads * max_splits
 
-void attn_prep(const AttnPrepArgs& a, cudaStream_t s);
+void attn_prep(const AttnPrepArgs& a, cudaStream_t s);  // for nt > 1 all rows' K/V are written before any row attends
 void attn_decode(const AttnDecodeArgs& a, cudaStream_t s);      // split-K if a.part, else reference
 void attn_decode_ref(const AttnDecodeArgs& a, cudaStream_t s);  // original one-block-per-head kernel (uses a.scores)
 
