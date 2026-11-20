@@ -81,8 +81,28 @@ static void run_case(int pos0, int T, std::mt19937& g) {
     ref_loop(d, pos0, d.N, kc_r, vc_r, out_ref, dpos);
     attn_prep_seq(prep_args(d, pos0, T, qprep, kc_s, vc_s), 0);
     AttnSeqArgs sa{qprep, d.qg + (size_t)pos0 * Hq * 2 * D, kc_s, vc_s, out_h, out_f, Hq, Hkv, MAXCTX, pos0, T};
-    attn_seq(sa, 0);
+    attn_seq_fp32(sa, 0);
+    float* out_t = dev<float>(on);
+    __half* out_th = dev<__half>(on);
+    AttnSeqArgs st = sa; st.out_f = out_t; st.out_h = out_th;
+    attn_seq_tc(st, 0);
     QV_CUDA_CHECK(cudaDeviceSynchronize());
+    {   // tensor-core kernel (fp16 HMMA inputs, fp32 softmax/accumulate) vs golden decode loop
+        std::vector<float> r2(on), t2(on);
+        std::vector<__half> th(on);
+        cudaMemcpy(r2.data(), out_ref, on * 4, cudaMemcpyDeviceToHost);
+        cudaMemcpy(t2.data(), out_t, on * 4, cudaMemcpyDeviceToHost);
+        cudaMemcpy(th.data(), out_th, on * 2, cudaMemcpyDeviceToHost);
+        double e2 = 0, n2 = 0, mx = 0, eh = 0;
+        for (size_t i = 0; i < on; ++i) {
+            double e = t2[i] - r2[i]; e2 += e * e; n2 += (double)r2[i] * r2[i]; mx = std::fmax(mx, std::fabs(e));
+            double eq = __half2float(th[i]) - r2[i]; eh += eq * eq;
+        }
+        double rel2 = std::sqrt(e2 / n2), relh2 = std::sqrt(eh / n2);
+        bool ok2 = rel2 <= 3e-3 && relh2 <= 4e-3;
+        std::printf("   TC   pos0=%5d T=%4d  out_f rel_err=%.3e (max abs %.2e)  out_h rel_err=%.3e  %s\n", pos0, T, rel2, mx, relh2, ok2 ? "OK" : "FAIL");
+        if (!ok2) ++g_fail;
+    }
     std::vector<float> r(on), s(on), kr(csz), ks(csz), vr(csz), vs(csz);
     std::vector<__half> h(on);
     cudaMemcpy(r.data(), out_ref, on * 4, cudaMemcpyDeviceToHost);
@@ -110,10 +130,10 @@ static void run_case(int pos0, int T, std::mt19937& g) {
     cudaFree(const_cast<float*>(d.qg)); cudaFree(const_cast<float*>(d.k)); cudaFree(const_cast<float*>(d.v));
     cudaFree(const_cast<float*>(d.qn)); cudaFree(const_cast<float*>(d.kn)); cudaFree(const_cast<float*>(d.invf));
     cudaFree(dpos); cudaFree(kc_r); cudaFree(vc_r); cudaFree(kc_s); cudaFree(vc_s);
-    cudaFree(out_ref); cudaFree(out_f); cudaFree(qprep); cudaFree(out_h);
+    cudaFree(out_t); cudaFree(out_th); cudaFree(out_ref); cudaFree(out_f); cudaFree(qprep); cudaFree(out_h);
 }
 
-static void bench(int pos0, int T, std::mt19937& g) {
+static void bench(int pos0, int T, std::mt19937& g, bool use_tc) {
     int N = pos0 + T;
     float* qg = up(rnd((size_t)T * Hq * 2 * D, g));
     float* q = up(rnd((size_t)T * Hq * D, g));
@@ -123,24 +143,25 @@ static void bench(int pos0, int T, std::mt19937& g) {
     float* out = dev<float>((size_t)T * Hq * D);
     __half* oh = dev<__half>((size_t)T * Hq * D);
     AttnSeqArgs sa{q, qg, kc, vc, oh, out, Hq, Hkv, MAXCTX, pos0, T};
-    for (int i = 0; i < 3; ++i) attn_seq(sa, 0);
+    auto fn = use_tc ? attn_seq_tc : attn_seq_fp32;
+    for (int i = 0; i < 3; ++i) fn(sa, 0);
     cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
     cudaEventRecord(e0);
-    for (int i = 0; i < 20; ++i) attn_seq(sa, 0);
+    for (int i = 0; i < 20; ++i) fn(sa, 0);
     cudaEventRecord(e1); cudaEventSynchronize(e1);
     float ms; cudaEventElapsedTime(&ms, e0, e1); ms /= 20;
     double keys = (double)T * pos0 + (double)T * (T + 1) / 2;
     double fl = 4.0 * Hq * D * keys;
-    std::printf("bench pos0=%5d T=%d: %.3f ms  %.2f TFLOP/s (causal-useful FLOPs)\n", pos0, T, ms, fl / (ms * 1e-3) / 1e12);
+    std::printf("bench %s pos0=%5d T=%d: %.3f ms  %.2f TFLOP/s (causal-useful FLOPs)\n", use_tc ? "tc  " : "fp32", pos0, T, ms, fl / (ms * 1e-3) / 1e12);
     (void)N;
 }
 
 int main() {
     std::mt19937 g(1234);
     for (int T : {1, 5, 64, 257}) run_case(0, T, g);
+    run_case(37, 100, g);  // unaligned pos0 and T
     run_case(1000, 64, g);
-    bench(0, 1024, g);
-    bench(8192, 1024, g);
+    for (bool tc : {false, true}) { bench(0, 1024, g, tc); bench(8192, 1024, g, tc); }
     std::printf(g_fail ? "FAILED\n" : "ALL PASS\n");
     return g_fail ? 1 : 0;
 }

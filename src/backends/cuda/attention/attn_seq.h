@@ -38,6 +38,9 @@ struct AttnSeqArgs {
 };
 
 void attn_prep_seq(const AttnSeqPrepArgs& a, cudaStream_t s);
+// attn_seq dispatches to the tensor-core kernel (attn_seq_tc.cu) unless env QV_ATTN=fp32 (fp32 CUDA-core reference kernel).
 void attn_seq(const AttnSeqArgs& a, cudaStream_t s);
+void attn_seq_fp32(const AttnSeqArgs& a, cudaStream_t s);
+void attn_seq_tc(const AttnSeqArgs& a, cudaStream_t s);
 
 }  // namespace qv::cuda

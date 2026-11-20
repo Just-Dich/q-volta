@@ -3,7 +3,9 @@
 // chunk boundaries at every phase of the 64-block; (c) nt-row (MTP verify) launch bit-identical to 1-row launches.
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <random>
 #include <vector>
 
@@ -87,6 +89,10 @@ static std::vector<float> decode_run(const Data& d, const float* qr_all, int row
 }
 
 int main() {
+    const char* qa = std::getenv("QV_ATTN");
+    const bool fp32k = qa && std::string(qa) == "fp32";  // CUDA-core prefill kernel: tight tolerances; tensor-core kernel (fp16 P): looser
+    const double tol = fp32k ? 2e-4 : 6e-3;
+    std::printf("prefill kernel: %s\n", fp32k ? "fp32 CUDA-core" : "tensor-core");
     std::mt19937 g(7);
     std::normal_distribution<float> nd(0.f, 1.f);
     const int N = 4000;
@@ -136,9 +142,9 @@ int main() {
             double e_chunk = rel(lastc_tail, last);
             std::printf("T=%5d  int4 prefill vs fp32: rel L2 %.4f | decode vs prefill(int4): %.2e | multichunk vs single: %.2e\n",
                         T, e_seq, e_dec, e_chunk);
-            CHECK(e_dec < 2e-4, "T=%d decode vs prefill kernel mismatch %.3e", T, e_dec);
-            CHECK(e_chunk < 2e-4, "T=%d multi-chunk mismatch %.3e", T, e_chunk);
-            CHECK(e_seq < (kmode == 2 ? 2e-3 : 0.15), "T=%d accuracy %.3e", T, e_seq);
+            CHECK(e_dec < tol, "T=%d decode vs prefill kernel mismatch %.3e", T, e_dec);
+            CHECK(e_chunk < tol, "T=%d multi-chunk mismatch %.3e", T, e_chunk);
+            CHECK(e_seq < (kmode == 2 ? 6e-3 : 0.15), "T=%d accuracy %.3e", T, e_seq);
             // MTP-style verify: nt rows (positions T-1..T+1 would need new tokens) -> use rows at the same ring content:
             // here compare nt=3 launch (same q, positions T-3..T-1) against three 1-row launches (bit-exact required)
             if (T >= 300) {

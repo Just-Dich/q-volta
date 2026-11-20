@@ -2,6 +2,8 @@
 // of one kv head (R = 48 rows), streams KT-key tiles of K and V through shared memory once for all rows,
 // fp32 online softmax, CUDA-core FMA.
 #include "attn_seq.h"
+#include <cstdlib>
+#include <string>
 
 namespace qv::cuda {
 
@@ -469,7 +471,7 @@ __global__ void __launch_bounds__(256, 1) attn_seq_kv4_kernel(AttnSeqArgs a) {
     }
 }
 
-void attn_seq(const AttnSeqArgs& a, cudaStream_t s) {
+void attn_seq_fp32(const AttnSeqArgs& a, cudaStream_t s) {
     if (a.n_heads != AG * a.n_kv_heads) { std::fprintf(stderr, "attn_seq: need 6 q heads per kv head\n"); std::abort(); }
     if (a.T <= 0) return;
     static bool init = false;
@@ -491,6 +493,11 @@ void attn_seq(const AttnSeqArgs& a, cudaStream_t s) {
         return;
     }
     attn_seq_kernel<<<grid, 256, ASMEM, s>>>(a);
+}
+
+void attn_seq(const AttnSeqArgs& a, cudaStream_t s) {
+    static const bool fp32 = [] { const char* e = std::getenv("QV_ATTN"); return e && std::string(e) == "fp32"; }();
+    if (fp32) attn_seq_fp32(a, s); else attn_seq_tc(a, s);
 }
 
 }  // namespace qv::cuda

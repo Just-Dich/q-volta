@@ -1,0 +1,200 @@
+{
+ "date": "2026-11-20",
+ "hypothesis": "H-D tensor-core (Volta HMMA via WMMA 16x16x16, fp16 in/fp32 acc) flash prefill attention",
+ "branch": "p9/tcattn",
+ "gpu": "Tesla V100-SXM2-16GB (device 0), shared with other agents; every timed run under flock /tmp/qv_bench.lock",
+ "kernel": "src/backends/cuda/attention/attn_seq_tc.cu: 8 queries x 6 q heads (48 rows) per block, 64-key tiles, 256 threads, 93 KB smem, KV fp32 cache converted to fp16 in smem (register-prefetched), fp32 online softmax, QV_ATTN=fp32 selects the old kernel",
+ "attention_only_chunk2048_one_layer": [
+  {
+   "pos0": 0,
+   "T": 2048,
+   "tc_ms": 2.0565,
+   "fp32_ms": 5.8293,
+   "speedup": 2.83,
+   "tc_tflops_causal_useful": 25.1
+  },
+  {
+   "pos0": 2048,
+   "T": 2048,
+   "tc_ms": 5.5921,
+   "fp32_ms": 17.3786,
+   "speedup": 3.11,
+   "tc_tflops_causal_useful": 27.7
+  },
+  {
+   "pos0": 6144,
+   "T": 2048,
+   "tc_ms": 12.4337,
+   "fp32_ms": 40.1572,
+   "speedup": 3.23,
+   "tc_tflops_causal_useful": 29.0
+  },
+  {
+   "pos0": 14336,
+   "T": 2048,
+   "tc_ms": 26.1751,
+   "fp32_ms": 87.3537,
+   "speedup": 3.34,
+   "tc_tflops_causal_useful": 29.5
+  },
+  {
+   "pos0": 30720,
+   "T": 2048,
+   "tc_ms": 54.1068,
+   "fp32_ms": 189.0126,
+   "speedup": 3.49,
+   "tc_tflops_causal_useful": 29.5
+  },
+  {
+   "pos0": 63488,
+   "T": 2048,
+   "tc_ms": 110.1732,
+   "fp32_ms": 431.0108,
+   "speedup": 3.91,
+   "tc_tflops_causal_useful": 29.5
+  },
+  {
+   "pos0": 129024,
+   "T": 2048,
+   "tc_ms": 239.502,
+   "fp32_ms": 834.1917,
+   "speedup": 3.48,
+   "tc_tflops_causal_useful": 27.3
+  },
+  {
+   "pos0": 260096,
+   "T": 2048,
+   "tc_ms": 498.4637,
+   "fp32_ms": 1675.9966,
+   "speedup": 3.36,
+   "tc_tflops_causal_useful": 26.4
+  }
+ ],
+ "attention_only_T1024": {
+  "pos0=3072": {
+   "tc_ms": 3.3447,
+   "fp32_ms": 10.4492,
+   "speedup": 3.12
+  },
+  "pos0=7168": {
+   "tc_ms": 7.0267,
+   "fp32_ms": 22.6284,
+   "speedup": 3.22
+  },
+  "pos0=15360": {
+   "tc_ms": 14.4292,
+   "fp32_ms": 47.2726,
+   "speedup": 3.28
+  },
+  "pos0=31744": {
+   "tc_ms": 29.2099,
+   "fp32_ms": 96.7212,
+   "speedup": 3.31
+  }
+ },
+ "synthetic_data_note": "random normal q/k/v, fp32 KV [4][pos0+T][256] for ONE layer; 64K/128K/256K points are kernel-only (no model fits)",
+ "tc_vs_fp32_rel_err_synthetic_pos0_63488_T2048": 0.00042,
+ "extrapolated_prefill_attention_16_layers_chunk2048_seconds": {
+  "4096": {
+   "tc": 0.12,
+   "fp32": 0.37,
+   "speedup": 3.03
+  },
+  "8192": {
+   "tc": 0.47,
+   "fp32": 1.47,
+   "speedup": 3.17
+  },
+  "16384": {
+   "tc": 1.81,
+   "fp32": 5.93,
+   "speedup": 3.28
+  },
+  "32768": {
+   "tc": 7.17,
+   "fp32": 24.43,
+   "speedup": 3.41
+  },
+  "65536": {
+   "tc": 28.65,
+   "fp32": 105.73,
+   "speedup": 3.69
+  },
+  "131072": {
+   "tc": 119.2,
+   "fp32": 432.85,
+   "speedup": 3.63
+  },
+  "262144": {
+   "tc": 499.11,
+   "fp32": 1724.8,
+   "speedup": 3.46
+  }
+ },
+ "extrapolation_method": "piecewise-linear interpolation of measured per-chunk time vs pos0 (8 measured points above), summed over all T=2048 chunks, x16 layers; attention only, excludes GEMM/GDN/dequant",
+ "end_to_end_prefill_tok_s": {
+  "protocol": "qv_run --bench --prefill, E0 model, wikitext prefix, 2 reps each, interleaved run order fp32 then tc, GPU shared (CPU also loaded by other agents)",
+  "4096_chunk2048": {
+   "fp32": [
+    1101.25,
+    1075.17
+   ],
+   "tc": [
+    1191.08,
+    1171.09,
+    1230.25
+   ]
+  },
+  "8192_chunk2048": {
+   "fp32": [
+    909.16,
+    913.38
+   ],
+   "tc": [
+    1040.28,
+    1087.62
+   ]
+  },
+  "16384_chunk1024": {
+   "fp32": [
+    691.64,
+    683.66
+   ],
+   "tc": [
+    888.49,
+    869.66
+   ],
+   "note": "chunk 2048 OOMs at 16K (fp32 KV 2.1 GiB + prefill scratch); 32K does not fit (fp32 KV 4 GiB)"
+  }
+ },
+ "correctness": {
+  "test_attn_seq": "ALL PASS; TC out_f rel err vs decode-loop golden 2.1e-4..4.1e-4 (limit 3e-3), out_h 2.9e-4..4.6e-4; fp32 kernel unchanged (<=8e-7)",
+  "golden_step_path": {
+   "kl_qsim_engine": 0.0006486,
+   "note": "unchanged (step path does not use attn_seq)"
+  },
+  "golden_prefill_path_T64": {
+   "tc": {
+    "kl": 7.293e-05,
+    "top1": 0.984,
+    "logits_rel": 0.00479
+   },
+   "fp32": {
+    "kl": 7.268e-05,
+    "top1": 0.952,
+    "logits_rel": 0.00478
+   }
+  },
+  "golden_prefill_chunk23_T64": {
+   "tc": {
+    "kl": 7.46e-05,
+    "top1": 0.952
+   },
+   "fp32": {
+    "kl": 7.226e-05,
+    "top1": 0.952
+   }
+  }
+ },
+ "verdict": "H-D not falsified: 3.0-3.9x attention speedup at 4K-256K (threshold 2x), below the 5x expected; 27-29.5 TFLOP/s = ~23% of 125 TFLOP/s peak"
+}
