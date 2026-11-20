@@ -10,7 +10,7 @@ A native CPU backend (x86 AVX2, later ARM/NEON) is planned and deliberately **no
 ## What works (tested)
 - Quantizer/converter (`tools/convert.py`): streams BF16 weights, writes the Q-Volta bit-plane format (asymmetric group-64, 2-8 bit), optional PEFT LoRA merge (`--lora`).
 - Full-model CUDA forward: step (decode, int8-activation dp4a GEMV at 81-99% of HBM peak, CUDA-graph) and batched prefill (dequant slab + cuBLAS HGEMM, in-kernel GDN recurrence, causal attention). Golden tests against a simulated-quantization reference pass on real weights.
-- Measured on V100: plain decode 52 tok/s (E0 quantization, 12.6 GiB); cold prefill 1013 / 971 / 917 tok/s at 512 / 2048 / 4088 tokens.
+- Measured on V100: plain decode 52 tok/s (E0 quantization, 12.6 GiB); cold prefill 1013 / 1205 / 1143 tok/s at 512 / 2048 / 4088 tokens (NInfer on the same GPU: 837 / 1010 / 1013).
 
 ## Known limitations (read before comparing)
 - **Quality is behind the strongest baseline**: E0 is plain round-to-nearest (+12% wikitext perplexity vs BF16); the comparison engine is +0.3%. Part of our decode lead is simply fewer bytes read. Improving quantization is the next big item.

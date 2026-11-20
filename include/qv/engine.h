@@ -11,7 +11,7 @@ namespace qv {
 
 struct EngineOptions {
     int max_ctx = 4096;
-    int prefill_chunk = 512;   // tokens per batched prefill chunk
+    int prefill_chunk = 2048;  // tokens per batched prefill chunk
     bool dump_hidden = false;  // record residual stream after embed + each layer (debug / golden tests)
 };
 

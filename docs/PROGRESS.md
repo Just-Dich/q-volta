@@ -6,4 +6,5 @@
 - 2026-11-20: adapter analysis: RTN noise >> adapter shift; runtime LoRA planned.
 - 2026-11-20: research fan-out (decode kernels, MTP, prefill, quantization quality) -> PLAN.md (hypotheses with mechanism/expected/falsification).
 - 2026-11-20: P1 batched prefill: dequant_rows_f16 (751 GB/s), gdn_seq (2.15 us/token/layer), attn_seq (8.4 TFLOP/s), cuBLAS slab GEMM; golden PASS; prefill 51 -> 1013 tok/s @512 (NInfer 837), 917 @4088 (NInfer 1013).
+- 2026-11-20: prefill chunk 512 -> 2048 (fewer dequant passes): 1205 / 1143 tok/s @2048/4088 vs NInfer 1010/1013 (+19%/+13%); multi-chunk golden PASS.
 Next: tensor-core attention + dequant/GEMM overlap (prefill at long prompts), runtime LoRA, MTP, KV quantization + split-K decode attention, quantization quality (clip search, bit allocation, GPTQ), NIAH/ppl at 32K-256K.

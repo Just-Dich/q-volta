@@ -25,7 +25,7 @@ static std::vector<int> read_i32(const std::string& p) {
 int main(int argc, char** argv) {
     std::string model, golden, out, prompt;
     bool bench = false, graph = false, use_prefill = false;
-    int n = 128, max_ctx = 4096, warm = 8;
+    int n = 128, max_ctx = 4096, warm = 8, chunk = 2048;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { if (i + 1 >= argc) throw std::runtime_error("missing value for " + a); return argv[++i]; };
@@ -35,6 +35,7 @@ int main(int argc, char** argv) {
         else if (a == "--prompt") prompt = next();
         else if (a == "--bench") bench = true;
         else if (a == "--prefill") use_prefill = true;
+        else if (a == "--prefill-chunk") chunk = std::stoi(next());
         else if (a == "--graph") graph = true;
         else if (a == "--n") n = std::stoi(next());
         else if (a == "--max-ctx") max_ctx = std::stoi(next());
@@ -45,6 +46,7 @@ int main(int argc, char** argv) {
     qv::ModelFile mf = qv::ModelFile::open(model);
     qv::EngineOptions opt;
     opt.max_ctx = max_ctx;
+    opt.prefill_chunk = chunk;
     opt.dump_hidden = !golden.empty();
     auto eng = qv::make_cuda_engine(mf, opt);
     eng->sync();

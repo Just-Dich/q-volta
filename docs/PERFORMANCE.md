@@ -14,14 +14,16 @@ Competitor: NInfer (Apache-2.0), model Qwen3.8-27B-GSQ-RCO-IQ3_S (13.99 GiB file
 Bytes-normalized plain decode: Q-Volta 52.2 x 12.63 = 659 GiB/s effective vs NInfer 45.3 x 13.99 = 634 GiB/s (+4%). Most of the raw +15% comes from reading fewer bytes (coarser quantization), not from a faster kernel. NInfer artifact may contain tensors not read per token, so treat +4% as an upper-bound-ish estimate until verified.
 
 ## Prefill (cold, no prefix cache, identical wikitext prompts)
-| prompt tokens | Q-Volta | NInfer | Q-Volta vs NInfer |
-|---:|---:|---:|---:|
-| 512 | 1013 | 837 | +21% |
-| 2048 | 971 | 1010 | -4% |
-| 4088 | 917 | 1013 | -9.5% |
-Path: dequantize 32-MiB weight slabs to fp16 -> cuBLAS tensor-core HGEMM; GDN recurrence in-kernel with register-resident state; fp32 CUDA-core flash-style attention. Reps agree within 1%.
-Where the loss comes from: attention (8.4 TFLOP/s on CUDA cores) grows with context; NInfer is flat. Next: tensor-core attention, overlap dequant with GEMM.
-History: step-by-step prefill 51 tok/s -> batched 680 -> aligned slabs 1014 (512 tokens). (An earlier "25.6 tok/s" figure was a benchmark-timer artifact in --graph mode; fixed.)
+| prompt tokens | Q-Volta (chunk 2048) | Q-Volta (chunk 512) | NInfer (chunk 1024) | Q-Volta chunk-2048 vs NInfer |
+|---:|---:|---:|---:|---:|
+| 512 | 1013 (one chunk) | 1013 | 837 | +21% |
+| 2048 | 1205 | 971 | 1010 | +19% |
+| 4088 | 1143 | 917 | 1013 | +13% |
+Path: dequantize 32-MiB weight slabs to fp16 -> cuBLAS tensor-core HGEMM; GDN recurrence in-kernel with register-resident state; fp32 CUDA-core flash-style attention. Reps agree within ~1%.
+Why chunk size matters: weights are re-dequantized once per chunk, so chunk 512 paid for 8 dequant passes on a 4K prompt. Profile at 4088 tokens (chunk 512): GEMM 61% (~77 TFLOP/s, near the cuBLAS ceiling), dequant 15%, attention 10%, GDN 10%. Chunk 2048 costs +0.6 GiB VRAM (14.9 GiB total at max_ctx 8192).
+Multi-chunk correctness: golden passes with chunks of 16 and 23 tokens (GDN/conv/KV carry across chunks), same error level as single-chunk.
+Not yet measured: prompts > 4K (attention is CUDA-core fp32 and grows quadratically; expect the lead to shrink), VRAM at long context (fp32 KV).
+History: step-by-step 51 -> batched 680 -> aligned slabs 1014 -> chunk 2048 1205 tok/s. (An earlier "25.6 tok/s" figure was a benchmark-timer artifact in --graph mode; fixed.)
 
 ## Quality (the co-metric; speed wins at worse quality are not wins)
 - wikitext-2 test, 4088 tokens: BF16 ppl 8.468 -> E0 9.508 (+12%), KL(ref||q) 0.122, top-1 agreement 84.6%.
