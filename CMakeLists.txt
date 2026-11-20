@@ -3,7 +3,12 @@ cmake_minimum_required(VERSION 3.24)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 70)
 endif()
-project(q_volta LANGUAGES CXX CUDA)
+option(QV_CUDA "Build the CUDA engine, kernels and tests" ON)
+if(QV_CUDA)
+  project(q_volta LANGUAGES CXX CUDA)
+else()
+  project(q_volta LANGUAGES CXX)
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -13,13 +18,16 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+if(QV_CUDA)
 find_package(CUDAToolkit REQUIRED)
+endif()
 
 set(QV_CUDA_FLAGS -O3 -lineinfo -Xptxas=-v -Wno-deprecated-gpu-targets)
 
 add_library(qv_core STATIC src/model/model_file.cpp)
 target_include_directories(qv_core PUBLIC include)
 
+if(QV_CUDA)
 add_library(qv_cuda STATIC
   src/backends/cuda/kernels/gemv.cu
   src/backends/cuda/kernels/gemv_q8.cu
@@ -39,6 +47,7 @@ target_compile_options(qv_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${QV_CUDA_FLAG
 
 add_executable(qv_run tools/qv_run.cpp)
 target_link_libraries(qv_run PRIVATE qv_cuda CUDA::cudart)
+target_compile_definitions(qv_run PRIVATE QV_HAVE_CUDA)
 
 enable_testing()
 add_executable(test_gemv tests/test_gemv.cu)
@@ -68,8 +77,13 @@ add_executable(test_attn_decode_split tests/test_attn_decode_split.cu)
 target_link_libraries(test_attn_decode_split PRIVATE qv_cuda)
 target_compile_options(test_attn_decode_split PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-gpu-targets>)
 add_test(NAME attn_decode_split COMMAND test_attn_decode_split)
+endif()
 
 option(QV_CPU "Build the CPU decode ops library (qv_cpu_ops)" ON)
 if(QV_CPU)
   add_subdirectory(src/backends/cpu)
+  if(QV_CUDA)
+    target_link_libraries(qv_run PRIVATE qv_cpu_engine)
+    target_compile_definitions(qv_run PRIVATE QV_HAVE_CPU)
+  endif()
 endif()

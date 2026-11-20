@@ -12,6 +12,7 @@ namespace qv {
 struct EngineOptions {
     int max_ctx = 4096;
     int prefill_chunk = 2048;  // tokens per batched prefill chunk
+    int threads = 32;          // CPU backend: worker threads incl. the caller (RAM bandwidth saturates near 32 here)
     bool dump_hidden = false;  // record residual stream after embed + each layer (debug / golden tests)
 };
 
@@ -38,6 +39,7 @@ class Engine {
     Config cfg_;
 };
 
-std::unique_ptr<Engine> make_cuda_engine(const ModelFile& mf, const EngineOptions& opt);
+std::unique_ptr<Engine> make_cuda_engine(const ModelFile& mf, const EngineOptions& opt);  // needs the qv_cuda library
+std::unique_ptr<Engine> make_cpu_engine(const ModelFile& mf, const EngineOptions& opt);   // needs qv_cpu_engine
 
 }  // namespace qv

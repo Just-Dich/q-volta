@@ -62,6 +62,10 @@ inline int q8_perm(int n) {
 
 void quantize_act_q8(const float* x, int K, Q8ActC& out);  // AVX2; K % 64 == 0
 
+// Range variant for fused/parallel use: quantizes groups [g0,g1) of x (x points at the START of the vector) into a
+// pre-sized `out` (q.size() >= 64*g1, ds.size() >= 2*g1). Disjoint group ranges may run concurrently.
+void quantize_act_q8_range(const float* x, int g0, int g1, Q8ActC& out);
+
 // y[row0..row1) = W[row0..row1) . x  (single thread). Optimized AVX2 for bits 2,3,4,5,6,8.
 void gemv_q(const QMatC& W, const Q8ActC& x, float* y, int row0, int row1);
 

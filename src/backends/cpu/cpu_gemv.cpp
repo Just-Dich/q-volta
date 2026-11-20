@@ -8,16 +8,19 @@
 namespace qv::cpu {
 
 void quantize_act_q8(const float* x, int K, Q8ActC& out) {
-    const int G = K / 64;
     out.K = K;
     out.q.assign((size_t)K, 0);
-    out.ds.assign((size_t)2 * G, 0.f);
+    out.ds.assign((size_t)(K / 64) * 2, 0.f);
+    quantize_act_q8_range(x, 0, K / 64, out);
+}
+
+void quantize_act_q8_range(const float* x, int g0, int g1, Q8ActC& out) {
     static int perm[64];
     static bool init = [] { for (int n = 0; n < 64; ++n) perm[n] = q8_perm(n); return true; }();
     (void)init;
     const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
     alignas(32) int8_t nat[64];
-    for (int g = 0; g < G; ++g) {
+    for (int g = g0; g < g1; ++g) {
         const float* xg = x + (size_t)g * 64;
         __m256 v[8];
         __m256 mx = _mm256_setzero_ps(), sm = _mm256_setzero_ps();
@@ -36,7 +39,8 @@ void quantize_act_q8(const float* x, int K, Q8ActC& out) {
         const float dx = amax / 127.f;
         out.ds[2 * g] = dx;
         out.ds[2 * g + 1] = _mm_cvtss_f32(s4);
-        if (dx > 0.f) {
+        if (!(dx > 0.f)) std::memset(out.q.data() + (size_t)g * 64, 0, 64);
+        else {
             const __m256 dv = _mm256_set1_ps(dx);
             __m256i qi[4];
             for (int i = 0; i < 4; ++i)

@@ -1,15 +1,21 @@
 // qv_run — driver for correctness dumps and decode benchmarks.
 //   qv_run --model PREFIX --golden TOKENS.i32 --out DUMP.bin      (hidden states after embed+each layer, + logits)
+//   qv_run --backend cuda|cpu [--threads N] ...   (cpu: no GPU is touched; qv_run_cpu is the same source built without CUDA)
 //   qv_run --model PREFIX --bench --prompt TOKENS.i32 [--n 128] [--max-ctx 4096]
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+#ifdef QV_HAVE_CUDA
 #include <cuda_runtime.h>
+#else
+#define QV_HAVE_CPU 1
+#endif
 
 #include "qv/engine.h"
 
@@ -25,6 +31,12 @@ static std::vector<int> read_i32(const std::string& p) {
 int main(int argc, char** argv) {
     std::string model, golden, out, prompt;
     bool bench = false, graph = false, use_prefill = false;
+#ifdef QV_HAVE_CUDA
+    std::string backend = "cuda";
+#else
+    std::string backend = "cpu";
+#endif
+    int threads = 32;
     int n = 128, max_ctx = 4096, warm = 8, chunk = 2048;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -33,6 +45,8 @@ int main(int argc, char** argv) {
         else if (a == "--golden") golden = next();
         else if (a == "--out") out = next();
         else if (a == "--prompt") prompt = next();
+        else if (a == "--backend") backend = next();
+        else if (a == "--threads") threads = std::stoi(next());
         else if (a == "--bench") bench = true;
         else if (a == "--prefill") use_prefill = true;
         else if (a == "--prefill-chunk") chunk = std::stoi(next());
@@ -48,11 +62,28 @@ int main(int argc, char** argv) {
     opt.max_ctx = max_ctx;
     opt.prefill_chunk = chunk;
     opt.dump_hidden = !golden.empty();
-    auto eng = qv::make_cuda_engine(mf, opt);
+    opt.threads = threads;
+    std::unique_ptr<qv::Engine> eng;
+    if (backend == "cpu") {
+#ifdef QV_HAVE_CPU
+        eng = qv::make_cpu_engine(mf, opt);
+#else
+        std::fprintf(stderr, "this build has no CPU engine\n"); return 2;
+#endif
+    } else {
+#ifdef QV_HAVE_CUDA
+        eng = qv::make_cuda_engine(mf, opt);
+#else
+        std::fprintf(stderr, "this build has no CUDA engine\n"); return 2;
+#endif
+    }
+    const bool cpu = backend == "cpu";
     eng->sync();
     double load_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    size_t fr, tot;
-    cudaMemGetInfo(&fr, &tot);
+    size_t fr = 0, tot = 0;
+#ifdef QV_HAVE_CUDA
+    if (!cpu) cudaMemGetInfo(&fr, &tot);
+#endif
     std::fprintf(stderr, "loaded in %.1fs: weights %.2f GiB, state+scratch %.2f GiB, device used %.2f / %.2f GiB\n", load_s,
                  eng->device_bytes_weights() / 1073741824.0, eng->device_bytes_state() / 1073741824.0,
                  (tot - fr) / 1073741824.0, tot / 1073741824.0);
@@ -83,35 +114,36 @@ int main(int argc, char** argv) {
         if (use_prefill) eng->prefill(toks.data(), (int)toks.size(), 0);  // warm: allocates prefill scratch + cuBLAS
         eng->sync();
         eng->reset();
-        cudaEvent_t e0, e1, e1b, e2;
-        cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventCreate(&e1b); cudaEventCreate(&e2);
-        cudaEventRecord(e0);
+        using clk = std::chrono::steady_clock;
+        auto ms = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+        auto e0 = clk::now();
         int pos = 0;
         if (use_prefill) { eng->prefill(toks.data(), (int)toks.size(), 0); pos = (int)toks.size(); }
         else for (; pos < (int)toks.size(); ++pos) eng->step(toks[pos], pos);
         int next = eng->argmax();
-        cudaEventRecord(e1);
-        cudaEventRecord(e1b);  // decode window starts here (re-recorded after the untimed graph-capture re-run)
+        eng->sync();
+        auto e1 = clk::now();
+        auto e1b = e1;  // decode window starts here (re-taken after the untimed graph-capture re-run)
         std::vector<int> gen{next}, rest;
-        auto td0 = std::chrono::steady_clock::now();
+        auto td0 = clk::now();
         if (graph) {  // capture outside the timed region: one untimed decode, then restore by re-running the prompt
             eng->decode_greedy(next, pos, 1, rest, true);
             eng->reset();
             if (use_prefill) eng->prefill(toks.data(), (int)toks.size(), 0);
             else for (int p = 0; p < (int)toks.size(); ++p) eng->step(toks[p], p);
             eng->sync();
-            cudaEventRecord(e1b);
-            td0 = std::chrono::steady_clock::now();
+            e1b = clk::now();
+            td0 = e1b;
         }
         eng->decode_greedy(next, pos, n - 1, rest, graph);
         gen.insert(gen.end(), rest.begin(), rest.end());
-        cudaEventRecord(e2);
-        cudaEventSynchronize(e2);
-        double td = std::chrono::duration<double>(std::chrono::steady_clock::now() - td0).count();
-        float pre_ms, dec_ms;
-        cudaEventElapsedTime(&pre_ms, e0, e1);
-        cudaEventElapsedTime(&dec_ms, e1b, e2);
-        cudaMemGetInfo(&fr, &tot);
+        eng->sync();
+        auto e2 = clk::now();
+        double td = std::chrono::duration<double>(e2 - td0).count();
+        double pre_ms = ms(e0, e1), dec_ms = ms(e1b, e2);
+#ifdef QV_HAVE_CUDA
+        if (!cpu) cudaMemGetInfo(&fr, &tot);
+#endif
         std::printf("{\"prompt_tokens\": %zu, \"prefill_ms\": %.2f, \"prefill_tok_s\": %.2f, \"decode_tokens\": %d, "
                     "\"decode_ms\": %.2f, \"decode_tok_s\": %.2f, \"decode_tok_s_wall\": %.2f, \"vram_used_gib\": %.3f, \"ids\": [",
                     toks.size(), pre_ms, toks.size() / (pre_ms / 1e3), n - 1, dec_ms, (n - 1) / (dec_ms / 1e3),
