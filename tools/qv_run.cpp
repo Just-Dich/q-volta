@@ -30,7 +30,7 @@ static std::vector<int> read_i32(const std::string& p) {
 
 int main(int argc, char** argv) {
     std::string model, golden, out, prompt;
-    bool bench = false, graph = false, use_prefill = false;
+    bool bench = false, graph = false, use_prefill = false, mtp = false;
 #ifdef QV_HAVE_CUDA
     std::string backend = "cuda";
 #else
@@ -50,6 +50,7 @@ int main(int argc, char** argv) {
         else if (a == "--bench") bench = true;
         else if (a == "--prefill") use_prefill = true;
         else if (a == "--prefill-chunk") chunk = std::stoi(next());
+        else if (a == "--mtp") mtp = true;
         else if (a == "--graph") graph = true;
         else if (a == "--n") n = std::stoi(next());
         else if (a == "--max-ctx") max_ctx = std::stoi(next());
@@ -63,6 +64,7 @@ int main(int argc, char** argv) {
     opt.prefill_chunk = chunk > 0 ? chunk : (backend == "cpu" ? 256 : 2048);  // cpu: tokens per batched-prefill chunk
     opt.dump_hidden = !golden.empty();
     opt.threads = threads;
+    opt.mtp = mtp;
     std::unique_ptr<qv::Engine> eng;
     if (backend == "cpu") {
 #ifdef QV_HAVE_CPU
@@ -149,7 +151,17 @@ int main(int argc, char** argv) {
                     toks.size(), pre_ms, toks.size() / (pre_ms / 1e3), n - 1, dec_ms, (n - 1) / (dec_ms / 1e3),
                     (n - 1) / td, (tot - fr) / 1073741824.0);
         for (size_t i = 0; i < gen.size(); ++i) std::printf("%s%d", i ? ", " : "", gen[i]);
-        std::printf("]}\n");
+        std::printf("]");
+        {
+            qv::MtpStats ms_;
+            eng->mtp_stats(ms_);
+            if (mtp)
+                std::printf(", \"mtp\": {\"cycles\": %ld, \"accepted\": %ld, \"accept_rate\": %.4f, \"plain_steps\": %ld, "
+                            "\"draft_ms\": %.1f, \"verify_ms\": %.1f, \"plain_ms\": %.1f, \"prefill_mtp_ms\": %.1f}",
+                            ms_.cycles, ms_.accepted, ms_.cycles ? (double)ms_.accepted / ms_.cycles : 0.0, ms_.plain_steps,
+                            ms_.draft_ms, ms_.verify_ms, ms_.plain_ms, ms_.prefill_mtp_ms);
+        }
+        std::printf("}\n");
         return 0;
     }
     std::fprintf(stderr, "nothing to do (use --golden or --bench)\n");
