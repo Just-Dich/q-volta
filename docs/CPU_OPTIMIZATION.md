@@ -33,3 +33,18 @@ group-64 layout with a 36 B group, not the real Q-Volta bit-plane layout (that k
 - CPU decode target: approach 55 GB/s of weight reads => ~4 tok/s with E0 weights; use 16-32 pinned threads, not 64.
 - GDN state traffic is small: 3 MiB per layer (48x128x128 fp32), 144 MiB per token over 48 layers (288 MiB read+write); measured ~6.4 ms/token at 48 threads (~3% of a 250 ms token). Earlier draft of this doc wrongly said 144 MiB per layer.
 - Using CPU weights in parallel with the GPU is pointless: 55 GB/s is ~6% of V100 HBM and both would fight for host RAM.
+
+## CPU engine v1 (branch merge 2026-11-20, commit 44f5b7f)
+Engine: src/runtime/cpu_engine.cpp on AVX2 GEMV (int8 activations, 32-element groups) + spin thread pool, weights in a 2 MiB-aligned
+huge-page copy (plain mmap: 2.37 tok/s vs ~3.9 with huge pages). Build without CUDA: `cmake -S . -B build-cpu -DQV_CUDA=OFF`.
+| threads | decode tok/s | note |
+|---:|---:|---|
+| 32 | 3.93 (253.7 ms/token) | box load avg 9-17 from other jobs during runs: noisy, probably understated |
+| 24 | 3.78 | |
+| 16 | 3.35 | |
+Time per token at 32 threads (group-64 build): gate/up 40%, in-proj 22%, down 19%, out-proj 10%, lm_head 7%, GDN 1.4%, attention 0.3%
+(4K context, fp32 KV). Limiter = DRAM read bandwidth (~49-58 GB/s, ceiling ~54): fewer bytes per token or several tokens per weight pass are the only levers.
+Golden (tests/check_golden.py, T=64, 32 threads): group-64 activations FAIL (top1 vs qsim 0.9365, KL 7.4e-3); 32-element groups PASS
+(top1 0.9524 = 60/63 vs gate 0.95, KL 3.6e-3, worst layer rel 0.078, final logits rel 0.030). Margin is thin (one flipped token fails);
+KL is ~6x the GPU path (5.7e-4), mostly int8 activation noise (fp32-activation diagnostic gives <5e-4 per layer).
+Not done: batched prefill GEMM (prefill = step loop), NEON/ARM, int4 KV for long context, comparison with llama.cpp on this machine.
