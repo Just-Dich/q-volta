@@ -266,7 +266,7 @@ def test_chat_reasoning_formats(srv):
     r = srv.req("POST", "/v1/chat/completions", dict(base, chat_template_kwargs={"enable_thinking": False}))[2]["choices"][0]["message"]
     assert "reasoning_content" not in r and r["content"].startswith("alpha")
     st, _, r = srv.req("POST", "/v1/chat/completions", dict(base, reasoning_format="bogus"))
-    assert st == 400
+    assert st == 500 and r["error"]["type"] == "server_error"   # llama-server answers 500 for an unknown format
 
 
 def test_chat_stream_framing(srv):

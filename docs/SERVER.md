@@ -1,98 +1,38 @@
-# qv_server — OpenAI-compatible HTTP server
+# qv_server: llama-server compatible HTTP server
 
-`qv_server` serves a Q-Volta model over HTTP/1.1 with the OpenAI `chat/completions` and `completions` schemas
-(non-streaming and SSE streaming). It is plain C++20 on POSIX sockets: no third-party dependencies
-(JSON, tokenizer, chat template and sampling are in `src/core/json_doc.h`, `src/tokenizer/`, `src/sampling/`).
-One generation runs at a time (the engine is stateful); other requests wait in a bounded queue.
+`qv_server` serves a Q-Volta model over HTTP/1.1 with the **same API, flags and environment variables as llama.cpp's `llama-server`**
+(reference commit 9d6f04f): native `/completion`, `/infill`, OpenAI `/v1/chat/completions` and `/v1/completions`, `/tokenize`, `/detokenize`,
+`/apply-template`, `/props`, `/slots`, `/metrics`, `/health` (503 while loading), `/v1/models`, SSE streaming. Every endpoint and flag with its
+status (implemented / partial / n/a / unsupported) is in [SERVER_COMPAT.md](SERVER_COMPAT.md). Plain C++20 on POSIX sockets, no third-party dependencies.
+
+Not yet available (stated, not hidden): tool calling, custom Jinja templates and grammar / JSON-schema constraints wait for the `src/jinja` / `src/grammar`
+libraries (branch p15/jinja); embeddings, vision, runtime LoRA are unsupported. Generation is serialized: `--parallel N` reports N logical slots, requests queue FIFO.
 
 ## Build
 
-CPU only (no CUDA toolkit needed):
-
     cmake -S . -B build-cpu -G Ninja -DQV_CUDA=OFF && ninja -C build-cpu -j8 qv_server qv_tok
-
-With the CUDA engine (`--backend cuda` selectable; `--backend auto` picks CUDA only if a device exists):
-
-    cmake -S . -B build -G Ninja -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc && ninja -C build qv_server qv_tok
-
-Both configurations were compiled. Only the CPU backend was run for this work (CUDA_VISIBLE_DEVICES empty; in the
-CUDA build, `--backend auto` with no visible device fell back to `cpu`). The CUDA path in the server is untested at runtime.
+    cmake -S . -B build -G Ninja -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc && ninja -C build qv_server qv_tok     # with the CUDA engine
 
 ## Run
 
-    CUDA_VISIBLE_DEVICES= ./build-cpu/qv_server --model /workspace/q-volta-models/qv/qwen38-27b-e0 \
-        --backend cpu --threads 32 --max-ctx 4096 --port 8080
+    ./build-cpu/qv_server -m /workspace/q-volta-models/qv/qwen38-27b-e0 -t 32 -c 4096 --port 8080 --metrics -a qwen3.8-27b
 
-| flag | meaning (default) |
-|---|---|
-| `--model PREFIX` | model prefix (`PREFIX.qv.json/.qv.bin`), required; `qwen38-27b-pi-e0` works the same way |
-| `--backend cuda\|cpu\|auto` | `auto`: cuda if built and a device exists, else cpu |
-| `--threads N` | CPU worker threads (min(32, cores)) |
-| `--max-ctx N` | context window / KV size (4096) |
-| `--prefill-chunk N` | tokens per prefill call; also the granularity at which a client disconnect is noticed during prefill (cpu 256, cuda 2048) |
-| `--host H --port P` | `127.0.0.1:8080` |
-| `--api-key KEY` | require `Authorization: Bearer KEY` on `/v1/*` (`/health` stays open) |
-| `--model-name NAME` | id reported in `/v1/models` and responses (`qwen3.8-27b`); any `model` in requests is accepted |
-| `--tokenizer PATH` | tokenizer.json (default: `PREFIX.tokenizer.json`, else `<prefix dir>/../Qwen3.8-27B/tokenizer.json`) |
-| `--http-threads N` | connection worker threads (16) |
-| `--max-queue N` | requests allowed to wait behind the running one; more get `503` (8) |
-| `--default-max-tokens N` | used when the request has no max_tokens (1024) |
-| `--temperature/--top-p/--top-k` | defaults when a request omits them (1.0 / 0.95 / 20, from the model's generation_config.json) |
-| `--reasoning-format none\|separate` | `none` (default): raw model text, thinking text and `</think>` stay in `content`. `separate`: text before `</think>` goes to `reasoning_content`, the rest to `content` |
-| `--quiet` | no per-request log line |
+Any llama-server flag spelling works (`-c`, `-ngl`, `-np`, `-ub`, `--temp`, `--top-k`, `--api-key`, `--chat-template-kwargs`, ...) and so do the `LLAMA_ARG_*` variables
+(command line wins). Flags with no meaning for Q-Volta print a warning and are ignored; an unknown flag is an error (exit 1), as in llama-server.
+Defaults are llama-server's: port **9931**, temperature 0.8, top_k 40, top_p 0.95, min_p 0.05, 4 slots. Use `--temp/--top-k/--top-p` for the Qwen-recommended values.
 
-## Endpoints
+Q-Volta flags: `--backend cuda|cpu|auto|mock` (`-ngl 0` also selects CPU), `--kv fp32|fp16|int4`, `--mtp` / `--mtp-depth N` (exact greedy MTP lookahead for temperature-0 requests),
+`--prefill-chunk N`, `--tokenizer PATH`, `--max-queue N` (503 beyond N waiting; default unbounded like llama), legacy `--max-ctx`, `--model-name`, `--http-threads`, `--quiet`.
+The `mock` backend (scripted tokens, `--mock-text`) is for tests and needs no weights.
 
-* `GET /health` -> `{"status":"ok"}`
-* `GET /v1/models`, `GET /v1/models/{id}`
-* `POST /v1/chat/completions`, `POST /v1/completions` (`stream` true/false)
-* `OPTIONS *` -> 204 with CORS headers (`Access-Control-Allow-Origin: *`)
-* Errors use `{"error":{"message","type","param","code"}}`: 400 (bad JSON / params), 401 (bad key), 404 (route), 405,
-  413 (prompt >= max-ctx, code `context_length_exceeded`), 503 (queue full), 500.
+Thinking: the Qwen3.8 template opens `<think>`; with `--reasoning-format auto` (= deepseek) the thinking text is returned as `reasoning_content`.
+Disable with `"chat_template_kwargs":{"enable_thinking":false}` or `--reasoning off`.
 
-Debug headers on non-stream and stream responses: `X-QV-Prompt-Cached-Tokens` (prompt tokens reused from the engine
-state), `X-QV-Prompt-Tokens`. `usage.prompt_tokens_details.cached_tokens` carries the same number.
+## Slots and queueing
 
-### Supported request parameters
-
-`model` (ignored), `messages` / `prompt` (string, list of strings -> first, token-id list, list of token-id lists -> first),
-`max_tokens` / `max_completion_tokens` (clamped to the remaining context), `temperature` (0 = greedy, <= 2), `top_p`, `top_k`,
-`min_p`, `seed` (deterministic: same seed + same request -> same text), `stop` (string or up to 4 strings),
-`presence_penalty`, `frequency_penalty` (OpenAI semantics, over generated tokens), `repetition_penalty` (extension; prompt + generated),
-`stream`, `stream_options.include_usage`, `n` (only 1), `logprobs`/`top_logprobs`, `chat_template_kwargs`
-(`enable_thinking`, `reasoning_effort` xhigh|medium|low, `preserve_thinking`; the same keys are also accepted at top level;
-OpenAI `reasoning_effort` high -> xhigh, minimal -> low, none -> thinking off).
-
-Behaviour notes:
-
-* **Thinking mode**: the Qwen3.8 template thinks by default (generation prompt ends with `<think>\n`, and a reasoning-effort
-  system line is injected). Pass `"chat_template_kwargs":{"enable_thinking":false}` for direct answers. Output with thinking
-  includes the reasoning text and `</think>` in `content` unless `--reasoning-format separate`.
-* **Finish reasons**: `stop` (an EOS token, `<|im_end|>` or `<|endoftext|>`, or a stop string) / `length`. Usage
-  `completion_tokens` counts every sampled token including the terminating EOS token.
-* **Defaults**: when a request omits sampling parameters the server uses temperature 1.0, top_p 0.95, top_k 20.
-  Greedy requests without penalties use the engine's `argmax()` fast path; everything else copies host logits.
-* **logprobs**: chat `logprobs:true` + `top_logprobs` (0-20) and completions `logprobs: N` return the log-softmax of the raw
-  (pre-penalty, temperature-1) logits for each generated token with the top-N alternatives. The EOS token is not listed.
-  Costs a full-vocabulary pass per token on the host.
-* **Prefix reuse**: the model is recurrent (GatedDeltaNet), so the context cannot be rewound. The server keeps the token
-  sequence that is inside the engine; if a new prompt starts with exactly that sequence only the new suffix is prefilled,
-  otherwise the engine is reset and the whole prompt is prefilled. A chat that continues the previous turn reuses the cache
-  when the re-rendered history tokenizes to the same ids as what was generated (true for the tested non-thinking turn). In thinking mode the
-  template re-renders earlier assistant turns as `<think>\n\n</think>\n\n...` (or with the client-sent `reasoning_content`),
-  which differs from what was generated, so those continuations are prefilled in full.
-* **Disconnects**: the socket is polled between tokens and between prefill chunks; on a closed peer the generation stops, the
-  engine keeps exactly the tokens it has processed, and the next request proceeds (tested).
-* Prompt tokenization parses special-token text (`<|im_end|>` etc.) inside message content as special tokens, like HF does.
-
-### NOT supported (rejected with 400 or ignored as noted)
-
-* tools / function calling / `tool_choice` / `functions` (400); assistant `tool_calls` in history (400). `tool`-role messages are rendered.
-* `n > 1` and `best_of > 1` (400), `echo`, `suffix`, `logit_bias`, non-text `response_format` (400).
-* Vision / audio / video content parts (400); text parts only.
-* `logprobs` beyond what is listed above (no per-token `bytes` merging across multi-byte characters, no prompt logprobs).
-* Chunked request bodies (411), HTTPS, multiple concurrent generations (requests are serialized), batching.
-* Case-insensitive contractions match ASCII only (`'S`, `'RE`); the Unicode case-fold forms U+017F / U+212A are not matched.
+`--parallel N` creates N logical slots (default 4). The engine holds one sequence, so one request decodes at a time; others wait FIFO (`/slots` shows one `is_processing`, `/metrics` `requests_deferred`).
+Prefix reuse (`cache_prompt`): if the new prompt starts with the tokens already in the engine only the suffix is evaluated (`timings.cache_n`, `usage.prompt_tokens_details.cached_tokens`, `tokens_cached`).
+The recurrent state cannot be rewound, so an identical repeated prompt is re-evaluated. Context end stops generation (`stop_type: limit`, `truncated: true`). True multi-slot batched decoding is a later engine-level feature.
 
 ## Tokenizer and chat template fidelity
 
@@ -114,10 +54,11 @@ Behaviour notes:
 
     python3 -I tests/test_tokenizer.py build-cpu/qv_tok
     python3 -I tests/test_chat_template.py build-cpu/qv_tok
-    python3 -I tests/test_server.py --server build-cpu/qv_server     # starts servers on free ports; ~60 s on CPU
+    python3 -m pytest tests/test_server_compat.py -q                 # mock engine; + structural diff vs llama-server if /tmp/llama_srv_build is present
+    python3 -I tests/test_server.py --server build-cpu/qv_server     # real model on CPU, ~60 s (hold flock /tmp/qv_bench.lock)
 
-`test_server.py` result: **45/45 checks passed** (CPU backend, e0 model). The `openai` python package is not installed here, so the
-optional SDK checks were skipped.
+`tests/test_server_compat.py` runs a stand-alone suite (endpoint shapes, SSE framing, errors, queue/slots, CLI/env) and sends the same requests to llama-server (Qwen2.5-0.5B GGUF) and to qv_server
+`--backend mock`, comparing status codes, content types, header names, JSON key sets/types and SSE event shapes (documented exceptions whitelisted in the file). Results are in SERVER_COMPAT.md / PROGRESS.md.
 
 ## curl examples
 
