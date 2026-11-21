@@ -1,6 +1,7 @@
 // Token sampling on host logits: OpenAI-style penalties, temperature, top-k, top-p, min-p, deterministic seeded RNG.
 #pragma once
 #include <cstdint>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -29,8 +30,18 @@ struct TokenLogprob {
     std::vector<std::pair<int, float>> top;             // best alternatives, descending
 };
 
+// Hook that constrains sampling (grammar / JSON-schema decoding, see src/grammar/sampler_hook.h).
+struct LogitMask {
+    virtual ~LogitMask() = default;
+    virtual void apply(float* logits, size_t n) = 0;  // set disallowed logits to -inf
+    virtual void accept(int tok) = 0;                 // the chosen token was committed
+};
+
 class Sampler {
    public:
+    // The mask runs after penalties and before temperature/top-k/top-p; greedy decoding on host logits honours it too.
+    void set_mask(std::shared_ptr<LogitMask> m) { mask_ = std::move(m); }
+    bool has_mask() const { return mask_ != nullptr; }
     Sampler(const SamplingParams& p, const std::vector<int>& prompt_tokens);
     // logits are modified in place (penalties/temperature applied). Does not record the token; call accept().
     int sample(std::vector<float>& logits);
@@ -40,6 +51,7 @@ class Sampler {
 
    private:
     SamplingParams p_;
+    std::shared_ptr<LogitMask> mask_;
     std::unordered_map<int, int> gen_counts_;
     std::unordered_map<int, char> seen_;  // prompt + generated (repetition penalty)
     uint64_t s_[4];

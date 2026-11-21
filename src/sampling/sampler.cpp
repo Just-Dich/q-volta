@@ -33,6 +33,7 @@ uint64_t Sampler::next() {  // xoshiro256**
 double Sampler::uniform() { return (next() >> 11) * (1.0 / 9007199254740992.0); }
 
 void Sampler::accept(int tok) {
+    if (mask_) mask_->accept(tok);
     if (p_.presence_penalty != 0 || p_.frequency_penalty != 0) ++gen_counts_[tok];
     if (p_.repetition_penalty != 1.0f) seen_[tok] = 1;
 }
@@ -43,6 +44,7 @@ int Sampler::sample(std::vector<float>& lg) {
         for (auto& [t, c] : gen_counts_) lg[t] -= p_.frequency_penalty * c + p_.presence_penalty;
     if (p_.repetition_penalty != 1.0f)
         for (auto& [t, _] : seen_) lg[t] = lg[t] > 0 ? lg[t] / p_.repetition_penalty : lg[t] * p_.repetition_penalty;
+    if (mask_) mask_->apply(lg.data(), lg.size());
     if (p_.greedy()) return (int)(std::max_element(lg.begin(), lg.end()) - lg.begin());
 
     const float inv_t = 1.0f / p_.temperature;

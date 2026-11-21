@@ -120,6 +120,7 @@ target_link_libraries(qv_tok PRIVATE qv_text)
 
 # ---- standalone libraries: Jinja2 interpreter + chat helpers (src/jinja), GBNF grammar + JSON schema (src/grammar)
 add_subdirectory(src/jinja)
+add_subdirectory(src/grammar)
 
 if(QV_CPU OR QV_CUDA)
   add_executable(qv_server src/server/server_main.cpp src/server/http.cpp)
