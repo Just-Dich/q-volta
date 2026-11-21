@@ -39,6 +39,28 @@ __device__ __forceinline__ float2 load_sm(const QMat& W, size_t row, size_t G, s
     return make_float2(sc, -(sc * z));
 }
 
+// Compile-time specialization of load_sm for the hot GEMV kernels: MODE bit0 = group 128, bit1 = meta8.
+// MODE 0 (group 64, fp16 (scale,min) pairs) compiles to exactly the pre-generalization code.
+constexpr int qmode_of(bool g128, bool meta8) { return (g128 ? 1 : 0) | (meta8 ? 2 : 0); }
+inline int qmode(const QMat& W) { return qmode_of(W.gshift == 7, W.sm8 != nullptr); }
+// rsc = per-row meta8 scale factor (rs / 255, computed once per row outside the chunk loop: bit-identical to load_sm)
+template <int MODE>
+__device__ __forceinline__ float row_rsc(const QMat& W, size_t row) {
+    if constexpr ((MODE & 2) == 0) return 0.f;
+    else return __half2float(W.rs[row]) / 255.0f;
+}
+template <int MODE>
+__device__ __forceinline__ float2 load_sm_t(const QMat& W, size_t row, size_t G, size_t g, float rsc) {
+    if constexpr ((MODE & 2) == 0) {
+        return __half22float2(W.sm[row * G + g]);
+    } else {
+        const unsigned v = W.sm8[row * G + g];
+        const float sc = (float)(v & 255u) * rsc;
+        const float z = (float)(v >> 8) * W.zstep + W.zlo;
+        return make_float2(sc, -(sc * z));
+    }
+}
+
 struct DMat16 {  // dense fp16 row-major [N][K]
     const __half* w = nullptr;
     int N = 0, K = 0;

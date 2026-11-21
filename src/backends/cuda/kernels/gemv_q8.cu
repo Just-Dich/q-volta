@@ -36,15 +36,19 @@ __device__ __forceinline__ int dp4a_us(uint32_t a, int b, int c) {
     return d;
 }
 
-template <int BITS, int R, int WARPS>
+template <int BITS, int R, int WARPS, int MODE>
 __global__ void __launch_bounds__(WARPS * 32) gemv_q8_kernel(QMat W, Q8Vec xv, float* __restrict__ y,
                                                              const float* __restrict__ residual) {
     __shared__ float red[WARPS][R];
     constexpr int ZP = 1 << (BITS - 1);
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row0 = blockIdx.x * R;
-    const int C = W.K >> 5, G = W.K >> W.gshift, GS = W.gshift - 5;
+    constexpr int GS = 1 + (MODE & 1);  // log2(group/32)
+    const int C = W.K >> 5, G = W.K >> (5 + GS);
     float acc[R];
+    float rsc[R];  // meta8 per-row scale factor, hoisted out of the chunk loop (unused for MODE 0/1)
+#pragma unroll
+    for (int r = 0; r < R; ++r) rsc[r] = row_rsc<MODE>(W, min(row0 + r, W.N - 1));
 #pragma unroll
     for (int r = 0; r < R; ++r) acc[r] = 0.f;
 
@@ -67,7 +71,7 @@ __global__ void __launch_bounds__(WARPS * 32) gemv_q8_kernel(QMat W, Q8Vec xv, f
                 for (int b = 0; b < 8; ++b) d = dp4a_us(qword<BITS>(w, b), xw[b], d);
                 // centre q on zp = 2^(BITS-1): the activation-quantization error then multiplies (q - zp), not q
                 d -= ZP * qs;
-                const float2 sm = load_sm(W, row, G, c >> GS);
+                const float2 sm = load_sm_t<MODE>(W, row, G, c >> GS, rsc[r]);
                 acc[r] = fmaf(sm.x * dx, (float)d, fmaf(fmaf(sm.x, (float)ZP, sm.y), xs, acc[r]));
             }
         }
@@ -89,7 +93,12 @@ __global__ void __launch_bounds__(WARPS * 32) gemv_q8_kernel(QMat W, Q8Vec xv, f
 
 template <int BITS, int R, int WARPS>
 static void launch_q8(const QMat& W, const Q8Vec& x, float* y, const float* res, cudaStream_t s) {
-    gemv_q8_kernel<BITS, R, WARPS><<<(W.N + R - 1) / R, WARPS * 32, 0, s>>>(W, x, y, res);
+    switch (qmode(W)) {
+        case 0: gemv_q8_kernel<BITS, R, WARPS, 0><<<(W.N + R - 1) / R, WARPS * 32, 0, s>>>(W, x, y, res); break;
+        case 1: gemv_q8_kernel<BITS, R, WARPS, 1><<<(W.N + R - 1) / R, WARPS * 32, 0, s>>>(W, x, y, res); break;
+        case 2: gemv_q8_kernel<BITS, R, WARPS, 2><<<(W.N + R - 1) / R, WARPS * 32, 0, s>>>(W, x, y, res); break;
+        default: gemv_q8_kernel<BITS, R, WARPS, 3><<<(W.N + R - 1) / R, WARPS * 32, 0, s>>>(W, x, y, res); break;
+    }
 }
 
 template <int BITS>
@@ -132,14 +141,18 @@ void gemv_q8(const QMat& W, const Q8Vec& x, float* y, const float* residual, cud
 // ---------------------------------------------------------------------------------------------------------------
 // Multi-token GEMV (MTP verification / short prefill): NT activation vectors share every weight load.
 // x: NT Q8 vectors, token t at q + t*K/4 ints, d/sum/qsum + t*K/32; y/residual: [NT][N].
-template <int BITS, int R, int WARPS, int NT>
+template <int BITS, int R, int WARPS, int NT, int MODE>
 __global__ void __launch_bounds__(WARPS * 32) gemv_q8_multi_kernel(QMat W, Q8Vec xv, float* __restrict__ y,
                                                                    const float* __restrict__ residual) {
     __shared__ float red[WARPS][NT][R];
     constexpr int ZP = 1 << (BITS - 1);
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row0 = blockIdx.x * R;
-    const int C = W.K >> 5, G = W.K >> W.gshift, GS = W.gshift - 5;
+    constexpr int GS = 1 + (MODE & 1);  // log2(group/32)
+    const int C = W.K >> 5, G = W.K >> (5 + GS);
+    float rsc[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) rsc[r] = row_rsc<MODE>(W, min(row0 + r, W.N - 1));
     float acc[NT][R];
 #pragma unroll
     for (int t = 0; t < NT; ++t)
@@ -158,7 +171,7 @@ __global__ void __launch_bounds__(WARPS * 32) gemv_q8_multi_kernel(QMat W, Q8Vec
             for (int b = 0; b < BITS; ++b) w[b] = __ldg(wp + b);
 #pragma unroll
             for (int b = 0; b < 8; ++b) qw[r][b] = qword<BITS>(w, b);
-            sm[r] = load_sm(W, row, G, c >> GS);
+            sm[r] = load_sm_t<MODE>(W, row, G, c >> GS, rsc[r]);
         }
 #pragma unroll
         for (int t = 0; t < NT; ++t) {
@@ -204,9 +217,15 @@ static void multi_launch(const QMat& W, const Q8Vec& x, float* y, const float* r
     // change the arithmetic; WARPS must equal the warps of the 1-token kernel for this shape (accumulation order).
     static int Rsel = [] { const char* e = std::getenv("QV_MULTI_R"); return e ? std::atoi(e) : 0; }();
     int R = Rsel ? Rsel : (NT <= 2 ? 2 : 4);
-    if (R == 1) gemv_q8_multi_kernel<BITS, 1, WARPS, NT><<<W.N, WARPS * 32, 0, s>>>(W, x, y, res);
-    else if (R == 2) gemv_q8_multi_kernel<BITS, 2, WARPS, NT><<<(W.N + 1) / 2, WARPS * 32, 0, s>>>(W, x, y, res);
-    else gemv_q8_multi_kernel<BITS, 4, WARPS, NT><<<(W.N + 3) / 4, WARPS * 32, 0, s>>>(W, x, y, res);
+    const int m = qmode(W);
+#define QV_ML(R_, MODE_) gemv_q8_multi_kernel<BITS, R_, WARPS, NT, MODE_><<<(W.N + R_ - 1) / R_, WARPS * 32, 0, s>>>(W, x, y, res)
+#define QV_MR(R_) \
+    switch (m) { case 0: QV_ML(R_, 0); break; case 1: QV_ML(R_, 1); break; case 2: QV_ML(R_, 2); break; default: QV_ML(R_, 3); break; }
+    if (R == 1) { QV_MR(1) }
+    else if (R == 2) { QV_MR(2) }
+    else { QV_MR(4) }
+#undef QV_MR
+#undef QV_ML
 }
 
 template <int BITS, int NT>
