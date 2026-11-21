@@ -27,6 +27,7 @@ History: step-by-step 51 -> batched 680 -> aligned slabs 1014 -> chunk 2048 1205
 
 ## Quality (the co-metric; speed wins at worse quality are not wins)
 - wikitext-2 test, 4088 tokens: BF16 ppl 8.468 -> E0 9.508 (+12%), KL(ref||q) 0.122, top-1 agreement 84.6%.
+- p10/quant (docs/QUANTIZATION.md): GPTQ g64 +6.1% / KL 0.080 (12.63 GiB), GPTQ g128 +7.3% (11.83), e1 all-3-bit g128 meta8 +9.6% / KL 0.112 at 10.44 GiB.
 - NInfer README (different protocol, 2048-token windows): ppl 7.071 vs BF16 7.05 (+0.3%). Only the ratio is comparable: we are far behind on quality.
 - KL is heavy-tailed (median 0): a few confident flips on structural tokens (JSON keys) dominate the mean. Report median/p99/flip-rate next.
 - Engine correctness: golden vs simulated-quant reference PASS on real weights. Step path (int8 activations): layer rel err 2.0e-2, KL 5.7e-4. Prefill path (fp16 activations): layer rel err 6.3e-4, KL 7.3e-5.
