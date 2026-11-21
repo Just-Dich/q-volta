@@ -1,0 +1,8 @@
+build*/
+.git/
+logs/
+**/__pycache__/
+*.qv
+*.qv.bin
+*.safetensors
+benchmarks/results/tier/

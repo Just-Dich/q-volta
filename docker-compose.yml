@@ -1,0 +1,28 @@
+# GPU server:  MODELS=./models docker compose up --build          (needs the NVIDIA container toolkit)
+# CPU server:  MODELS=./models docker compose --profile cpu up --build
+# ./models must contain model.qv (or edit the command) and tokenizer.json, e.g. from
+#   hf download q-project/Qwen3.8-27B-QVolta qwen38-27b-e1.qv tokenizer.json --local-dir ./models && mv ./models/qwen38-27b-e1.qv ./models/model.qv
+services:
+  q-volta:
+    build:
+      context: .
+      target: cuda
+    image: q-volta:latest
+    ports: ["8080:8080"]
+    volumes: ["${MODELS:-./models}:/models:ro"]
+    command: ["--model", "/models/model.qv", "--tokenizer", "/models/tokenizer.json", "--backend", "cuda", "--kv", "int4", "--max-ctx", "131072"]
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, count: 1, capabilities: [gpu]}]
+    restart: unless-stopped
+  q-volta-cpu:
+    profiles: ["cpu"]
+    build:
+      context: .
+      target: cpu
+    image: q-volta:cpu
+    ports: ["8081:8080"]
+    volumes: ["${MODELS:-./models}:/models:ro"]
+    command: ["--model", "/models/model.qv", "--tokenizer", "/models/tokenizer.json", "--backend", "cpu", "--threads", "32"]
+    restart: unless-stopped

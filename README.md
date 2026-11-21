@@ -66,6 +66,9 @@ CPU decode is bound by DRAM bandwidth (about 54 GB/s here, 13.6 GB read per toke
 ## Roadmap
 Better quantization (smaller file at equal quality), runtime LoRA inside the model file, 256K context (int4 KV), adaptive MTP depth and a restricted draft vocabulary, server MTP, CPU prefill (fp32 scale overhead), ARM/NEON.
 
+## Docker
+A `Dockerfile` (GPU and CPU-only targets) and `docker-compose.yml` are provided, see [docs/DOCKER.md](docs/DOCKER.md) (written without a container runtime on hand: not yet built by the authors).
+
 ## Build and test
 ```
 cmake -S . -B build -G Ninja -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc && ninja -C build
