@@ -48,3 +48,27 @@ passkey 32K/128K/256K passed. pi LoRA and ARM Stage B not covered. docs/INKLING_
 - qv_server rewritten to be 1:1 with llama-server (llama.cpp 9d6f04f): all llama flag spellings + LLAMA_ARG_* env (tools/gen_llama_flags.py -> src/server/llama_flags.inc), endpoints /completion /infill /v1/completions /v1/chat/completions /tokenize /detokenize /apply-template /props /slots (+save/restore/erase) /metrics /models /health (503 while loading), llama error JSON, CORS, SSE framing, llama sampler chain (mt19937 draw), n_probs/logprobs, n>1, reasoning_content, timings, cache_n. Matrix: docs/SERVER_COMPAT.md.
 - Tests: tests/test_server_compat.py = stand-alone checks (mock engine) + structural-diff cases vs the real llama-server (Qwen2.5-0.5B GGUF): status, content-type, header names, JSON key/type shape, SSE event shapes; documented exceptions whitelisted. tests/test_server.py (real e0 model, CPU, 32 threads): 47/47, stream 3.0 tok/s at load 11.7 (no regression vs ~2.7-3.9).
 - Open: tools/grammar/custom Jinja templates wait for p15/jinja (src/jinja, src/grammar not on the main branch yet); one decoding sequence (queued slots); embeddings/vision/runtime LoRA unsupported; DRY approximate; CUDA server path not run.
+
+## p15/jinja (2026-11-21) - Jinja2 interpreter + chat helpers (milestone A)
+src/jinja: standalone Jinja2-compatible engine + chat rendering + tool-call / reasoning output parser (docs/JINJA.md). Differential test against
+Python jinja2 3.1.6 (oracle env = HF settings): 82/82 templates (80 llama.cpp `models/templates` + Qwen3.8-27B + Inkling-2-Mini) byte-exact on 33
+generated conversations each (2345 exact renders + 361 cases where both engines raise, 130 of them `raise_exception` with identical message), 0 mismatches;
+94/94 feature snippets match; ctest `jinja` 90 checks (incl. golden renders of 11 templates and cross-check against the hand-written
+src/tokenizer/chat_template.cpp). Not done: include/import/extends, autoescape, Python Markup semantics (deliberately follows llama.cpp).
+
+## p15/jinja (2026-11-21) - GBNF grammar + JSON schema + tool-call grammars (milestone B)
+src/grammar (docs/GRAMMAR.md): GBNF parser, stack-set matcher with interned states, trie masks with per-state cache, JSON-schema -> GBNF, json_object grammar,
+tool-call grammars (Hermes/QwenXml/Inkling/Mistral/Generic, forced/parallel/lazy-trigger), `qv::LogitMask` hook in the sampler. ctest `grammar`: 807 checks pass,
+including mask == brute-force per-token acceptance on the real Qwen3.8 tokenizer (248077 tokens; at sampled steps of 5 grammars, all allowed tokens + 1/37 of the rest) and on a small UTF-8 vocab.
+Mask latency, single thread, Qwen3.8 vocab (first-visit = state mask computed, warm = cached lookup; mask_logits = applying a cached mask to 248K logits):
+```
+[qwen] vocab=248077 trie_nodes=591809 max_piece=128 eog=2 build=169.3 ms
+[qwen] json_object     steps=41 cold avg=1.635 ms max=10.893 ms | warm lookup avg=0.000 ms | mask_logits avg=0.050 ms | states=448 masks=25
+[qwen] schema_obj      steps=25 cold avg=1.260 ms max=10.617 ms | warm lookup avg=0.000 ms | mask_logits avg=0.052 ms | states=205 masks=20
+[qwen] enum+int_range  steps=14 cold avg=0.059 ms max=0.181 ms | warm lookup avg=0.000 ms | mask_logits avg=0.072 ms | states=120 masks=15
+[qwen] qwen_tool       steps=45 cold avg=0.969 ms max=10.940 ms | warm lookup avg=0.000 ms | mask_logits avg=0.060 ms | states=127 masks=43
+[qwen] utf8_class      steps=3 cold avg=7.340 ms max=13.444 ms | warm lookup avg=0.000 ms | mask_logits avg=0.255 ms | states=4 masks=3
+```
+First-visit masks cost up to ~11 ms (states inside a string where most of the vocab is allowed), ~1-1.6 ms averaged over short 25-45 token samples; cached lookups are ~0.001 ms and
+mask_logits 0.05-0.07 ms (0.26 ms with only 3 allowed CJK-range tokens path). Long generations amortise well below 1 ms/token; short ones with many distinct states do not (not measured on a long run).
+Not supported: `<[id]>` token elements; non-integer minimum/maximum are not enforced.

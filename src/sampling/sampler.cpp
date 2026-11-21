@@ -14,6 +14,7 @@ Sampler::Sampler(const SamplingParams& p, const std::vector<int>& prompt) : p_(p
 }
 
 void Sampler::accept(int tok) {
+<<<<<<< HEAD
     hist_.push_back(tok);
     if (constraint_) constraint_->accept(tok);
 }
@@ -223,17 +224,53 @@ int Sampler::mirostat_v1() {
 float Sampler::last_prob(int tok) const {
     for (auto& [id, p] : last_cands_) if (id == tok) return p;
     return 0.0f;
+=======
+    if (mask_) mask_->accept(tok);
+    if (p_.presence_penalty != 0 || p_.frequency_penalty != 0) ++gen_counts_[tok];
+    if (p_.repetition_penalty != 1.0f) seen_[tok] = 1;
+>>>>>>> p15/jinja
 }
 
 int Sampler::sample(std::vector<float>& lg) {
     for (auto& [t, b] : p_.logit_bias) if (t >= 0 && t < (int)lg.size()) lg[t] += b;
     if (constraint_) constraint_->apply(lg);
     const int V = (int)lg.size();
+<<<<<<< HEAD
     auto finish = [&](int id) {
         last_cands_.clear();
         if (want_post_) {
             softmax();
             for (auto& c : cur_) last_cands_.emplace_back(c.id, c.p);
+=======
+    if (p_.presence_penalty != 0 || p_.frequency_penalty != 0)
+        for (auto& [t, c] : gen_counts_) lg[t] -= p_.frequency_penalty * c + p_.presence_penalty;
+    if (p_.repetition_penalty != 1.0f)
+        for (auto& [t, _] : seen_) lg[t] = lg[t] > 0 ? lg[t] / p_.repetition_penalty : lg[t] * p_.repetition_penalty;
+    if (mask_) mask_->apply(lg.data(), lg.size());
+    if (p_.greedy()) return (int)(std::max_element(lg.begin(), lg.end()) - lg.begin());
+
+    const float inv_t = 1.0f / p_.temperature;
+    int k = (p_.top_k > 0 && p_.top_k < V) ? p_.top_k : 0;
+    const bool need_sorted = k > 0 || p_.top_p < 1.0f || p_.min_p > 0.0f;
+    idx_.resize(V);
+    std::iota(idx_.begin(), idx_.end(), 0);
+    int n = V;
+    if (need_sorted) {
+        auto gt = [&](int a, int b) { return lg[a] > lg[b] || (lg[a] == lg[b] && a < b); };
+        if (k > 0) { std::nth_element(idx_.begin(), idx_.begin() + k, idx_.end(), gt); n = k; std::sort(idx_.begin(), idx_.begin() + n, gt); }
+        else std::sort(idx_.begin(), idx_.end(), gt);
+    }
+    prob_.resize(n);
+    float mx = -INFINITY;
+    for (int i = 0; i < n; ++i) mx = std::max(mx, lg[idx_[i]]);
+    double sum = 0;
+    for (int i = 0; i < n; ++i) { prob_[i] = std::exp((lg[idx_[i]] - mx) * inv_t); sum += prob_[i]; }
+    for (int i = 0; i < n; ++i) prob_[i] = (float)(prob_[i] / sum);
+    if (need_sorted) {
+        if (p_.min_p > 0.0f) {
+            float thr = p_.min_p * prob_[0];
+            while (n > 1 && prob_[n - 1] < thr) --n;
+>>>>>>> p15/jinja
         }
         return id;
     };

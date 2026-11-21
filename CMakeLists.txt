@@ -123,6 +123,10 @@ target_include_directories(qv_text PUBLIC include src)
 add_executable(qv_tok tools/qv_tok.cpp)
 target_link_libraries(qv_tok PRIVATE qv_text)
 
+# ---- standalone libraries: Jinja2 interpreter + chat helpers (src/jinja), GBNF grammar + JSON schema (src/grammar)
+add_subdirectory(src/jinja)
+add_subdirectory(src/grammar)
+
 if(QV_CPU OR QV_CUDA)
   execute_process(COMMAND git -C ${CMAKE_SOURCE_DIR} rev-parse --short HEAD OUTPUT_VARIABLE QV_GIT_REV OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
   if(NOT QV_GIT_REV)
