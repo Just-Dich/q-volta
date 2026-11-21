@@ -1,0 +1,18 @@
+{
+ "what": "next-token NLL (nats/token) of 511 README tokens (plain text, no chat template) under tools/inkling_ref.py with single-op ablations",
+ "ntok": 511,
+ "nll": {
+  "ref": 1.7561025619506836,
+  "conv_flip": 6.56662654876709,
+  "swap_gu": 3.4213755130767822,
+  "no_gate": 12.824610710144043,
+  "no_sink": 2.3928585052490234,
+  "no_rel": 5.5009307861328125,
+  "scale128": 2.8867404460906982,
+  "no_reset": 8.082629203796387,
+  "no_msgs": 2.3573529720306396,
+  "one_pass": 2.3573529720306396,
+  "no_dyn": 1.7796802520751953
+ },
+ "date": "2026-11-21"
+}

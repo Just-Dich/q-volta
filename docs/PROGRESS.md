@@ -21,3 +21,12 @@ Next: tensor-core attention + dequant/GEMM overlap (prefill at long prompts), ru
 
 ## p10/quant (2026-11-21)
 GPTQ + clip + group128 + meta8 quantizer and kernels; profile e1 10.44 GiB +9.6% ppl (KL 0.112), 55.4 tok/s decode; <=10.4 GiB at +5% not reached. Details and falsified hypotheses: docs/QUANTIZATION.md; data benchmarks/results/quant_2026-11-21.json. ctest 13/13 on the merge with main.
+
+## p12/ink-spec (2026-11-21) - Gen 7 H-I1: Inkling-2-Mini spec + reference
+Weights downloaded (/workspace/q-volta-models/Inkling-2-Mini, 19 GB; set HF_HUB_DISABLE_XET=1, xet stalled via the proxy).
+Finding: installed transformers 5.17 has no `inkling2_loop`; PyPI 5.23 has only Inkling2 Small (no loop); the loop model is in the
+open PR huggingface/transformers#51050 (read, not executed - permission denied). docs/INKLING_SPEC.md = exact spec (all ops, checkpoint
+tensor table, NVFP4/MXFP8 dequant, tokenizer/template, MTP inventory). tools/inkling_ref.py = own torch reference (CPU fp32);
+goldens in tests/golden/inkling (4 prompts, 32 greedy tokens each, 48 layer-application hiddens, router ids; 8.9 MB).
+HF logit parity NOT verified (H-I1 partially: spec + behaviourally validated reference, HF comparison pending). Decode bytes/token at
+stored precision 5.4 GiB (68 % dense bf16) -> ~130 tok/s V100 ceiling unless dense weights are quantised.
