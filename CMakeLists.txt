@@ -118,6 +118,9 @@ target_include_directories(qv_text PUBLIC include src)
 add_executable(qv_tok tools/qv_tok.cpp)
 target_link_libraries(qv_tok PRIVATE qv_text)
 
+# ---- standalone libraries: Jinja2 interpreter + chat helpers (src/jinja), GBNF grammar + JSON schema (src/grammar)
+add_subdirectory(src/jinja)
+
 if(QV_CPU OR QV_CUDA)
   add_executable(qv_server src/server/server_main.cpp src/server/http.cpp)
   target_link_libraries(qv_server PRIVATE qv_text qv_core Threads::Threads)

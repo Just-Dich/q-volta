@@ -34,3 +34,10 @@ HF logit parity NOT verified (H-I1 partially: spec + behaviourally validated ref
 stored precision 5.4 GiB (68 % dense bf16) -> ~130 tok/s V100 ceiling unless dense weights are quantised.
 ## p11/perf (2026-11-21)
 Fixed the decode regression introduced by p10/quant (bisected: only 28dcefc; tensor-core attention and int4 KV are neutral). Hot GEMV kernels now compile per (group, meta8) mode, so group-64 E0 runs the pre-p10 code; meta8 row scale hoisted. E0 code: plain 48.7 -> 52.2, MTP-3 104.4 -> 131.5 (324ea1e: 52.2 / 129.6); E1: plain 55.4 -> 57.6, MTP-3 114.7 -> 138.2. Bit-exact (ids identical, ctest 13/13, test_cuda_mtp E0+E1). E1 is faster in tok/s but ~9% lower in effective bytes/s than E0. See docs/PERFORMANCE.md, benchmarks/results/gpu_perf_2026-11-21.json.
+
+## p15/jinja (2026-11-21) - Jinja2 interpreter + chat helpers (milestone A)
+src/jinja: standalone Jinja2-compatible engine + chat rendering + tool-call / reasoning output parser (docs/JINJA.md). Differential test against
+Python jinja2 3.1.6 (oracle env = HF settings): 82/82 templates (80 llama.cpp `models/templates` + Qwen3.8-27B + Inkling-2-Mini) byte-exact on 33
+generated conversations each (2345 exact renders + 361 cases where both engines raise, 130 of them `raise_exception` with identical message), 0 mismatches;
+94/94 feature snippets match; ctest `jinja` 90 checks (incl. golden renders of 11 templates and cross-check against the hand-written
+src/tokenizer/chat_template.cpp). Not done: include/import/extends, autoescape, Python Markup semantics (deliberately follows llama.cpp).
