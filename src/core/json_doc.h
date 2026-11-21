@@ -2,6 +2,7 @@
 // Objects keep insertion order. Used by the tokenizer loader and the HTTP server.
 #pragma once
 #include <charconv>
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
@@ -79,6 +80,7 @@ class Value {
                 char b[40];
                 auto r = std::to_chars(b, b + 40, d_);
                 out.append(b, r.ptr);
+                if (std::find_if(b, r.ptr, [](char c) { return c == '.' || c == 'e' || c == 'E'; }) == r.ptr) out += ".0";  // keep floats floats (like nlohmann)
                 break;
             }
             case Type::Str: dump_string(out, s_); break;
