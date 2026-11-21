@@ -43,3 +43,8 @@ Router ids are not identical (int8 activation noise amplified by the loop). New 
 ## p14/ink-gpu (2026-11-21)
 Inkling-2-Mini CUDA engine on V100: decode 122 tok/s (graph, ~33 % of HBM bound, latency bound), batched prefill 2.1-2.8K tok/s at 4K, int4 KV (9216 B/token), max ctx ~580K,
 passkey 32K/128K/256K passed. pi LoRA and ARM Stage B not covered. docs/INKLING_ENGINE.md.
+
+## p15/srv2 (2026-11-21) - llama-server compatible qv_server
+- qv_server rewritten to be 1:1 with llama-server (llama.cpp 9d6f04f): all llama flag spellings + LLAMA_ARG_* env (tools/gen_llama_flags.py -> src/server/llama_flags.inc), endpoints /completion /infill /v1/completions /v1/chat/completions /tokenize /detokenize /apply-template /props /slots (+save/restore/erase) /metrics /models /health (503 while loading), llama error JSON, CORS, SSE framing, llama sampler chain (mt19937 draw), n_probs/logprobs, n>1, reasoning_content, timings, cache_n. Matrix: docs/SERVER_COMPAT.md.
+- Tests: tests/test_server_compat.py = stand-alone checks (mock engine) + structural-diff cases vs the real llama-server (Qwen2.5-0.5B GGUF): status, content-type, header names, JSON key/type shape, SSE event shapes; documented exceptions whitelisted. tests/test_server.py (real e0 model, CPU, 32 threads): 47/47, stream 3.0 tok/s at load 11.7 (no regression vs ~2.7-3.9).
+- Open: tools/grammar/custom Jinja templates wait for p15/jinja (src/jinja, src/grammar not on the main branch yet); one decoding sequence (queued slots); embeddings/vision/runtime LoRA unsupported; DRY approximate; CUDA server path not run.
