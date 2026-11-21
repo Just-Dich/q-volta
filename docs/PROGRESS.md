@@ -24,3 +24,11 @@ GPTQ + clip + group128 + meta8 quantizer and kernels; profile e1 10.44 GiB +9.6%
 
 ## p12/ink-design (2026-11-21)
 - Inkling-2-Mini design + feasibility study (docs/INKLING_DESIGN.md, tools/ink_model.py; pure analysis, nothing run on GPU/CPU). Exact budget from the safetensors headers (text 18.89 GB: experts NVFP4 layers 0-19 + MXFP8 layers 20-23 = 15.67 GB, attention 1.29 GB BF16, untied lm_head 0.93 GB; MTP is a separate 0.64 GB block drafter file). Q3 profile 9.7 GiB resident; decode ceiling V100 392 tok/s (bandwidth) / ~206 (kernel-overhead model), CPU 23.8 tok/s; max context on V100 ~478K (per-pass KV) / ~860K (shared KV), 1M only with host KV tier or hybrid expert residency; MTP on MoE 1.3-1.7x (alpha 0.75). One new measurement: requantizing NVFP4 experts to uniform int adds 10% rel. RMS noise at 4-bit g128 and 19-22% at 3-bit.
+## p12/ink-spec (2026-11-21) - Gen 7 H-I1: Inkling-2-Mini spec + reference
+Weights downloaded (/workspace/q-volta-models/Inkling-2-Mini, 19 GB; set HF_HUB_DISABLE_XET=1, xet stalled via the proxy).
+Finding: installed transformers 5.17 has no `inkling2_loop`; PyPI 5.23 has only Inkling2 Small (no loop); the loop model is in the
+open PR huggingface/transformers#51050 (read, not executed - permission denied). docs/INKLING_SPEC.md = exact spec (all ops, checkpoint
+tensor table, NVFP4/MXFP8 dequant, tokenizer/template, MTP inventory). tools/inkling_ref.py = own torch reference (CPU fp32);
+goldens in tests/golden/inkling (4 prompts, 32 greedy tokens each, 48 layer-application hiddens, router ids; 8.9 MB).
+HF logit parity NOT verified (H-I1 partially: spec + behaviourally validated reference, HF comparison pending). Decode bytes/token at
+stored precision 5.4 GiB (68 % dense bf16) -> ~130 tok/s V100 ceiling unless dense weights are quantised.
