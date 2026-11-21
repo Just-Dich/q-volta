@@ -1,0 +1,14 @@
+{
+  "model": "inkling2-mini-q3a5.qv", "gpu": "Tesla V100 16GB", "branch": "p14/ink-gpu",
+  "decode_tok_s": {"ctx25_fp16": 122.4, "ctx4096_real_fp16": 113.78, "ctx4096_synth_int4": 113.45, "ctx4096_synth_fp16": 112.85,
+    "ctx32768_synth_int4": 101.12, "ctx32768_synth_fp16": 97.31, "ctx131072_synth_int4": 75.88, "ctx131072_synth_fp16": 68.10, "ctx262144_synth_int4": 57.36},
+  "decode_hbm_bound_fraction": 0.33,
+  "prefill_tok_s": {"4096_chunk2048": 2118.4, "4096_chunk4096": 2764.0, "8000_int4": 2005, "32000_int4": 1835, "127795_int4": 1164, "255834_int4": 766},
+  "prefill_s_256k": 333.9,
+  "memory_gib": {"weights": 9.89, "int4_kv_bytes_per_token": 9216, "kv_256k_gib": 2.2, "vram_used_ctx262144_int4": 12.954, "vram_used_ctx131072_fp16": 14.704},
+  "max_context_int4": {"fits": 580000, "fails": 620000, "design_estimate": 478000},
+  "passkey_int4": {"8K": true, "32K": true, "128K": true, "256K": true, "32K_fp16": true},
+  "correctness": {"greedy_vs_q_golden": "32/32 on p1-p4 (step, batched prefill, int4 p4)", "greedy_vs_fp_golden": "32/32 p1-p3, 4-token prefix p4 (Q3A5 drift)",
+    "int4_kv_p4_kl_last": 1.5e-11, "fp16_kv_p4_kl_last": 1.2e-12},
+  "notes": "synthetic ctx = decode over unwritten KV (speed only). Another process shared GPU0 briefly; timed runs under flock."
+}

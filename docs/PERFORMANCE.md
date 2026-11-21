@@ -157,3 +157,20 @@ E1 matrix (3 runs, [min-max] tok/s; all ids identical to plain; accept rate in p
 | wikitext 2048 | 55.7 [55.69-55.74] | 76.8 [76.70-76.84] (0.684) | 83.6 [83.38-83.77] (0.537) | 76.4 [76.26-76.54] (0.420) |
 | wikitext 4088 | 54.6 [54.18-54.79] | 78.1 [77.51-79.04] (0.789) | 94.1 [92.93-96.21] (0.731) | 81.4 [80.16-83.31] (0.527) |
 Note: during this session another job intermittently used the GPU/lock; runs were serialized with flock and retried when the GPU was occupied, and the spreads above are tight. Raw data: benchmarks/results/gpu_perf_2026-11-21.json.
+
+## Inkling-2-Mini CUDA engine (p14/ink-gpu, 2026-11-21)
+Q3A5 on one V100 (CUDA_VISIBLE_DEVICES=0). Details: docs/INKLING_ENGINE.md; raw: benchmarks/results/inkling_gpu_20261121.json.
+Correctness: greedy 32/32 vs the Q3A5 reference goldens on all four prompts (step decode, batched prefill + decode, int4 KV on p4); vs the fp goldens 32/32 on p1-p3 and a
+4-token prefix on p4 (Q3A5 quantisation drift, same as the CPU engine). Last-position KL to the quantised reference 1e-12..6e-9; vs fp golden top-20 mean abs error 0.77-1.87
+(0.19-0.52 vs the quantised reference).
+| ctx | KV | decode tok/s |
+|---|---|---|
+| 25 | fp16 | 122.4 |
+| 4K (real, after prefill) | fp16 | 113.8 |
+| 4K (synthetic KV) | int4 / fp16 | 113.5 / 112.9 |
+| 32K (synthetic) | int4 / fp16 | 101.1 / 97.3 |
+| 128K (synthetic) | int4 / fp16 | 75.9 / 68.1 |
+| 256K (synthetic) | int4 | 57.4 |
+Prefill (4K prompt): chunk 2048 2118 tok/s, chunk 4096 2764 tok/s (target 2500 met at chunk 4096). 8K 2005 tok/s, 32K 1830, 128K 1164, 256K 766 (int4, chunk 2048, includes quadratic attention; 256K = 334 s).
+Passkey (chat template via HF tokenizers, key at 50 % depth, greedy 200 tokens): found at 8K, 32K, 128K and 256K with int4 KV; also 32K fp16.
+Decode is ~33 % of the HBM bound: latency-bound small kernels (see INKLING_ENGINE.md). "Synthetic" = decode over unwritten KV at that position (speed only).
