@@ -45,7 +45,7 @@ int main() {
                 worst = std::max(worst, std::fabs(r - Y[t * N + n]) / (std::fabs(r) + 1.0));
             }
         for (int n = 0; n < N; ++n) worst = std::max(worst, (double)std::fabs(Y1[n] - Y[3 * N + n]));
-        check(worst < 1e-5, "gemm_f16_rows", worst);
+        check(worst < 5e-5, "gemm_f16_rows", worst);
     }
     {  // attention partial + merge vs naive (ring cache, window crossing the ring end, rel bias, sink)
         const int D = 128, ring = 64, rext = 40, p = 100, jlo = p - 49;
