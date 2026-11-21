@@ -68,7 +68,7 @@ def _params(wg, bits, colw=None, clip=True, rs=None):
         d = q * sf[:, None] + mf[:, None] - wg
         e = d * d
         if colw is not None:
-            e = e * colw[None, :]
+            e = e * (colw if colw.dim() == 2 else colw[None, :])  # [g] shared, or [rows, g] per row (batched GPTQ)
         e = e.sum(-1)
         if best is None:
             best = [e, sf, mf, cs, cm]
@@ -183,3 +183,63 @@ def out_err(W, Wq, H):
     e = ((D @ H) * D).sum().item()
     en = ((W @ H) * W).sum().item()
     return e, en
+
+
+def hinv_chol_batched(H, percdamp=0.01):
+    """H [B,K,K] fp32 -> upper Cholesky factors of the damped inverses [B,K,K] (each as hinv_chol)."""
+    H = H.clone()
+    d = torch.diagonal(H, dim1=-2, dim2=-1)
+    d[d == 0] = 1.0
+    d.add_(percdamp * d.mean(-1, keepdim=True))
+    L = torch.linalg.cholesky(H)
+    del H
+    Hinv = torch.cholesky_inverse(L)
+    del L
+    return torch.linalg.cholesky(Hinv, upper=True)
+
+
+def rtn_batched(W, bits, group=64, clip=True, colw=None, meta8=True):
+    """W [E,N,K] -> (q uint8 [E,N,K], S [E,N,G], M [E,N,G], rs [E,N] | None). colw [E,K] optional per-expert column weights."""
+    E, N, K = W.shape
+    outs = [rtn(W[e], bits, group, clip=clip, colw=None if colw is None else colw[e], meta8=meta8) for e in range(E)]
+    q = torch.stack([o[0] for o in outs]); S = torch.stack([o[1] for o in outs]); M = torch.stack([o[2] for o in outs])
+    rs = torch.stack([o[3] for o in outs]) if meta8 else None
+    return q, S, M, rs
+
+
+def gptq_batched(W, Hu, bits, group=64, clip=True, colw=None, block=128, meta8=False):
+    """GPTQ over a batch of independent matrices that share one shape: W [E,N,K] (device), Hu = hinv_chol_batched(H) [E,K,K],
+    colw [E,K] or None. Same algorithm as gptq() (static groups, params from error-compensated weights); the python loop over
+    columns is amortised across E. Returns (Q uint8 [E,N,K], S [E,N,G], M [E,N,G], rs [E,N] | None)."""
+    E, N, K = W.shape
+    qmax = (1 << bits) - 1
+    G = K // group
+    rs = torch.stack([row_scale(W[e], bits, group) for e in range(E)]) if meta8 else None  # [E,N]
+    rsf = None if rs is None else rs.reshape(E * N)
+    W = W.clone()
+    Q = torch.empty(E, N, K, dtype=torch.uint8, device=W.device)
+    S = torch.empty(E, N, G, dtype=_meta_dtype(rs), device=W.device)
+    M = torch.empty_like(S)
+    for i1 in range(0, K, block):
+        i2 = min(i1 + block, K)
+        W1 = W[:, :, i1:i2].clone()
+        Err = torch.zeros_like(W1)
+        Hb = Hu[:, i1:i2, i1:i2]
+        sf = mf = None
+        for i in range(i2 - i1):
+            if (i1 + i) % group == 0:
+                g0 = i1 + i
+                cw = None if colw is None else colw[:, g0:g0 + group].repeat_interleave(N, 0)
+                a, b, cs, cm = _params(W1[:, :, i:i + group].reshape(E * N, group), bits, cw, clip, rsf)
+                sf, mf = a.view(E, N), b.view(E, N)
+                S[:, :, g0 // group] = cs.view(E, N)
+                M[:, :, g0 // group] = cm.view(E, N)
+            w = W1[:, :, i]
+            d = Hb[:, i, i][:, None]
+            q, dq = _quant_col(w, sf, mf, qmax)
+            Q[:, :, i1 + i] = q.to(torch.uint8)
+            err = (w - dq) / d
+            W1[:, :, i:] -= err[:, :, None] * Hb[:, i, i:][:, None, :]
+            Err[:, :, i] = err
+        W[:, :, i2:] -= torch.bmm(Err, Hu[:, i1:i2, i2:])
+    return Q, S, M, rs

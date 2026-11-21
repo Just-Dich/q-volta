@@ -26,6 +26,14 @@ set(QV_CUDA_FLAGS -O3 -lineinfo -Xptxas=-v -Wno-deprecated-gpu-targets)
 
 add_library(qv_core STATIC src/model/model_file.cpp)
 target_include_directories(qv_core PUBLIC include)
+enable_testing()
+add_executable(test_model_inkling tests/test_model_inkling.cpp)
+target_link_libraries(test_model_inkling PRIVATE qv_core)
+add_test(NAME model_inkling COMMAND test_model_inkling)
+set(QV_INKLING_TEST_MODEL "" CACHE STRING "optional converted Inkling .qv whose header is validated by ctest (model_inkling_file)")
+if(QV_INKLING_TEST_MODEL AND EXISTS "${QV_INKLING_TEST_MODEL}")
+  add_test(NAME model_inkling_file COMMAND test_model_inkling ${QV_INKLING_TEST_MODEL})
+endif()
 
 if(QV_CUDA)
 add_library(qv_cuda STATIC

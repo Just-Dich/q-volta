@@ -74,6 +74,7 @@ class Inkling:
         self.P = {}  # weight cache (fp32) for non-expert tensors
         self.trace = None  # dict -> filled by forward when not None
         self.sl = {}  # per-tensor safetensors slice handles
+        self.last_k = 1  # number of final positions whose logits forward() returns when all_logits=False
 
     # ---------------- weights -----------------
     def w(self, name):
@@ -368,7 +369,7 @@ class Inkling:
         if want_trace:
             trace["final_norm"] = hf.clone()
         cache["n"] += n
-        hs = hf if all_logits else hf[-1:]
+        hs = hf if all_logits else hf[-self.last_k:]
         logits = self.unembed(hs)
         if self.verbose:
             print(f"  forward n={n} {time.time() - t0:.1f}s (expert cache {self.ecache_bytes / 2**30:.1f} GiB)", flush=True)

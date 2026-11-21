@@ -170,3 +170,102 @@ class Writer:
         with open(self.prefix + ".qv.json", "w") as fh:
             config = dict(config, **self.extra_config)
             json.dump(dict(format="qvolta-v1", config=config, tensors=self.tensors), fh, indent=1)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Single-file container written directly (no .json/.bin pair, so a 13 GB model never exists twice on disk) and a reader.
+# Added for Inkling (docs/INKLING_FORMAT.md). Stacked expert tensors: a "q" entry whose shape is [E, N, K]; qweight is
+# uint32[E][N][K/32][bits], sm is [E][N][K/G] (fp16 pairs or meta8 uint16), rs is fp16 [E][N]; every expert's slice is a
+# multiple of 256 bytes, so expert e of a tensor starts at off + e * (nbytes / E).
+# ---------------------------------------------------------------------------------------------------------------------
+class ContainerWriter(Writer):
+    HDR = 8 << 20  # header region (magic, lengths, json); data section starts here (2 MiB aligned)
+
+    def __init__(self, path, resume=None):
+        self.prefix = path
+        self.path = path
+        self.extra_config = {}
+        self.null = False
+        if resume is None:
+            self.f = open(path, "wb")
+            self.f.seek(self.HDR)
+            self.off, self.tensors = 0, {}
+        else:
+            self.f = open(path, "r+b")
+            self.off, self.tensors = resume
+            self.f.truncate(self.HDR + self.off)
+            self.f.seek(self.HDR + self.off)
+
+    def add_raw(self, name, kind, shape, parts: dict, **extra):
+        """Passthrough (checkpoint-native) tensor, e.g. kind 'nvfp4': parts = {q: uint8 codes, sm: e4m3 scales (uint8),
+        rs: fp32 per-expert global factor}; they are stored in off_q/off_sm/off_rs. Returns bytes written."""
+        ent = dict(kind=kind, shape=list(shape), **extra)
+        nb = 0
+        for key, off_name, nb_name in (("q", "off_q", "nbytes_q"), ("sm", "off_sm", "nbytes_sm"), ("rs", "off_rs", "nbytes_rs")):
+            if key in parts:
+                a = np.ascontiguousarray(parts[key])
+                ent[off_name] = self._blob(a)
+                ent[nb_name] = a.nbytes
+                nb += a.nbytes
+        self.tensors[name] = ent
+        return nb
+
+    def close(self, config: dict):
+        import json, struct
+        config = dict(config, **self.extra_config)
+        js = json.dumps(dict(format="qvolta-v1", config=config, tensors=self.tensors), indent=None, separators=(",", ":")).encode()
+        assert 24 + len(js) <= self.HDR, "header region too small"
+        self.f.flush()
+        self.f.seek(0)
+        self.f.write(b"QVOLTA1\0" + struct.pack("<QQ", len(js), self.HDR) + js)
+        self.f.close()
+
+
+class Reader:
+    """Read-only view of a .qv container (numpy memmap). Tensor offsets in the JSON are relative to the data section."""
+
+    def __init__(self, path):
+        import json, struct
+        self.path = path
+        with open(path, "rb") as fh:
+            magic = fh.read(8)
+            assert magic == b"QVOLTA1\0", "not a .qv container"
+            jl, self.data_off = struct.unpack("<QQ", fh.read(16))
+            hdr = json.loads(fh.read(jl))
+        self.config, self.tensors = hdr["config"], hdr["tensors"]
+        self.mm = np.memmap(path, dtype=np.uint8, mode="r")
+
+    def _arr(self, off, nbytes, dtype, shape):
+        a = self.mm[self.data_off + off: self.data_off + off + nbytes]
+        return a.view(dtype).reshape(shape)
+
+    def dense(self, name):
+        t = self.tensors[name]
+        dt = {"f32": np.float32, "f16": np.float16}[t["kind"]]
+        return torch.from_numpy(np.array(self._arr(t["off"], t["nbytes"], dt, t["shape"])))
+
+    def quant(self, name, e=None):
+        """-> (packed int32 [..N, K/32, bits], sm, rs|None, bits, group). For a stacked tensor pass the expert index e (or None for all)."""
+        t = self.tensors[name]
+        assert t["kind"] == "q"
+        bits, group, shape = t["bits"], t["group"], t["shape"]
+        E = shape[0] if len(shape) == 3 else None
+        N, K = shape[-2:] if E else shape
+        meta8 = t.get("meta") == "s8z8"
+        pk = self._arr(t["off_q"], t["nbytes_q"], np.int32, ([E] if E else []) + [N, K // 32, bits])
+        sm = self._arr(t["off_sm"], t["nbytes_sm"], np.uint16 if meta8 else np.float16,
+                       ([E] if E else []) + ([N, K // group] if meta8 else [N, K // group, 2]))
+        rs = self._arr(t["off_rs"], t["nbytes_rs"], np.float16, ([E] if E else []) + [N]) if meta8 else None
+        if E and e is not None:
+            pk, sm, rs = pk[e], sm[e], (rs[e] if rs is not None else None)
+        pk, sm = torch.from_numpy(np.array(pk)), torch.from_numpy(np.array(sm).view(np.uint16 if meta8 else np.float16))
+        if meta8:
+            sm = sm.view(torch.int16) if False else sm.to(torch.int32)
+        return pk, sm, (torch.from_numpy(np.array(rs)) if rs is not None else None), bits, group
+
+    def dequant(self, name, e=None, dev="cpu"):
+        """Exact engine reconstruction (fp32) of a quant tensor (one expert if e is given)."""
+        pk, sm, rs, bits, group = self.quant(name, e)
+        pk, sm = pk.to(dev), sm.to(dev)
+        rs = None if rs is None else rs.to(dev)
+        return dequant(pk, sm, bits, group, rs)
