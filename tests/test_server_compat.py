@@ -297,8 +297,156 @@ def test_chat_logprobs_and_tools_error(srv):
     assert len(lp) == 2 and set(lp[0]) == {"id", "token", "bytes", "logprob", "top_logprobs"} and len(lp[0]["top_logprobs"]) == 2
     st, _, e = srv.req("POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "Hi"}], "top_logprobs": 2})
     assert st == 400 and e["error"]["message"] == "top_logprobs requires logprobs to be set to true"
-    st, _, e = srv.req("POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "Hi"}], "tools": [{"type": "function", "function": {"name": "f", "parameters": {}}}]})
-    assert st == 400 and e["error"]["type"] == "invalid_request_error"   # until the Jinja interpreter is linked (documented)
+    st, _, e = srv.req("POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "Hi"}], "tool_choice": "bogus", "tools": [WEATHER]})
+    assert st == 400 and e["error"]["message"] == "Invalid tool_choice: bogus"
+
+
+WEATHER = {"type": "function", "function": {"name": "get_weather", "description": "weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}
+CALL = "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>"
+NOTHINK = {"enable_thinking": False}
+
+
+@pytest.fixture(scope="module")
+def tsrv():
+    s = Srv(qv_cmd("--mock-text", CALL), name="tools")
+    yield s
+    s.stop()
+
+
+def chat_body(**kw):
+    return dict({"messages": [{"role": "user", "content": "weather in Paris?"}], "max_tokens": 120, "temperature": 0, "chat_template_kwargs": NOTHINK}, **kw)
+
+
+def test_tools_non_stream(tsrv):
+    st, _, r = tsrv.req("POST", "/v1/chat/completions", chat_body(tools=[WEATHER]))
+    assert st == 200
+    ch = r["choices"][0]
+    assert ch["finish_reason"] == "tool_calls" and ch["message"]["content"] == ""
+    tc = ch["message"]["tool_calls"]
+    assert len(tc) == 1 and tc[0]["type"] == "function" and tc[0]["id"] and tc[0]["function"]["name"] == "get_weather"
+    assert json.loads(tc[0]["function"]["arguments"]) == {"city": "Paris"}
+    # tool_choice none: tools are rendered but the output is not parsed
+    r = tsrv.req("POST", "/v1/chat/completions", chat_body(tools=[WEATHER], tool_choice="none"))[2]["choices"][0]
+    assert "tool_calls" not in r["message"] and "<tool_call>" in r["message"]["content"] and r["finish_reason"] != "tool_calls"
+
+
+def test_tools_stream(tsrv):
+    st, hd, ev, raw = tsrv.sse("/v1/chat/completions", chat_body(tools=[WEATHER], stream=True))
+    assert st == 200 and ev[-1] == "[DONE]"
+    deltas = [e["choices"][0]["delta"] for e in ev[:-1] if e["choices"]]
+    assert deltas[0] == {"role": "assistant", "content": None}
+    tcs = [d["tool_calls"][0] for d in deltas if "tool_calls" in d]
+    assert tcs[0]["index"] == 0 and tcs[0]["id"] and tcs[0]["type"] == "function" and tcs[0]["function"]["name"] == "get_weather"
+    assert all("id" not in t and "name" not in t["function"] for t in tcs[1:])
+    assert json.loads("".join(t["function"]["arguments"] for t in tcs)) == {"city": "Paris"}
+    assert not any(d.get("content") for d in deltas[1:])
+    fin = [e for e in ev[:-1] if e["choices"] and e["choices"][0]["finish_reason"]]
+    assert len(fin) == 1 and fin[0]["choices"][0]["finish_reason"] == "tool_calls" and fin[0]["choices"][0]["delta"] == {}
+
+
+def test_tools_parallel_and_history():
+    s = Srv(qv_cmd("--mock-text", CALL + "\n" + CALL.replace("Paris", "Rome")), name="par")
+    try:
+        r = s.req("POST", "/v1/chat/completions", chat_body(tools=[WEATHER], parallel_tool_calls=True))[2]["choices"][0]["message"]["tool_calls"]
+        assert [json.loads(t["function"]["arguments"])["city"] for t in r] == ["Paris", "Rome"] and r[0]["id"] != r[1]["id"]
+        hist = [{"role": "user", "content": "weather?"},
+                {"role": "assistant", "content": None, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "sunny"}]
+        ap = s.req("POST", "/apply-template", {"messages": hist, "tools": [WEATHER]})
+        assert ap[0] == 200 and "get_weather" in ap[2]["prompt"] and "sunny" in ap[2]["prompt"] and "<tools>" in ap[2]["prompt"]
+        assert s.req("POST", "/v1/chat/completions", chat_body(messages=hist, tools=[WEATHER]))[0] == 200
+    finally:
+        s.stop()
+
+
+def test_forced_and_required_tool_choice_use_grammar():
+    s = Srv(qv_cmd("--mock-text", "I will not call any tool, just talking."), name="forced")
+    try:
+        for tc in ("required", {"type": "function", "function": {"name": "get_weather"}}):
+            r = s.req("POST", "/v1/chat/completions", chat_body(tools=[WEATHER], tool_choice=tc, max_tokens=300))[2]["choices"][0]
+            assert r["finish_reason"] == "tool_calls" and r["message"]["tool_calls"][0]["function"]["name"] == "get_weather"
+            assert isinstance(json.loads(r["message"]["tool_calls"][0]["function"]["arguments"]), dict)
+        # tool_choice auto: lazy grammar, plain text passes through untouched
+        r = s.req("POST", "/v1/chat/completions", chat_body(tools=[WEATHER], max_tokens=300))[2]["choices"][0]
+        assert r["message"]["content"].startswith("I will not") and "tool_calls" not in r["message"]
+    finally:
+        s.stop()
+
+
+def test_response_format_and_grammar():
+    s = Srv(qv_cmd("--mock-text", "hello world"), name="grammar")
+    try:
+        r = s.req("POST", "/v1/chat/completions", chat_body(response_format={"type": "json_object"}, max_tokens=300))[2]["choices"][0]
+        assert isinstance(json.loads(r["message"]["content"]), dict) and r["finish_reason"] == "stop"
+        sch = {"type": "object", "properties": {"n": {"type": "integer"}, "tag": {"enum": ["a", "b"]}}, "required": ["n", "tag"]}
+        for rf in ({"type": "json_schema", "json_schema": {"name": "x", "schema": sch}}, {"type": "json_object", "schema": sch}):
+            r = s.req("POST", "/v1/chat/completions", chat_body(response_format=rf, max_tokens=300))[2]["choices"][0]
+            v = json.loads(r["message"]["content"])
+            assert isinstance(v["n"], int) and v["tag"] in ("a", "b")
+        r = s.req("POST", "/completion", {"prompt": "x", "grammar": 'root ::= "yes" | "no"', "n_predict": 10, "temperature": 0})[2]
+        assert r["content"] in ("yes", "no") and r["generation_settings"]["grammar"] == 'root ::= "yes" | "no"'
+        r = s.req("POST", "/completion", {"prompt": "x", "json_schema": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2}, "n_predict": 40, "temperature": 0.7})[2]
+        v = json.loads(r["content"]); assert len(v) == 2 and all(isinstance(x, int) for x in v)
+        r = s.req("POST", "/completion", {"prompt": "x", "grammar": 'root ::= [0-9]+', "n_predict": 6, "temperature": 1.0, "seed": 3})[2]
+        assert r["content"].isdigit()
+        st, _, e = s.req("POST", "/completion", {"prompt": "x", "grammar": "root ::= undefined-rule"})
+        assert st == 400 and e["error"]["type"] == "invalid_request_error"
+        assert s.req("POST", "/v1/chat/completions", chat_body(grammar="root ::= \"a\"", json_schema={}))[0] == 500
+        assert s.req("POST", "/completion", {"prompt": "x", "n_predict": 3, "temperature": 0, "grammar": "root ::= \"a\"", "json_schema": {}})[2]["content"] == "a"
+        assert s.req("POST", "/v1/chat/completions", chat_body(response_format={"type": "bogus"}))[0] == 400
+        st, _, ev, _ = s.sse("/v1/chat/completions", chat_body(response_format={"type": "json_object"}, stream=True, max_tokens=300))
+        txt = "".join(e["choices"][0]["delta"].get("content") or "" for e in ev[:-1] if e["choices"])
+        assert isinstance(json.loads(txt), dict)
+    finally:
+        s.stop()
+
+
+def test_cli_grammar_flags():
+    s = Srv(qv_cmd("--mock-text", "zzz", "--grammar", 'root ::= "ok"'), name="cligr")
+    try:
+        assert s.req("POST", "/completion", {"prompt": "x", "n_predict": 10, "temperature": 0})[2]["content"] == "ok"
+    finally:
+        s.stop()
+    s = Srv(qv_cmd("--mock-text", "zzz", "--json-schema", '{"type":"boolean"}'), name="clijs")
+    try:
+        assert s.req("POST", "/completion", {"prompt": "x", "n_predict": 10, "temperature": 0})[2]["content"] in ("true", "false")
+    finally:
+        s.stop()
+
+
+def test_chat_template_flags(tmp_path):
+    s = Srv(qv_cmd("--chat-template", "chatml"), name="chatml")
+    try:
+        p = s.req("POST", "/apply-template", {"messages": [{"role": "system", "content": "S"}, {"role": "user", "content": "U"}]})[2]["prompt"]
+        assert p == "<|im_start|>system\nS<|im_end|>\n<|im_start|>user\nU<|im_end|>\n<|im_start|>assistant\n"
+    finally:
+        s.stop()
+    f = tmp_path / "t.jinja"
+    f.write_text("{% for m in messages %}[{{ m.role }}] {{ m.content }}\n{% endfor %}{% if add_generation_prompt %}[assistant] {% endif %}")
+    s = Srv(qv_cmd("--chat-template-file", str(f)), name="tfile")
+    try:
+        assert s.req("POST", "/apply-template", {"messages": [{"role": "user", "content": "U"}]})[2]["prompt"] == "[user] U\n[assistant] "
+        assert s.req("GET", "/props")[2]["chat_template"].startswith("{% for m")
+    finally:
+        s.stop()
+    bad = run_cli(["--backend", "mock", "--tokenizer", TOKJSON, "--chat-template", "{% for %}"])
+    assert bad.returncode == 1
+
+
+def test_jinja_matches_native_renderer():
+    a = Srv(qv_cmd(), name="jinja"); b = Srv(qv_cmd("--no-jinja"), name="native")
+    try:
+        convs = [{"messages": [{"role": "user", "content": "Hi"}]},
+                 {"messages": [{"role": "system", "content": "sys"}, {"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}, {"role": "user", "content": "c"}]},
+                 {"messages": [{"role": "user", "content": "Hi"}], "chat_template_kwargs": {"enable_thinking": False}},
+                 {"messages": [{"role": "user", "content": [{"type": "text", "text": "p1"}, {"type": "text", "text": "p2"}]}], "reasoning_effort": "low"}]
+        for c in convs:
+            pa, pb = a.req("POST", "/apply-template", c)[2], b.req("POST", "/apply-template", c)[2]
+            assert pa["prompt"] == pb["prompt"], (c, pa, pb)
+        assert b.req("POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "x"}], "tools": [WEATHER]})[0] == 400
+        assert a.req("GET", "/props")[2]["chat_template_caps"]["supports_tools"] is True
+    finally:
+        a.stop(); b.stop()
 
 
 def test_error_shapes(srv):
@@ -659,6 +807,27 @@ case("ERR top_logprobs", "POST", "/v1/chat/completions", dict(CHAT, top_logprobs
 case("ERR ctx exceeded", "POST", "/completion", {"prompt": "word " * 6000, "n_predict": 1})
 case("ERR reasoning_format", "POST", "/v1/chat/completions", dict(CHAT, reasoning_format="bogus"))
 case("POST /v1/chat/completions thinking", "POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "Hi"}], "max_tokens": 3, "temperature": 0})
+TOOLS = [{"type": "function", "function": {"name": "get_weather", "description": "weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
+TCHAT = dict(CHAT, messages=[{"role": "user", "content": "What is the weather in Paris?"}], max_tokens=80, tools=TOOLS, tool_choice="required")
+case("POST /v1/chat/completions tools required", "POST", "/v1/chat/completions", TCHAT)
+case("POST /v1/chat/completions tools required stream", "POST", "/v1/chat/completions", dict(TCHAT, stream=True), stream=True)
+case("POST /v1/chat/completions tools forced", "POST", "/v1/chat/completions", dict(TCHAT, tool_choice={"type": "function", "function": {"name": "get_weather"}}))
+case("POST /v1/chat/completions tools parallel", "POST", "/v1/chat/completions", dict(TCHAT, parallel_tool_calls=True))
+case("POST /v1/chat/completions tools none", "POST", "/v1/chat/completions", dict(CHAT, tools=TOOLS, tool_choice="none"))
+case("POST /v1/chat/completions tools history", "POST", "/v1/chat/completions", dict(CHAT, tools=TOOLS, messages=[
+    {"role": "user", "content": "weather?"},
+    {"role": "assistant", "content": None, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]},
+    {"role": "tool", "tool_call_id": "call_1", "content": "sunny"}]))
+case("POST /apply-template tools", "POST", "/apply-template", {"messages": [{"role": "user", "content": "Hi"}], "tools": TOOLS})
+case("POST /v1/chat/completions json_object", "POST", "/v1/chat/completions", dict(CHAT, max_tokens=60, response_format={"type": "json_object"}))
+case("POST /v1/chat/completions json_schema", "POST", "/v1/chat/completions", dict(CHAT, max_tokens=60, response_format={"type": "json_schema", "json_schema": {"name": "x", "schema": {"type": "object", "properties": {"n": {"type": "integer"}}, "required": ["n"]}}}))
+case("POST /v1/chat/completions json_object stream", "POST", "/v1/chat/completions", dict(CHAT, max_tokens=60, response_format={"type": "json_object"}, stream=True), stream=True)
+case("POST /completion grammar", "POST", "/completion", {"prompt": "Hello", "n_predict": 5, "temperature": 0, "grammar": 'root ::= "yes" | "no"'})
+case("POST /completion json_schema", "POST", "/completion", {"prompt": "Hello", "n_predict": 30, "temperature": 0, "json_schema": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2}})
+case("ERR bad tool_choice", "POST", "/v1/chat/completions", dict(CHAT, tools=TOOLS, tool_choice="bogus"))
+case("ERR bad response_format", "POST", "/v1/chat/completions", dict(CHAT, response_format={"type": "bogus"}))
+case("POST /completion grammar+schema", "POST", "/completion", {"prompt": "x", "n_predict": 3, "grammar": 'root ::= "a"', "json_schema": {}})
+case("ERR chat grammar and schema", "POST", "/v1/chat/completions", dict(CHAT, grammar='root ::= "a"', json_schema={}))
 case("OPTIONS", "OPTIONS", "/v1/chat/completions")
 case("HEAD /health", "HEAD", "/health")
 
@@ -674,6 +843,10 @@ def parse_resp(srv, c):
             if blk: evs.append(blk[6:] if blk.startswith("data: ") else "BADFRAME:" + blk)
         shapes = []
         for e in evs:
+            if e != "[DONE]" and not e.startswith("BADFRAME"):   # tool-call argument continuations: chunk count depends on the generated text, not on the protocol
+                j = json.loads(e)
+                d = j["choices"][0].get("delta", {}) if j.get("choices") else {}
+                if d.get("tool_calls") and "id" not in d["tool_calls"][0]: continue
             s = e if (e == "[DONE]" or e.startswith("BADFRAME")) else shape(json.loads(e))
             if not shapes or shapes[-1] != s: shapes.append(s)
         return st, h, ("sse", shapes, evs)

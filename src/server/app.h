@@ -9,7 +9,11 @@
 #include <optional>
 #include <set>
 
+#include <map>
+
 #include "core/json_doc.h"
+#include "core/tool_format.h"
+#include "grammar/grammar.h"
 #include "qv/engine.h"
 #include "sampling/sampler.h"
 #include "server/chat_render.h"
@@ -50,6 +54,12 @@ struct Task {
     int id_slot = -1, n_probs = 0, n_keep = 0, n_choices = 1;
     SamplingParams sp;
     std::string grammar;
+    bool grammar_lazy = false, json_object = false;
+    std::vector<std::string> trigger_words;
+    // chat tools
+    Value tools;
+    bool parse_tools = false;
+    ToolFormat tool_fmt = ToolFormat::Generic;
     Value json_schema, response_fields, logit_bias_echo, stop_echo;
     // chat
     bool include_usage = false, thinking_open = false;
@@ -133,6 +143,11 @@ class App {
     void parse_sampling(const Value& body, Task& t);
     std::vector<int> tokenize_prompt_value(const Value& p);
     std::string template_prefix_json(const Value&);
+    void finalize_constraints(Task& t);  // json_schema / response_format -> GBNF (validated)
+    std::shared_ptr<grammar::Matcher> get_matcher(const std::string& gbnf);
+    std::mutex gm_;
+    std::shared_ptr<const grammar::VocabIndex> vocab_;
+    std::map<std::string, std::shared_ptr<grammar::Matcher>> matchers_;
 
     // ---- generation
     long lease_acquire(const std::function<bool()>& alive);  // FIFO turn on the engine; -1 if the client left while waiting

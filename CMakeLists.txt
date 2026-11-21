@@ -135,7 +135,7 @@ if(QV_CPU OR QV_CUDA)
   add_executable(qv_server src/server/server_main.cpp src/server/http.cpp src/server/options.cpp src/server/chat_render.cpp
                  src/server/app_core.cpp src/server/app_gen.cpp src/server/app_handlers.cpp)
   target_compile_definitions(qv_server PRIVATE QV_GIT_REV="${QV_GIT_REV}")
-  target_link_libraries(qv_server PRIVATE qv_text qv_core Threads::Threads)
+  target_link_libraries(qv_server PRIVATE qv_text qv_core qv_jinja qv_grammar Threads::Threads)
   if(QV_CPU)
     target_link_libraries(qv_server PRIVATE qv_cpu_engine)
     target_compile_definitions(qv_server PRIVATE QV_HAVE_CPU)

@@ -185,7 +185,20 @@ try:
     st, _, b = req(port, "POST", "/v1/chat/completions", dict(chat1, n=2, max_tokens=2)); check("n=2 -> two choices", st == 200 and [c["index"] for c in b["choices"]] == [0, 1] and b["usage"]["completion_tokens"] == 4, b)
     st, _, b = req(port, "POST", "/v1/chat/completions", {"max_tokens": 4}); check("missing messages -> 400", st == 400 and b["error"]["message"] == "'messages' is required", b)
     st, _, b = req(port, "POST", "/v1/chat/completions", dict(chat1, temperature="hot")); check("temperature wrong type -> 400", st == 400 and "Field 'temperature'" in b["error"]["message"], b)
-    st, _, b = req(port, "POST", "/v1/chat/completions", dict(chat1, tools=[{"type": "function", "function": {"name": "f"}}])); check("tools -> 400 (until the Jinja interpreter is linked)", st == 400 and b["error"]["type"] == "invalid_request_error", b)
+    W = {"type": "function", "function": {"name": "get_weather", "description": "Get the current weather for a city", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}
+    st, _, b = req(port, "POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "What is the weather in Paris?"}], "tools": [W], "max_tokens": 200, "temperature": 0, "chat_template_kwargs": NOTHINK})
+    tcs = b["choices"][0]["message"].get("tool_calls") if st == 200 else None
+    check("tools (auto, lazy grammar): real model calls get_weather(city=Paris), finish_reason tool_calls", bool(tcs) and tcs[0]["function"]["name"] == "get_weather" and "Paris" in json.loads(tcs[0]["function"]["arguments"]).get("city", "") and b["choices"][0]["finish_reason"] == "tool_calls", b)
+    st, _, b = req(port, "POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "Say hello."}], "tools": [W], "tool_choice": "required", "max_tokens": 200, "temperature": 0, "chat_template_kwargs": NOTHINK})
+    tcs = b["choices"][0]["message"].get("tool_calls") if st == 200 else None
+    check("tool_choice required forces a valid call (grammar)", bool(tcs) and tcs[0]["function"]["name"] == "get_weather" and isinstance(json.loads(tcs[0]["function"]["arguments"]), dict), b)
+    st, _, b = req(port, "POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "Give a JSON object with keys name and age for a fictional person."}], "response_format": {"type": "json_object"}, "max_tokens": 100, "temperature": 0, "chat_template_kwargs": NOTHINK})
+    ok = st == 200
+    try: ok = ok and isinstance(json.loads(b["choices"][0]["message"]["content"]), dict)
+    except Exception: ok = False
+    check("response_format json_object yields a JSON object (grammar-constrained, real model)", ok, b)
+    st, _, b = req(port, "POST", "/completion", {"prompt": "Is the sky blue? Answer: ", "grammar": 'root ::= "yes" | "no"', "n_predict": 8, "temperature": 0})
+    check("grammar root ::= yes|no on /completion", st == 200 and b["content"] in ("yes", "no"), b)
     st, _, b = req(port, "POST", "/v1/completions", {"prompt": [100] * 600, "max_tokens": 2}); check("prompt longer than ctx -> 400 exceed_context_size_error", st == 400 and b["error"]["type"] == "exceed_context_size_error" and b["error"]["n_ctx"] == int(args.max_ctx) and b["error"]["n_prompt_tokens"] == 600, (st, b))
     st, _, b = req(port, "POST", "/completion", {"prompt": [100] * (int(args.max_ctx) - 4), "n_predict": 50, "temperature": 0})
     check("generation stops at the context limit: stop_type limit, truncated", st == 200 and b["tokens_predicted"] <= 4 and b["stop_type"] == "limit" and b["truncated"] is True, b)

@@ -72,3 +72,8 @@ Mask latency, single thread, Qwen3.8 vocab (first-visit = state mask computed, w
 First-visit masks cost up to ~11 ms (states inside a string where most of the vocab is allowed), ~1-1.6 ms averaged over short 25-45 token samples; cached lookups are ~0.001 ms and
 mask_logits 0.05-0.07 ms (0.26 ms with only 3 allowed CJK-range tokens path). Long generations amortise well below 1 ms/token; short ones with many distinct states do not (not measured on a long run).
 Not supported: `<[id]>` token elements; non-integer minimum/maximum are not enforced.
+
+## p16/srv3 (2026-11-21) - Jinja + grammar integrated into qv_server
+- Chat templates via qv::chat::ChatTemplate (model template, --chat-template, --chat-template-file; native Qwen3.8 renderer only as fallback, byte-equal on the tested conversations). tools/tool_choice/parallel_tool_calls -> OpenAI tool_calls (non-stream + streaming deltas), reasoning_content via the chat parser, /apply-template with tools.
+- grammar / json_schema / response_format / forced tool_choice / lazy tool triggers / --grammar / --json-schema via src/grammar on host logits (argmax + MTP paths skipped when constrained).
+- tests/test_server_compat.py: 121 passed (48 stand-alone incl. tools, tool streaming, parallel calls, history, grammar, json modes, template flags; 73 structural-diff cases vs llama-server incl. tools/json/grammar). tests/test_server.py real e0 CPU: 50/50 incl. real-model tool call, required tool_choice, json_object, grammar; stream 2.9 tok/s at load 12.5.

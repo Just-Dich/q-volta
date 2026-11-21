@@ -5,6 +5,8 @@
 #include <random>
 
 #include "server/app.h"
+#include "grammar/json_schema.h"
+#include "grammar/sampler_hook.h"
 
 namespace qv::server {
 
@@ -135,8 +137,12 @@ Value App::gen_settings(const Task& t, int flavor) const {  // flavor 0: complet
     o.set("min_keep", s.min_keep);
     if (flavor == 0) {
         o.set("grammar", t.grammar);
-        o.set("grammar_lazy", false);
-        o.set("grammar_triggers", Value::array());
+        o.set("grammar_lazy", t.grammar_lazy);
+        {
+        Value gt = Value::array();
+        for (auto& w : t.trigger_words) { Value x = Value::object(); x.set("type", 1); x.set("value", w); x.set("token", -1); gt.push(std::move(x)); }
+        o.set("grammar_triggers", std::move(gt));
+    }
         o.set("preserved_tokens", Value::array());
     }
     o.set("chat_format", "Content-only");
@@ -298,7 +304,7 @@ void App::parse_sampling(const Value& bv, Task& t) {
         t.stops.erase(std::remove(t.stops.begin(), t.stops.end(), std::string()), t.stops.end());
     }
     if (const Value* v = b.g("response_fields")) t.response_fields = *v;
-    if (!t.grammar.empty() && !t.json_schema.is_null()) throw_error(400, "Cannot use both json_schema and grammar");
+    // native endpoints: `grammar` wins over `json_schema` silently (llama-server); the chat path rejects the combination below
 }
 
 Task App::parse_task(const Value& body, Kind kind) {
@@ -317,18 +323,25 @@ Task App::parse_task(const Value& body, Kind kind) {
         const Value* tools = b.g("tools");
         bool has_tools = tools && tools->is_array() && tools->size() > 0;
         Value tc = body.find("tool_choice") ? *body.find("tool_choice") : Value("auto");
-        std::string tool_choice = tc.is_string() ? tc.as_string() : "auto";
+        std::string tool_choice = "auto", forced_name;
+        if (tc.is_string()) tool_choice = tc.as_string();
+        else if (tc.is_object()) {
+            tool_choice = "required";
+            if (const Value* f = tc.find("function"); f && f->is_object()) forced_name = Body{*f}.str("name", "");
+            else forced_name = Body{tc}.str("name", "");
+        } else if (!tc.is_null()) throw_error(400, "Invalid tool_choice: " + tc.dump());
+        if (tool_choice != "auto" && tool_choice != "none" && tool_choice != "required") throw_error(400, "Invalid tool_choice: " + tool_choice);
         if (!o.jinja) {
             if (has_tools) throw_error(400, "tools param requires --jinja flag");
             if (tool_choice != "auto") throw_error(400, "tool_choice param requires --jinja flag");
         }
         if (tools && !tools->is_array()) throw_error(400, "'tools' must be an array of objects");
-        if (!t.json_schema.is_null() && !t.grammar.empty()) throw_error(400, "Cannot use both json_schema and grammar");
+        if (!t.json_schema.is_null() && !t.grammar.empty()) throw_error(500, "Cannot use both json_schema and grammar");  // llama-server: 500 server_error
         if (const Value* r = b.g("response_format")) {
             std::string type = r->is_object() ? Body{*r}.str("type", "") : "";
             if (type == "json_object") {
                 const Value* sch = r->find("schema");
-                if (sch || t.json_schema.is_null()) t.json_schema = sch ? *sch : Value::object();
+                if (sch) t.json_schema = *sch; else if (t.json_schema.is_null() && t.grammar.empty()) t.json_object = true;
             } else if (type == "json_schema") {
                 const Value* w = r->find("json_schema");
                 if (w && w->is_object()) { const Value* sch = w->find("schema"); t.json_schema = sch ? *sch : Value::object(); }
@@ -393,6 +406,24 @@ Task App::parse_task(const Value& body, Kind kind) {
         t.think_start = co.think_start;
         t.think_end = co.think_end;
         t.stops.insert(t.stops.end(), co.additional_stops.begin(), co.additional_stops.end());
+        t.tool_fmt = co.tool_format;
+        if (has_tools) {
+            t.tools = *tools;
+            t.parse_tools = tool_choice != "none";
+            if (t.parse_tools && t.grammar.empty() && t.json_schema.is_null() && !t.json_object) {
+                grammar::ToolGrammarOptions go;
+                go.format = co.tool_format;
+                go.forced_name = forced_name;
+                go.parallel = ci.parallel_tool_calls;
+                go.thinking_forced_open = co.thinking_open;
+                go.think_end = co.think_end;
+                try {
+                    grammar::ToolGrammar tg = grammar::tool_call_grammar(*tools, go);
+                    if (tool_choice == "required") t.grammar = tg.gbnf;
+                    else if (!tg.trigger_words.empty() && !tg.gbnf_lazy.empty()) { t.grammar = tg.gbnf_lazy; t.grammar_lazy = true; t.trigger_words = tg.trigger_words; }
+                } catch (const std::exception& e) { throw_error(400, std::string("tool grammar: ") + e.what()); }
+            }
+        }
         if (b.boolean("logprobs", false)) {
             if (has_tools && t.stream) throw_error(400, "logprobs is not supported with tools + stream");
             t.n_probs = b.integer("top_logprobs", 20);
@@ -405,7 +436,29 @@ Task App::parse_task(const Value& body, Kind kind) {
         if (const Value* lp = b.g("logprobs"); lp && lp->is_number()) t.n_probs = (int)lp->as_int();
         t.n_choices = std::max(1, b.integer("n", 1));
     }
+    finalize_constraints(t);
     return t;
+}
+
+void App::finalize_constraints(Task& t) {
+    try {
+        if (t.grammar.empty() && t.json_object) t.grammar = grammar::json_object_grammar();
+        else if (t.grammar.empty() && !t.json_schema.is_null()) t.grammar = grammar::json_schema_to_grammar(t.json_schema);
+        if (!t.grammar.empty()) (void)grammar::Grammar::parse(t.grammar);  // validate now: bad grammars are a 400, not a mid-stream failure
+    } catch (const std::exception& e) {
+        throw_error(400, std::string("Failed to parse grammar: ") + e.what());
+    }
+}
+
+std::shared_ptr<grammar::Matcher> App::get_matcher(const std::string& gbnf) {
+    std::lock_guard<std::mutex> lk(gm_);
+    auto it = matchers_.find(gbnf);
+    if (it != matchers_.end()) return it->second;
+    if (!vocab_) vocab_ = grammar::vocab_from_tokenizer(tok, stop_ids);
+    if (matchers_.size() >= 16) matchers_.clear();
+    auto m = std::make_shared<grammar::Matcher>(grammar::Grammar::parse(gbnf), vocab_);
+    matchers_[gbnf] = m;
+    return m;
 }
 
 // ------------------------------------------------------------------------------------------------ generation
@@ -485,6 +538,13 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
 
         {
             Sampler sampler(t.sp, t.prompt);
+            const bool constrained = !t.grammar.empty();
+            if (constrained) {
+                grammar::Triggers trig;
+                trig.words = t.trigger_words;
+                sampler.set_mask(std::make_shared<grammar::GrammarLogitMask>(grammar::GrammarState(get_matcher(t.grammar), trig)));
+            }
+            const bool argmax_ok = t.sp.engine_argmax_ok() && !constrained;  // constrained requests sample on host logits
             sampler.want_post_ = t.post_probs && t.n_probs > 0;
             Tokenizer::Decoder dec(tok);
             std::string pending;      // decoded text not yet emitted (held back for stop-string / utf-8)
@@ -492,17 +552,17 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
             std::vector<int> lookahead;
             size_t la = 0;
             const bool want_probs = t.n_probs > 0;
-            const bool use_chunk = o.mtp && t.sp.engine_argmax_ok() && !want_probs;
+            const bool use_chunk = o.mtp && argmax_ok && !want_probs;
             Chunk ck;
             bool hit_stop_word = false;
             const int budget = t.n_predict;  // <0: unlimited
             auto td0 = now();
             auto pick = [&](TokProb& tp, bool& have_tp) -> int {
                 have_tp = false;
-                if (t.sp.engine_argmax_ok() && !want_probs) return eng->argmax();
+                if (argmax_ok && !want_probs) return eng->argmax();
                 eng->logits(lg);
                 if (want_probs) raw = lg;
-                int tkn = t.sp.engine_argmax_ok() ? (int)(std::max_element(lg.begin(), lg.end()) - lg.begin()) : sampler.sample(lg);
+                int tkn = argmax_ok ? (int)(std::max_element(lg.begin(), lg.end()) - lg.begin()) : sampler.sample(lg);
                 if (want_probs) {
                     have_tp = true;
                     tp.id = tkn;

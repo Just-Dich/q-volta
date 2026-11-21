@@ -5,11 +5,10 @@ for differential testing). Goal: a client written for llama-server (curl, OpenAI
 works unchanged against `qv_server`. Status values: **implemented** (same behaviour, verified), **partial** (works, with the stated limit),
 **n/a** (accepted/answered, no effect for Q-Volta, reason given), **unsupported** (refused explicitly).
 
-Integration status of the two sibling libraries (branch `p15/jinja`): the Jinja interpreter (`src/jinja`) and the GBNF / JSON-schema
-constrained sampler (`src/grammar`) had **not landed on `autoresearch/q-volta-gen1`** when this was written, so:
-`tools` / `tool_choice`, custom chat templates, `grammar`, `json_schema` and `response_format: json_object|json_schema` are **not enforced yet**
-(tools and custom templates are rejected with a 400/startup error; grammar-type constraints are parsed but ignored, which is stated here rather than hidden).
-The interfaces are in place: `src/server/chat_render.h` (template front end) and `qv::LogitsConstraint` in `src/sampling/sampler.h` (grammar hook).
+Jinja interpreter (`src/jinja`, docs/JINJA.md) and GBNF / JSON-schema grammar sampler (`src/grammar`, docs/GRAMMAR.md) are integrated: chat templates are evaluated by
+`qv::chat::ChatTemplate` (the model's `chat_template.jinja`, `--chat-template`, `--chat-template-file`; the native Qwen3.8 renderer is only the fallback if the model's own template
+fails to evaluate and no tools were requested), `tools` / `tool_choice` / `parallel_tool_calls` produce OpenAI `tool_calls` (also as streaming deltas), and `grammar`, `json_schema`,
+`response_format`, forced `tool_choice` and `--grammar/--json-schema` constrain sampling on host logits (the engine-argmax fast path and MTP lookahead are skipped for constrained requests).
 
 ## 1. Endpoints
 
@@ -24,11 +23,11 @@ The interfaces are in place: `src/server/chat_render.h` (template front end) and
 | `GET /models`, `GET /v1/models` | implemented | llama's merged shape (`models[]` Ollama-style + `data[]` OpenAI-style). `meta.n_params` is 0 (not read from the container) |
 | `POST /completion`, `/completions` | implemented | see section 2 |
 | `POST /v1/completions` | implemented | llama's shape: `chatcmpl-` ids, `logprobs: {"content":[...]}` (not the legacy OpenAI arrays), `timings` |
-| `POST /chat/completions`, `/v1/chat/completions` | partial | multi-part text content, `max_tokens`/`max_completion_tokens`, `stream_options.include_usage`, `logprobs`/`top_logprobs`, `n` (sequential generations, not concurrent), `reasoning_format`, `chat_template_kwargs`, `reasoning_effort`, all llama sampling extras. **Not yet**: tools / tool_choice / parallel_tool_calls (need src/jinja), `response_format` json constraints (need src/grammar), image/audio parts (error 500 like llama without mmproj) |
+| `POST /chat/completions`, `/v1/chat/completions` | implemented | multi-part text content, `max_tokens`/`max_completion_tokens`, `stream_options.include_usage`, `logprobs`/`top_logprobs`, `n` (sequential generations, not concurrent), `reasoning_format`, `chat_template_kwargs`, `reasoning_effort`, all llama sampling extras, **tools / `tool_choice` (auto = lazy grammar, `required`/function = grammar) / `parallel_tool_calls`**, tool-call history messages, `tool_calls` streaming deltas, `response_format` (`json_object`, `json_schema`), `grammar`, `json_schema`. Image/audio parts: error 500 like llama without mmproj |
 | `POST /infill` | implemented | llama's FIM prompt layout (repo/file separators, 3:1 prefix:suffix budget); uses the Qwen `<|fim_*|>` tokens, 501 with llama's message if the vocabulary has none |
 | `POST /tokenize` | implemented | `with_pieces`, `parse_special`; `add_special` accepted (Qwen tokenizers add no BOS/EOS so it has no effect) |
 | `POST /detokenize` | implemented | |
-| `POST /apply-template` | implemented | same renderer as chat completions |
+| `POST /apply-template` | implemented | same renderer as chat completions, including `tools` and tool-call history |
 | `POST /chat/completions/input_tokens`, `/v1/...` | implemented | `{"input_tokens":N,"object":"response.input_tokens"}` |
 | `GET /lora-adapters`, `POST /lora-adapters` | partial | no runtime LoRA: GET returns `[]`, POST of `[]` returns `{"success":true}`, non-empty -> 400 (adapters are merged at conversion time) |
 | `POST /embedding`, `/embeddings`, `/v1/embeddings` | n/a | 501 `not_supported_error` with llama's message (the engines do not expose a pooled hidden state) |
@@ -59,7 +58,7 @@ Accepted request fields: `prompt` (string, token array, mixed strings+tokens, `{
 (`max_tokens`), `stream`, `stop`, `cache_prompt`, `id_slot`, `return_tokens`, `timings_per_token`, `post_sampling_probs`, `n_probs`, `n_keep`, `response_fields`,
 `temperature`, `top_k`, `top_p`, `min_p`, `typical_p`, `top_n_sigma`, `xtc_probability`, `xtc_threshold`, `repeat_penalty` (`repetition_penalty`), `repeat_last_n`, `presence_penalty`,
 `frequency_penalty`, `dry_*`, `dynatemp_range`, `dynatemp_exponent`, `mirostat` (1, 2), `mirostat_tau`, `mirostat_eta`, `seed`, `ignore_eos`, `logit_bias` (`[[id|"text", bias|false]]` or `{"id": bias}`),
-`samplers`, `min_keep`, `grammar`, `json_schema` (parsed, see status above). Unknown fields are ignored (as llama).
+`samplers`, `min_keep`, `grammar`, `json_schema` (enforced; `grammar` wins over `json_schema` on the native endpoints, the chat endpoint answers 500 `Cannot use both json_schema and grammar` like llama). Unknown fields are ignored (as llama).
 Response fields: `index, content, tokens, id_slot, stop, model, tokens_predicted, tokens_evaluated, generation_settings, prompt, has_new_line, truncated, stop_type (eos|word|limit|none), stopping_word, tokens_cached, timings{cache_n, prompt_n, prompt_ms, ...}, completion_probabilities`.
 Defaults are llama-server's (temperature 0.8, top_k 40, top_p 0.95, min_p 0.05, `n_predict` -1), **not** the Qwen generation_config values the old server used; set `--temp/--top-k/--top-p` (or `LLAMA_ARG_*`) for model-recommended sampling.
 The sampler chain, sampler order and the final draw follow `common_sampler` / `llama_sampler_dist` (mt19937 + `uniform_real_distribution<double>`); identical probabilities + identical seed give identical draws, but the logits themselves come from a different model/runtime, so seeded texts are not comparable across servers.
@@ -82,7 +81,9 @@ True concurrent multi-slot decoding (batched sequences) needs per-slot recurrent
 |---|---|---|
 | `Server` header | `qv_server` instead of `llama.cpp` | not impersonating another product |
 | Thinking | `reasoning_content` appears for the Qwen3.8 template (its generation prompt opens `<think>`); llama + Qwen2.5 template has no thinking | model/template, same `reasoning_format` semantics (`auto`=deepseek) |
-| Tool calls, grammar, JSON mode | not enforced yet | waiting for src/jinja and src/grammar to land (see top) |
+| Tool-call wire format | the Qwen3.8 template makes the model emit `<tool_call><function=..><parameter=..>` (QwenXml); llama-server + Qwen2.5 uses Hermes JSON. The OpenAI `tool_calls` output has the same shape; the model-specific text format follows the loaded model's template | model/template |
+| Grammar speed | allowed-token masks are cached per grammar state; first use of a new state costs one trie walk over the 248K-token vocabulary (docs/GRAMMAR.md) | different implementation |
+| `--reasoning-budget N>0`, grammar for `<think>` text | not enforced | |
 | Slot concurrency | one decoding sequence | engine design, see section 4 |
 | `/slots` save/restore | token-list files, restore = re-prefill | no KV snapshot API in the engines |
 | `meta.n_params`, `model_ftype` | 0 / `Q-Volta` | not recorded in the `.qv` header |
@@ -95,7 +96,7 @@ True concurrent multi-slot decoding (batched sequences) needs per-slot recurrent
 
 Every flag of `llama-server --help` (llama.cpp 9d6f04f, 266 entries, generated into `src/server/llama_flags.inc`) is parsed with its own argument arity, so an unsupported flag never swallows or leaks the next argument. Environment variables (`LLAMA_ARG_*`, `LLAMA_API_KEY`) are read for every flag that has one; the command line wins. Boolean env values `1/on/true/enabled` set, `0/off/false/disabled` unset (the `--no-X` spelling).
 
-Counts: **45 implemented, 22 partial, 192 accepted-and-ignored (n/a), 7 refuse-to-start (unsupported)**.
+Counts: **51 implemented, 20 partial, 188 accepted-and-ignored (n/a), 7 refuse-to-start (unsupported)**.
 
 Not in llama-server (Q-Volta flags): `--backend cuda|cpu|auto|mock`, `--kv fp32|fp16|int4`, `--kv4-kmode`, `--mtp`, `--mtp-depth N`, `--prefill-chunk N`, `--tokenizer PATH`, `--max-queue N`, `--model-name` (= `-a`), `--max-ctx` (= `-c`), `--http-threads` (= `--threads-http`), `--quiet` (= `--log-disable`), `--default-max-tokens` (= `-n`), mock-engine flags `--mock-text/--mock-loop/--mock-delay-us`. Legacy llama spellings `--mlock/--no-mmap/--mmap` are accepted.
 
@@ -221,10 +222,10 @@ Not in llama-server (Q-Volta flags): `--backend cuda|cpu|auto|mock`, `--kv fp32|
 | `--mirostat-lr` `N` |  | implemented |  |
 | `--mirostat-ent` `N` |  | implemented |  |
 | `-l`, `--logit-bias` `TOKEN_ID(+/-)BIAS` |  | implemented | `TOKEN_ID(+/-)BIAS` |
-| `--grammar` `GRAMMAR` |  | n/a | accepted; `grammar` / `json_schema` / `response_format` constraints are enforced only once src/grammar (branch p15/jinja) is integrated; until then requests carrying them are answered without the constraint -- see the status line at the top of this file |
-| `--grammar-file` `FNAME` |  | n/a | accepted; `grammar` / `json_schema` / `response_format` constraints are enforced only once src/grammar (branch p15/jinja) is integrated; until then requests carrying them are answered without the constraint -- see the status line at the top of this file |
-| `-j`, `--json-schema` `SCHEMA` |  | n/a | accepted; `grammar` / `json_schema` / `response_format` constraints are enforced only once src/grammar (branch p15/jinja) is integrated; until then requests carrying them are answered without the constraint -- see the status line at the top of this file |
-| `-jf`, `--json-schema-file` `FILE` |  | n/a | accepted; `grammar` / `json_schema` / `response_format` constraints are enforced only once src/grammar (branch p15/jinja) is integrated; until then requests carrying them are answered without the constraint -- see the status line at the top of this file |
+| `--grammar` `GRAMMAR` |  | implemented | src/grammar; host-logit sampling |
+| `--grammar-file` `FNAME` |  | implemented |  |
+| `-j`, `--json-schema` `SCHEMA` |  | implemented | converted to GBNF |
+| `-jf`, `--json-schema-file` `FILE` |  | implemented |  |
 | `-bs`, `--backend-sampling` | `LLAMA_ARG_BACKEND_SAMPLING` | n/a | accepted, no effect |
 
 ### speculative params
@@ -355,15 +356,15 @@ Not in llama-server (Q-Volta flags): `--backend cuda|cpu|auto|mock`, `--kv fp32|
 | `--models-max` `N` | `LLAMA_ARG_MODELS_MAX` | n/a | router mode is not supported |
 | `--models-memory-margin` `N` | `LLAMA_ARG_MODELS_MEMORY_MARGIN` | n/a | router mode is not supported |
 | `--models-autoload`, `--no-models-autoload` | `LLAMA_ARG_MODELS_AUTOLOAD` | n/a | router mode is not supported |
-| `--jinja`, `--no-jinja` | `LLAMA_ARG_JINJA` | partial | the built-in Qwen3.8 renderer (verified against HF apply_chat_template) is always used; arbitrary Jinja templates and `tools` need the Jinja interpreter (branch p15/jinja, not integrated yet) |
+| `--jinja`, `--no-jinja` | `LLAMA_ARG_JINJA` | implemented | Jinja interpreter (src/jinja) evaluates the model's chat template; `--no-jinja` selects the native Qwen3.8 renderer (no tools) |
 | `--reasoning-format` `FORMAT` | `LLAMA_ARG_THINK` | implemented | `auto` (=deepseek), `none`, `deepseek`, `deepseek-legacy`; legacy spelling `separate` accepted |
 | `-rea`, `--reasoning` `[on\|off\|auto]` | `LLAMA_ARG_REASONING` | partial | `off` -> `enable_thinking=false`; `on`/`auto` -> template default |
 | `--reasoning-effort` `LEVEL` | `LLAMA_ARG_REASONING_EFFORT` | implemented | passed to the Qwen3.8 template (`low\|medium\|xhigh`; OpenAI `high` -> `xhigh`, `minimal` -> `low`) |
 | `--reasoning-budget` `N` | `LLAMA_ARG_THINK_BUDGET` | partial | only `0` (thinking off) is honoured; positive budgets are not enforced |
 | `--reasoning-budget-message` `MESSAGE` | `LLAMA_ARG_THINK_BUDGET_MESSAGE` | n/a | accepted for compatibility, no effect in qv_server |
 | `--reasoning-preserve`, `--no-reasoning-preserve` | `LLAMA_ARG_REASONING_PRESERVE` | n/a | accepted, no effect |
-| `--chat-template` `JINJA_TEMPLATE` | `LLAMA_ARG_CHAT_TEMPLATE` | partial | only `chatml` (built-in) and the model's own Qwen3.8 template; custom Jinja strings are refused at startup until src/jinja is integrated |
-| `--chat-template-file` `JINJA_TEMPLATE_FILE` | `LLAMA_ARG_CHAT_TEMPLATE_FILE` | partial | same limitation as `--chat-template` |
+| `--chat-template` `JINJA_TEMPLATE` | `LLAMA_ARG_CHAT_TEMPLATE` | partial | `chatml` or a template text (Jinja source); other llama built-in names (llama3, mistral-v7, ...) are refused at startup |
+| `--chat-template-file` `JINJA_TEMPLATE_FILE` | `LLAMA_ARG_CHAT_TEMPLATE_FILE` | implemented | Jinja template file |
 | `--skip-chat-parsing`, `--no-skip-chat-parsing` | `LLAMA_ARG_SKIP_CHAT_PARSING` | n/a | accepted, no effect |
 | `--prefill-assistant`, `--no-prefill-assistant` | `LLAMA_ARG_PREFILL_ASSISTANT` | n/a | accepted, no effect |
 | `-sps`, `--slot-prompt-similarity` `SIMILARITY` |  | n/a | llama.cpp KV/checkpoint management; Q-Volta keeps one prompt-prefix cache |

@@ -5,8 +5,9 @@
 `/apply-template`, `/props`, `/slots`, `/metrics`, `/health` (503 while loading), `/v1/models`, SSE streaming. Every endpoint and flag with its
 status (implemented / partial / n/a / unsupported) is in [SERVER_COMPAT.md](SERVER_COMPAT.md). Plain C++20 on POSIX sockets, no third-party dependencies.
 
-Not yet available (stated, not hidden): tool calling, custom Jinja templates and grammar / JSON-schema constraints wait for the `src/jinja` / `src/grammar`
-libraries (branch p15/jinja); embeddings, vision, runtime LoRA are unsupported. Generation is serialized: `--parallel N` reports N logical slots, requests queue FIFO.
+Chat templates run through the Jinja interpreter (`src/jinja`): the model's own `chat_template.jinja`, `--chat-template chatml|TEXT`, `--chat-template-file`. Tools (`tools`, `tool_choice`,
+`parallel_tool_calls`, tool-call history) produce OpenAI `tool_calls`, also as streaming deltas; `grammar`, `json_schema`, `response_format` and forced tool choices are enforced by the GBNF sampler (`src/grammar`)
+on host logits. Still unavailable: embeddings, vision, runtime LoRA. Generation is serialized: `--parallel N` reports N logical slots, requests queue FIFO.
 
 ## Build
 
@@ -27,6 +28,16 @@ The `mock` backend (scripted tokens, `--mock-text`) is for tests and needs no we
 
 Thinking: the Qwen3.8 template opens `<think>`; with `--reasoning-format auto` (= deepseek) the thinking text is returned as `reasoning_content`.
 Disable with `"chat_template_kwargs":{"enable_thinking":false}` or `--reasoning off`.
+
+## Tools, grammar, JSON mode
+
+    curl -s localhost:9931/v1/chat/completions -d '{"messages":[{"role":"user","content":"Weather in Paris?"}],
+      "tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],
+      "chat_template_kwargs":{"enable_thinking":false}}'
+    curl -s localhost:9931/completion -d '{"prompt":"Answer: ","grammar":"root ::= \"yes\" | \"no\""}'
+    curl -s localhost:9931/v1/chat/completions -d '{"messages":[...],"response_format":{"type":"json_object"}}'
+
+`tool_choice` auto uses a lazy grammar (unconstrained text until the tool-call marker appears), `required` / a named function constrain the whole answer. Constrained requests skip the engine argmax and MTP fast paths.
 
 ## Slots and queueing
 

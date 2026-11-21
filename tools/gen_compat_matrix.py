@@ -26,9 +26,9 @@ S = {
     "parallel": (P, "N logical slots reported by `/slots`/`/props`; the engine holds ONE sequence, requests are served FIFO (queued, not rejected). True concurrent decoding is a future engine feature"),
     "cont-batching": (N, "accepted; single-sequence engine"),
     "cache-prompt": (I, "prefix reuse of the engine state (see docs/SERVER.md for the recurrent-state limits)"),
-    "jinja": (P, "the built-in Qwen3.8 renderer (verified against HF apply_chat_template) is always used; arbitrary Jinja templates and `tools` need the Jinja interpreter (branch p15/jinja, not integrated yet)"),
-    "chat-template": (P, "only `chatml` (built-in) and the model's own Qwen3.8 template; custom Jinja strings are refused at startup until src/jinja is integrated"),
-    "chat-template-file": (P, "same limitation as `--chat-template`"),
+    "jinja": (I, "Jinja interpreter (src/jinja) evaluates the model's chat template; `--no-jinja` selects the native Qwen3.8 renderer (no tools)"),
+    "chat-template": (P, "`chatml` or a template text (Jinja source); other llama built-in names (llama3, mistral-v7, ...) are refused at startup"),
+    "chat-template-file": (I, "Jinja template file"),
     "chat-template-kwargs": (I, "merged under per-request `chat_template_kwargs`; `enable_thinking`, `reasoning_effort`, `preserve_thinking` are honoured by the Qwen3.8 template"),
     "reasoning-format": (I, "`auto` (=deepseek), `none`, `deepseek`, `deepseek-legacy`; legacy spelling `separate` accepted"),
     "reasoning": (P, "`off` -> `enable_thinking=false`; `on`/`auto` -> template default"),
@@ -48,7 +48,7 @@ S = {
     "seed": (I, "same mt19937 + uniform_real_distribution draw as llama_sampler_dist"),
     "samplers": (I, "`;`-separated; same sampler names as llama (`penalties;dry;top_n_sigma;top_k;typ_p;top_p;min_p;xtc;temperature`)"),
     "ignore-eos": (I, ""), "logit-bias": (I, "`TOKEN_ID(+/-)BIAS`"), "min-keep": (I, ""),
-    "grammar": (N, "STATUS_GRAMMAR"), "grammar-file": (N, "STATUS_GRAMMAR"), "json-schema": (N, "STATUS_GRAMMAR"), "json-schema-file": (N, "STATUS_GRAMMAR"),
+    "grammar": (I, "src/grammar; host-logit sampling"), "grammar-file": (I, ""), "json-schema": (I, "converted to GBNF"), "json-schema-file": (I, ""),
     "timeout": (I, "socket read/write timeout"),
     "path": (P, "serves static files from the directory; there is no embedded web UI"),
     "ui": (P, "no embedded web UI exists; `--no-webui` is a no-op"),
@@ -81,7 +81,7 @@ RULES = [  # (regex on canonical name, status, note)
     (r"^(log-|verbosity|log)", N, "logging format flags are accepted and ignored"),
     (r"^(pooling|embd-normalize|rerank|reranking)", N, "embeddings / reranking are not supported"),
     (r"^(adaptive|backend-sampling|sampler-seq|sleep-idle|lora-init|log-prompts|reuse-port|skip-chat|prefill-assistant|reasoning-preserve|keep|lookup)", N, "accepted, no effect"),
-    (r"^(grammar|json-schema)", N, "STATUS_GRAMMAR"),
+    
     (r"^(reverse-prompt|spm-infill|input-prefix)", N, "accepted, no effect"),
 ]
 GRAMMAR = ("accepted; `grammar` / `json_schema` / `response_format` constraints are enforced only once src/grammar (branch p15/jinja) is integrated; until then requests carrying them are answered without the constraint -- see the status line at the top of this file")

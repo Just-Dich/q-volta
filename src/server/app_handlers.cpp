@@ -3,6 +3,7 @@
 #include <random>
 
 #include "server/app.h"
+#include "jinja/chat.h"
 
 namespace qv::server {
 
@@ -18,57 +19,29 @@ std::string rand_alnum(int n) {
     return s;
 }
 
-// Splits "<reasoning></think>answer" model output into reasoning_content / content (deepseek reasoning format).
-class ReasoningSplitter {
-   public:
-    ReasoningSplitter(bool in_reasoning, std::string start, std::string end) : in_(in_reasoning), started_(in_reasoning), start_(std::move(start)), end_(std::move(end)) {}
-    void feed(const std::string& t, std::string& reasoning, std::string& content, bool final_) {
-        std::string buf = hold_ + t;
-        hold_.clear();
-        for (;;) {
-            if (in_) {
-                if (lead_r_) {
-                    size_t b = buf.find_first_not_of('\n');
-                    buf.erase(0, b == std::string::npos ? buf.size() : b);
-                    if (!buf.empty()) lead_r_ = false;
-                }
-                size_t p = buf.find(end_);
-                if (p != std::string::npos) {
-                    reasoning += buf.substr(0, p);
-                    buf.erase(0, p + end_.size());
-                    in_ = false;
-                    lead_ = true;
-                    continue;
-                }
-                size_t keep = 0;
-                if (!final_)
-                    for (size_t k = std::min(buf.size(), end_.size() - 1); k > 0; --k)
-                        if (buf.compare(buf.size() - k, k, end_, 0, k) == 0) { keep = k; break; }
-                reasoning += buf.substr(0, buf.size() - keep);
-                hold_ = buf.substr(buf.size() - keep);
-                return;
-            }
-            if (!started_) {
-                size_t b = buf.find_first_not_of(" \n\t");
-                std::string rest = b == std::string::npos ? "" : buf.substr(b);
-                if (rest.compare(0, start_.size(), start_) == 0 && rest.size() >= start_.size()) { buf = rest.substr(start_.size()); in_ = true; started_ = true; lead_r_ = true; continue; }
-                if (!final_ && start_.compare(0, rest.size(), rest) == 0) { hold_ = buf; return; }  // could still become the start tag
-                started_ = true;
-            }
-            if (lead_) {
-                size_t b = buf.find_first_not_of('\n');
-                buf.erase(0, b == std::string::npos ? buf.size() : b);
-                if (!buf.empty()) lead_ = false;
-            }
-            content += buf;
-            return;
-        }
-    }
+// Chat output post-processing (src/jinja chat parser): reasoning extraction + tool calls, complete and streaming.
+chat::ParseParams parse_params_of(const Task& t) {
+    chat::ParseParams p;
+    p.format = t.tool_fmt;
+    p.reasoning = t.reasoning_format == "none" ? chat::ReasoningFormat::None : t.reasoning_format == "deepseek-legacy" ? chat::ReasoningFormat::DeepseekLegacy : chat::ReasoningFormat::Deepseek;
+    p.thinking_forced_open = t.thinking_open;
+    p.parse_tool_calls = t.parse_tools;
+    p.think_start = t.think_start;
+    p.think_end = t.think_end;
+    p.tools = t.tools.is_array() ? &t.tools : nullptr;
+    return p;
+}
 
-   private:
-    bool in_, started_, lead_ = false, lead_r_ = false;
-    std::string start_, end_, hold_;
-};
+Value tool_delta_json(const chat::ToolCallDelta& d, const std::string& id) {
+    Value tc = Value::object();
+    tc.set("index", (long long)d.index);
+    if (d.is_new) { tc.set("id", id); tc.set("type", "function"); }
+    Value f = Value::object();
+    if (d.is_new) f.set("name", d.name);
+    f.set("arguments", d.arguments);
+    tc.set("function", std::move(f));
+    return tc;
+}
 
 }  // namespace
 
@@ -116,7 +89,6 @@ void App::handle_completion(const http::Request& req, http::Conn& c, Kind kind) 
     const long long created = (long long)std::time(nullptr);
     const std::string fp = build_info;
     auto alive = [&] { return !c.peer_closed(); };
-    const bool split = chat && base.reasoning_format != "none";
 
     auto timings_of = [&](const GenResult& r) { return timings_json(r); };
     auto base_chunk = [&](const char* object) {
@@ -179,7 +151,11 @@ void App::handle_completion(const http::Request& req, http::Conn& c, Kind kind) 
         for (int ci = 0; ci < (oai ? base.n_choices : 1) && ok; ++ci) {
             Task tc = t;
             if (ci > 0 && tc.sp.has_seed) tc.sp.seed += ci;
-            ReasoningSplitter rs(t.thinking_open, t.think_start, t.think_end);
+            const chat::ParseParams pp = parse_params_of(tc);
+            chat::Message prev_msg;
+            std::string acc;
+            std::vector<std::string> tc_ids;
+            bool any_tool = false;
             bool first = true;
             auto role_chunk = [&] {
                 Value o2 = base_chunk("chat.completion.chunk");
@@ -192,6 +168,27 @@ void App::handle_completion(const http::Request& req, http::Conn& c, Kind kind) 
                 ch.set("delta", std::move(d));
                 o2.set("choices", Value::array()).push(std::move(ch));
                 return o2;
+            };
+            auto emit_delta = [&](const chat::Delta& dl, const std::vector<TokProb>& probs) {
+                Value o2 = base_chunk("chat.completion.chunk");
+                Value d = Value::object();
+                if (!dl.reasoning.empty()) d.set("reasoning_content", dl.reasoning);
+                if (!dl.content.empty() || (dl.reasoning.empty() && dl.tool_calls.empty())) d.set("content", dl.content);
+                if (!dl.tool_calls.empty()) {
+                    Value arr = Value::array();
+                    for (auto& td : dl.tool_calls) {
+                        if (td.is_new) { while (tc_ids.size() <= td.index) tc_ids.push_back(chat::gen_tool_call_id()); any_tool = true; }
+                        arr.push(tool_delta_json(td, td.index < tc_ids.size() ? tc_ids[td.index] : std::string()));
+                    }
+                    d.set("tool_calls", std::move(arr));
+                }
+                Value ch = Value::object();
+                ch.set("finish_reason", Value());
+                ch.set("index", ci);
+                ch.set("delta", std::move(d));
+                if (!probs.empty()) { Value lp = Value::object(); lp.set("content", probs_json(probs, t.post_probs)); ch.set("logprobs", std::move(lp)); }
+                o2.set("choices", Value::array()).push(std::move(ch));
+                return sse(o2);
             };
             auto on_chunk = [&](const Chunk& ck) {
                 if (!ok) return false;
@@ -208,21 +205,14 @@ void App::handle_completion(const http::Request& req, http::Conn& c, Kind kind) 
                     return sse(o2);
                 }
                 if (chat) {
-                    std::string rr, cc;
-                    if (split) rs.feed(ck.text, rr, cc, false); else cc = ck.text;
                     if (first) { first = false; if (!sse(role_chunk())) return false; }
-                    if (rr.empty() && cc.empty() && ck.probs.empty()) return true;
-                    Value o2 = base_chunk("chat.completion.chunk");
-                    Value d = Value::object();
-                    if (!rr.empty()) d.set("reasoning_content", rr);
-                    if (!cc.empty() || rr.empty()) d.set("content", cc);
-                    Value ch = Value::object();
-                    ch.set("finish_reason", Value());
-                    ch.set("index", ci);
-                    ch.set("delta", std::move(d));
-                    if (!ck.probs.empty()) { Value lp = Value::object(); lp.set("content", probs_json(ck.probs, t.post_probs)); ch.set("logprobs", std::move(lp)); }
-                    o2.set("choices", Value::array()).push(std::move(ch));
-                    return sse(o2);
+                    acc += ck.text;
+                    chat::ParseParams q = pp; q.partial = true;
+                    chat::Message cur = chat::parse_output(acc, q);
+                    chat::Delta dl = chat::diff_messages(prev_msg, cur);
+                    prev_msg = std::move(cur);
+                    if (dl.empty() && ck.probs.empty()) return true;
+                    return emit_delta(dl, ck.probs);
                 }
                 Value o2 = base_chunk("text_completion");
                 Value ch = Value::object();
@@ -237,21 +227,12 @@ void App::handle_completion(const http::Request& req, http::Conn& c, Kind kind) 
             if (r.aborted) { c.close_after = true; return; }
             begin(0);
             if (chat && first) { first = false; sse(role_chunk()); }
-            if (chat && split) {  // flush text held back by the splitter
-                std::string rr, cc;
-                rs.feed("", rr, cc, true);
-                if (!rr.empty() || !cc.empty()) {
-                    Value o2 = base_chunk("chat.completion.chunk");
-                    Value d = Value::object();
-                    if (!rr.empty()) d.set("reasoning_content", rr);
-                    if (!cc.empty() || rr.empty()) d.set("content", cc);
-                    Value ch = Value::object();
-                    ch.set("finish_reason", Value());
-                    ch.set("index", ci);
-                    ch.set("delta", std::move(d));
-                    o2.set("choices", Value::array()).push(std::move(ch));
-                    sse(o2);
-                }
+            if (chat) {  // release text held back by the parser
+                chat::ParseParams q = pp; q.partial = true; q.flush = true;
+                chat::Message cur = chat::parse_output(acc, q);
+                chat::Delta dl = chat::diff_messages(prev_msg, cur);
+                prev_msg = std::move(cur);
+                if (!dl.empty()) emit_delta(dl, {});
             }
             tot_dec += r.n_decoded;
             tot_cache = r.n_cache;
@@ -262,7 +243,7 @@ void App::handle_completion(const http::Request& req, http::Conn& c, Kind kind) 
             } else if (chat) {
                 Value o2 = base_chunk("chat.completion.chunk");
                 Value ch = Value::object();
-                ch.set("finish_reason", finish_reason_of(r));
+                ch.set("finish_reason", !prev_msg.tool_calls.empty() ? "tool_calls" : finish_reason_of(r));
                 ch.set("index", ci);
                 ch.set("delta", Value::object());
                 o2.set("choices", Value::array()).push(std::move(ch));
@@ -319,18 +300,10 @@ void App::handle_completion(const http::Request& req, http::Conn& c, Kind kind) 
             tot_dec += r.n_decoded;
             Value ch = Value::object();
             if (chat) {
-                std::string reasoning, content = r.content;
-                if (split) {
-                    ReasoningSplitter rsp(t.thinking_open, t.think_start, t.think_end);
-                    content.clear();
-                    rsp.feed(r.content, reasoning, content, true);
-                    if (base.reasoning_format == "deepseek-legacy") content = (t.thinking_open ? t.think_start + "\n" : "") + r.content;
-                }
-                Value m = Value::object();
-                m.set("role", "assistant");
-                m.set("content", content);
-                if (!reasoning.empty()) m.set("reasoning_content", reasoning);
-                ch.set("finish_reason", finish_reason_of(r));
+                chat::Message pm = chat::parse_output(r.content, parse_params_of(t));
+                Value m = chat::message_to_json(pm, true);
+                if (pm.content.empty() && !pm.tool_calls.empty()) m.set("content", std::string());  // llama-server: "" (not null) next to tool_calls
+                ch.set("finish_reason", !pm.tool_calls.empty() ? "tool_calls" : finish_reason_of(r));
                 ch.set("index", (int)ci);
                 ch.set("message", std::move(m));
                 if (!r.probs.empty()) { Value lp = Value::object(); lp.set("content", probs_json(r.probs, t.post_probs)); ch.set("logprobs", std::move(lp)); }
