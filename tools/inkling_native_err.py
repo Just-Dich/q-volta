@@ -16,7 +16,6 @@ cfgs = [(3, 128), (4, 128), (4, 64), (4, 32), (5, 64), (5, 32), (5, 16), (6, 64)
 res = {}
 for L in (int(x) for x in a.layers.split(",")):
     w13, w2 = K.dequant_experts(f, L, 0, a.experts, "cuda")
-    W = torch.cat([w13.to(torch.bfloat16).float().reshape(-1, K.H), w2.to(torch.bfloat16).float().reshape(-1, K.FF)[: 0]], 0)
     r = {}
     for name, M_ in (("w13", w13), ("w2", w2)):
         M_ = M_.to(torch.bfloat16).float().reshape(-1, M_.shape[-1])

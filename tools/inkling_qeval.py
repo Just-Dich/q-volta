@@ -35,11 +35,16 @@ class Proxy:
 
 
 class QInkling(Inkling):
-    def __init__(self, d, qv=None, sim=None, **kw):
+    def __init__(self, d, qv=None, sim=None, sim_dense=None, dense_sel="embed,unembed,attn", **kw):
         super().__init__(d, **kw)
+        self.dsel = set(dense_sel.split(","))
+        self.sim_dense = sim_dense  # (bits, group): RTN+clip meta8 on the dense matrices of convert_inkling (embed, unembed, q/k/v/o/gate_attn)
         self.rd = F.Reader(qv) if qv else None
         self.sim = sim  # (bits, group, clip)
         self.qcache = {}
+        if self.sim_dense and "embed" in self.dsel:
+            e = self.s.f.get_slice("model.llm.embed.weight")[0:C.VOCAB].float()
+            self.s.f = Proxy(self.s.f, {"model.llm.embed.weight": self._sq(e)})
         if self.rd:
             self.s.f = Proxy(self.s.f, {"model.llm.embed.weight": self._dense("model.llm.embed.weight")})
 
@@ -57,12 +62,24 @@ class QInkling(Inkling):
             if name not in self.P:
                 self.P[name] = self._dense(name)
             return self.P[name]
+        if self.sim_dense and name not in self.P and "attn" in self.dsel and __import__("convert_inkling").QDENSE.search(name):
+            self.P[name] = self._sq(super().w(name))
+            return self.P[name]
         return super().w(name)
+
+    def _sq(self, W):
+        b, g = self.sim_dense
+        q, S, M, rs = Q.rtn(W.cuda(), b, g, clip=True, meta8=True)
+        return Q.dequant_g(q, S, M, g, b, rs).cpu()
 
     def unembed(self, hs):
         if self.rd:
             if "unembed" not in self.P:
                 self.P["unembed"] = self._dense("model.llm.unembed.weight")[:C.VOCAB]
+            return R.softcap(hs @ self.P["unembed"].T, C.LOGIT_CAP)
+        if self.sim_dense and "unembed" in self.dsel:
+            if "unembed" not in self.P:
+                self.P["unembed"] = self._sq(self.s.f.get_slice("model.llm.unembed.weight")[0:C.VOCAB].float())
             return R.softcap(hs @ self.P["unembed"].T, C.LOGIT_CAP)
         return super().unembed(hs)
 
@@ -149,7 +166,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=K.MODEL)
     ap.add_argument("--golden", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tests", "golden", "inkling"))
-    ap.add_argument("--qv"); ap.add_argument("--sim", help="bits:group:rtn[:clip]")
+    ap.add_argument("--qv"); ap.add_argument("--sim", help="bits:group:rtn[:clip]"); ap.add_argument("--dense-sel", default="embed,unembed,attn"); ap.add_argument("--sim-dense", help="bits:group, RTN+clip meta8 on embed/unembed/q/k/v/o/gate_attn")
     ap.add_argument("--tasks", default="p1,p2,p3,nll")
     ap.add_argument("--out", required=True); ap.add_argument("--label", default="")
     ap.add_argument("--threads", type=int, default=48); ap.add_argument("--cache-gb", type=float, default=30.0)
@@ -158,7 +175,7 @@ def main():
     sim = None
     if a.sim:
         x = a.sim.split(":"); sim = (int(x[0]), int(x[1]), "clip" in x[3:])
-    m = QInkling(a.model, qv=a.qv, sim=sim, expert_cache_gb=a.cache_gb, verbose=False)
+    m = QInkling(a.model, qv=a.qv, sim=sim, dense_sel=a.dense_sel, sim_dense=tuple(int(x) for x in a.sim_dense.split(':')) if a.sim_dense else None, expert_cache_gb=a.cache_gb, verbose=False)
     res = json.load(open(a.out)) if os.path.exists(a.out) else {}
     names = {"p1": "p1_en", "p2": "p2_code", "p3": "p3_multi", "p4": "p4_long4k"}
     for t in a.tasks.split(","):

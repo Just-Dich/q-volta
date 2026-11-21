@@ -1,0 +1,11 @@
+ref nll {"nll": 1.7561025619506836, "n": 511}
+ref val {"nll": 1.4478707313537598, "nll_wiki": 1.7536747455596924, "nll_code": 1.114746332168579, "n": 2047}
+q3 val {"nll": 1.4740971326828003, "nll_wiki": 1.7894302606582642, "nll_code": 1.1316580772399902, "n": 2047}
+Traceback (most recent call last):
+  File "/workspace/q-volta-wt/ink-conv/tools/inkling_native_err.py", line 19, in <module>
+    W = torch.cat([w13.to(torch.bfloat16).float().reshape(-1, K.H), w2.to(torch.bfloat16).float().reshape(-1, K.FF)[: 0]], 0)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: Sizes of tensors must match except in dimension 0. Expected size 2304 but got size 1152 for tensor number 1 in the list.
+Q3DELETED
+q4 val {"nll": 1.4635529518127441, "nll_wiki": 1.7781505584716797, "nll_code": 1.1207165718078613, "n": 2047}
+QUEUE2DONE

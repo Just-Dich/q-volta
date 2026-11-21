@@ -28,6 +28,8 @@ PROFILES = {
     "native": dict(expert="native", dense_bits=0),
     "q4": dict(expert="q", expert_bits=4, expert_group=128, method="gptq", dense_bits=4, dense_group=64),
     "q3": dict(expert="q", expert_bits=3, expert_group=128, method="gptq", dense_bits=4, dense_group=64),
+    # recommended: attention matrices at 5 bit (4-bit RTN on them costs +0.026 nats, see docs/INKLING_FORMAT.md), embed/unembed 4-bit
+    "q3a5": dict(expert="q", expert_bits=3, expert_group=128, method="gptq", dense_bits=4, dense_group=64, attn_bits=5),
 }
 QDENSE = re.compile(r"\.attn\.(wq_du|wk_dv|wv_dv|wo_ud|gate_attn)\.weight$")
 F16_MAT = re.compile(r"\.attn\.(wr_du|attn_sink_proj)\.weight$|\.mlp\.gate\.weight$|controllers\.|k_sconv\.weight_proj$|v_sconv\.weight_proj$")
@@ -249,7 +251,7 @@ def inkling_config(model_dir, args, prof):
         },
         "quant": {"profile": args.profile, "expert": prof.get("expert"), "expert_bits": prof.get("expert_bits"),
                   "expert_group": prof.get("expert_group"), "method": prof.get("method"), "prior": args.prior,
-                  "dense_bits": prof.get("dense_bits"), "dense_group": prof.get("dense_group"), "meta": "s8z8",
+                  "dense_bits": prof.get("dense_bits"), "attn_bits": prof.get("attn_bits", prof.get("dense_bits")), "dense_group": prof.get("dense_group"), "meta": "s8z8",
                   "calib": args.calib_seqs, "layers": [args.l0, args.l1]},
     }
 
@@ -309,8 +311,9 @@ def main():
             if re.search(r"\.(embed|unembed)\.weight$", n) and not a.no_vocab_trim:
                 t = t[:uv]
             if kd in ("qrows", "q"):
-                pk, sm, rs, s = quant_dense(t, prof["dense_bits"], prof["dense_group"], dev)
-                w.add_quant(n, pk, sm, prof["dense_bits"], list(t.shape), prof["dense_group"], rs)
+                db = prof.get("attn_bits", prof["dense_bits"]) if kd == "q" else prof["dense_bits"]
+                pk, sm, rs, s = quant_dense(t, db, prof["dense_group"], dev)
+                w.add_quant(n, pk, sm, db, list(t.shape), prof["dense_group"], rs)
                 st["dense_stats"][n] = s
             elif kd == "f16":
                 st["dense_report"][n] = fp16_report(t)
