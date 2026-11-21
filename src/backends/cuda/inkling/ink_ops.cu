@@ -67,6 +67,7 @@ __device__ __forceinline__ void sm8_decode(unsigned v, float rsc, float zlo, flo
 // reduce N values over the block of NT threads (all threads get the sums). sm >= NW*N floats.
 template <int N>
 __device__ __forceinline__ void bred(float (&v)[N], float* sm) {
+    // sm >= NW*N + N floats
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
 #pragma unroll
     for (int i = 0; i < N; ++i) v[i] = warp_sum(v[i]);
@@ -76,13 +77,15 @@ __device__ __forceinline__ void bred(float (&v)[N], float* sm) {
         for (int i = 0; i < N; ++i) sm[w * N + i] = v[i];
     }
     __syncthreads();
-#pragma unroll
-    for (int i = 0; i < N; ++i) {
+    if (threadIdx.x < N) {
         float s = 0.f;
 #pragma unroll
-        for (int k = 0; k < NW; ++k) s += sm[k * N + i];
-        v[i] = s;
+        for (int k = 0; k < NW; ++k) s += sm[k * N + threadIdx.x];
+        sm[NW * N + threadIdx.x] = s;
     }
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < N; ++i) v[i] = sm[NW * N + i];
 }
 
 __device__ __forceinline__ Q8Buf q8_stream(const Q8Buf& q, int s) {
@@ -153,8 +156,9 @@ void softcap_inplace(float* x, int n, float cap, cudaStream_t s) { k_softcap<<<(
 
 // ------------------------------------------------------------------------------------------------------------------
 // attention residual
+template <int QM>
 __global__ void __launch_bounds__(NT) k_ar(ArArgs a) {
-    __shared__ float sm[NW * 32];
+    __shared__ float sm[NW * 25 + 32];
     const int t = threadIdx.x;
     const float* queries = a.queries + (long)blockIdx.x * a.qbs;
     float v[5][3];
@@ -210,7 +214,7 @@ __global__ void __launch_bounds__(NT) k_ar(ArArgs a) {
             if (a.boundary && blockIdx.x == 0) a.blocks[a.B * H + t + NT * j] = hin[j];
         }
     }
-    float out[4][3];
+    float out[QM][3];
     if (!a.mix) {
 #pragma unroll
         for (int j = 0; j < 3; ++j) {
@@ -220,22 +224,24 @@ __global__ void __launch_bounds__(NT) k_ar(ArArgs a) {
             out[0][j] = pv;
         }
     } else {
-        float red[25];
+        float red[5 + 5 * QM];
 #pragma unroll
         for (int b = 0; b < 5; ++b) red[b] = (b < NB) ? v[b][0] * v[b][0] + v[b][1] * v[b][1] + v[b][2] * v[b][2] : 0.f;
-        for (int q = 0; q < 4; ++q) {
+#pragma unroll
+        for (int q = 0; q < QM; ++q) {
             float qv[3];
 #pragma unroll
             for (int j = 0; j < 3; ++j) qv[j] = q < a.Q ? queries[(long)q * H + t + NT * j] : 0.f;
 #pragma unroll
             for (int b = 0; b < 5; ++b) red[5 + q * 5 + b] = (b < NB && q < a.Q) ? v[b][0] * qv[0] + v[b][1] * qv[1] + v[b][2] * qv[2] : 0.f;
         }
-        bred<25>(red, sm);
+        bred<5 + 5 * QM>(red, sm);
         float rb[5];
 #pragma unroll
         for (int b = 0; b < 5; ++b) rb[b] = rsqrtf(red[b] / H + 1e-6f);
-        float coef[4][5];
-        for (int q = 0; q < 4; ++q) {
+        float coef[QM][5];
+#pragma unroll
+        for (int q = 0; q < QM; ++q) {
             float mx = -1e30f;
 #pragma unroll
             for (int b = 0; b < 5; ++b) {
@@ -251,7 +257,8 @@ __global__ void __launch_bounds__(NT) k_ar(ArArgs a) {
 #pragma unroll
             for (int b = 0; b < 5; ++b) coef[q][b] = coef[q][b] / sum * rb[b];
         }
-        for (int q = 0; q < 4; ++q)
+#pragma unroll
+        for (int q = 0; q < QM; ++q)
 #pragma unroll
             for (int j = 0; j < 3; ++j) {
                 float o = 0.f;
@@ -261,16 +268,18 @@ __global__ void __launch_bounds__(NT) k_ar(ArArgs a) {
             }
     }
     if (a.epi == 0) {
-        for (int q = 0; q < a.Q; ++q)
+#pragma unroll
+        for (int q = 0; q < QM; ++q)
 #pragma unroll
             for (int j = 0; j < 3; ++j) a.raw_out[(long)blockIdx.x * a.rbs + (long)q * H + t + NT * j] = out[q][j];
     } else {
-        float ssq[4];
+        float ssq[QM];
 #pragma unroll
-        for (int q = 0; q < 4; ++q) ssq[q] = (q < a.Q) ? out[q][0] * out[q][0] + out[q][1] * out[q][1] + out[q][2] * out[q][2] : 0.f;
-        bred<4>(ssq, sm);
+        for (int q = 0; q < QM; ++q) ssq[q] = out[q][0] * out[q][0] + out[q][1] * out[q][1] + out[q][2] * out[q][2];
+        bred<QM>(ssq, sm);
         const int warp = t >> 5;
-        for (int q = 0; q < a.Q; ++q) {
+#pragma unroll
+        for (int q = 0; q < QM; ++q) {
             const float f = rsqrtf(ssq[q] / H + 1e-6f);
             const Q8Buf o = q8_stream(a.q8, q);
 #pragma unroll
@@ -282,7 +291,11 @@ __global__ void __launch_bounds__(NT) k_ar(ArArgs a) {
         }
     }
 }
-void attn_res(const ArArgs& a, int nblocks, cudaStream_t s) { k_ar<<<nblocks, NT, 0, s>>>(a); }
+void attn_res(const ArArgs& a, int nblocks, cudaStream_t s) {
+    if (a.Q == 1) k_ar<1><<<nblocks, NT, 0, s>>>(a);
+    else if (a.Q == 3) k_ar<3><<<nblocks, NT, 0, s>>>(a);
+    else k_ar<4><<<nblocks, NT, 0, s>>>(a);
+}
 
 __global__ void __launch_bounds__(NT) k_norm(NormArgs a) {
     __shared__ float sm[NW * 32];
@@ -455,6 +468,7 @@ __global__ void __launch_bounds__(128) k_prep(PrepArgs a) {
     float tau = 1.f;
     if (a.glob) tau = 1.f + 0.1f * logf(fmaxf((float)(pos + 1) / 8192.f, 1.f));
     const int slot = a.ring ? (pos & (a.cap - 1)) : pos;
+    if (blockIdx.y == 0) {
     // ---- k and v: short conv (state = 3 previous pre-conv inputs), then clip / value norm
     float kx = a.kraw[ch], vx = a.vraw[ch];
     float ko, vo;
@@ -493,6 +507,7 @@ __global__ void __launch_bounds__(128) k_prep(PrepArgs a) {
         const float f = fminf(1.f, 22.627416997969522f / (sqrtf(n2) + 1e-6f));
         a.qs[h * HD + c] = qv * f * tau * 0.08838834764831845f;  // 128^-0.5
     }
+    }
     // ---- rel: scale, l2 clip (8.0), tau
     if (c < 48) rv0[c] = a.relraw[(g * 3 + c / 16) * 16 + (c & 15)] * a.relscale[(g * 3 + c / 16) * 16 + (c & 15)];
     __syncthreads();
@@ -502,7 +517,8 @@ __global__ void __launch_bounds__(128) k_prep(PrepArgs a) {
         rv[c] = rv0[c] * fminf(1.f, 8.f / (sqrtf(n2) + 1e-6f)) * tau;
     }
     __syncthreads();
-    for (int d = c; d < REXT; d += 128) {
+    {
+        const int d = blockIdx.y * 128 + c;
 #pragma unroll
         for (int hh = 0; hh < 3; ++hh) {
             float b = 0.f;
@@ -512,7 +528,7 @@ __global__ void __launch_bounds__(128) k_prep(PrepArgs a) {
         }
     }
 }
-void attn_prep(const PrepArgs& a, cudaStream_t s) { k_prep<<<NKV, 128, 0, s>>>(a); }
+void attn_prep(const PrepArgs& a, cudaStream_t s) { k_prep<<<dim3(NKV, 8), 128, 0, s>>>(a); }
 
 // ------------------------------------------------------------------------------------------------------------------
 // decode attention partials. grid (8 kv heads, nsplit); 128 threads = 4 warps x 4 groups of 8 lanes; a group owns one key at a time,
@@ -638,10 +654,10 @@ void attn_combine(const AttnArgs& a, cudaStream_t s) { k_attn_combine<<<NH, 128,
 
 // ------------------------------------------------------------------------------------------------------------------
 // router
-__global__ void __launch_bounds__(256) k_router(const __half* W, const float* bias, const float* x, float* logits, int* ids, float* wts,
+__global__ void __launch_bounds__(64) k_router(const __half* W, const float* bias, const float* x, float* logits, int* ids, float* wts,
                                                 int* ticket, float route_scale) {
     __shared__ int s_last;
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, row = blockIdx.x * 8 + warp;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, row = blockIdx.x * 2 + warp;
     float acc = 0.f;
     for (int i = lane; i < H / 8; i += 32) {
         const float4 x0 = *reinterpret_cast<const float4*>(x + i * 8), x1 = *reinterpret_cast<const float4*>(x + i * 8 + 4);
@@ -709,7 +725,7 @@ __global__ void __launch_bounds__(256) k_router(const __half* W, const float* bi
     (void)chosen_w;
 }
 void router(const __half* W, const float* bias, const float* x, float* logits, int* ids, float* wts, int* ticket, float route_scale, cudaStream_t s) {
-    k_router<<<NE / 8, 256, 0, s>>>(W, bias, x, logits, ids, wts, ticket, route_scale);
+    k_router<<<NE / 2, 64, 0, s>>>(W, bias, x, logits, ids, wts, ticket, route_scale);
 }
 
 // grouped expert GEMV 1: rows of w13 are interleaved (even = gate, odd = up). block = 64 rows = 32 activations, 16 warps x 4 rows.
