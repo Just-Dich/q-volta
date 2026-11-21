@@ -3,13 +3,11 @@
 // (the order is configurable through `samplers`, like llama-server's "samplers" request field), mirostat v1/v2 as an alternative
 // to the chain, and a final draw with std::mt19937 + uniform_real_distribution<double> exactly like llama_sampler_dist.
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include <memory>
-<<<<<<< HEAD
 #include <random>
 #include <string>
-=======
->>>>>>> p15/jinja
 #include <unordered_map>
 #include <vector>
 
@@ -21,6 +19,22 @@ struct LogitsConstraint {
     virtual void apply(std::vector<float>& logits) = 0;  // set logits of disallowed tokens to -inf
     virtual void accept(int token) = 0;                  // advance the constraint with the sampled token
 };
+
+
+// Hook used by grammar / JSON-schema decoding (src/grammar/sampler_hook.h): operates on raw float logits.
+struct LogitMask {
+    virtual ~LogitMask() = default;
+    virtual void apply(float* logits, size_t n) = 0;  // set disallowed logits to -inf
+    virtual void accept(int tok) = 0;                 // the chosen token was committed
+};
+namespace detail {
+struct MaskConstraint : LogitsConstraint {
+    std::shared_ptr<LogitMask> m;
+    explicit MaskConstraint(std::shared_ptr<LogitMask> mm) : m(std::move(mm)) {}
+    void apply(std::vector<float>& lg) override { m->apply(lg.data(), lg.size()); }
+    void accept(int t) override { m->accept(t); }
+};
+}  // namespace detail
 
 struct SamplingParams {
     // llama-server defaults (common_params_sampling)
@@ -65,21 +79,13 @@ struct TokenLogprob {
     std::vector<std::pair<int, float>> top;             // best alternatives, descending
 };
 
-// Hook that constrains sampling (grammar / JSON-schema decoding, see src/grammar/sampler_hook.h).
-struct LogitMask {
-    virtual ~LogitMask() = default;
-    virtual void apply(float* logits, size_t n) = 0;  // set disallowed logits to -inf
-    virtual void accept(int tok) = 0;                 // the chosen token was committed
-};
-
 class Sampler {
    public:
-    // The mask runs after penalties and before temperature/top-k/top-p; greedy decoding on host logits honours it too.
-    void set_mask(std::shared_ptr<LogitMask> m) { mask_ = std::move(m); }
-    bool has_mask() const { return mask_ != nullptr; }
     Sampler(const SamplingParams& p, const std::vector<int>& prompt_tokens);
     bool want_post_ = false;  // keep the post-chain candidate probabilities (llama post_sampling_probs)
     void set_constraint(std::shared_ptr<LogitsConstraint> c) { constraint_ = std::move(c); }
+    void set_mask(std::shared_ptr<LogitMask> m) { constraint_ = std::make_shared<detail::MaskConstraint>(std::move(m)); }
+    bool has_mask() const { return constraint_ != nullptr; }
     // logits are modified in place. Does not record the token; call accept().
     int sample(std::vector<float>& logits);
     void accept(int tok);
@@ -92,7 +98,6 @@ class Sampler {
    private:
     struct Cand { int id; float logit; float p; };
     SamplingParams p_;
-<<<<<<< HEAD
     std::vector<int> hist_;  // prompt + generated tokens
     std::mt19937 rng_;
     float mu_;
@@ -114,16 +119,6 @@ class Sampler {
     int draw();
     int mirostat_v2();
     int mirostat_v1();
-=======
-    std::shared_ptr<LogitMask> mask_;
-    std::unordered_map<int, int> gen_counts_;
-    std::unordered_map<int, char> seen_;  // prompt + generated (repetition penalty)
-    uint64_t s_[4];
-    std::vector<int> idx_;
-    std::vector<float> prob_;
-    uint64_t next();
-    double uniform();
->>>>>>> p15/jinja
 };
 
 }  // namespace qv
