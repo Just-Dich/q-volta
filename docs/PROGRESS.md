@@ -21,3 +21,6 @@ Next: tensor-core attention + dequant/GEMM overlap (prefill at long prompts), ru
 
 ## p10/quant (2026-11-21)
 GPTQ + clip + group128 + meta8 quantizer and kernels; profile e1 10.44 GiB +9.6% ppl (KL 0.112), 55.4 tok/s decode; <=10.4 GiB at +5% not reached. Details and falsified hypotheses: docs/QUANTIZATION.md; data benchmarks/results/quant_2026-11-21.json. ctest 13/13 on the merge with main.
+
+## p12/ink-design (2026-11-21)
+- Inkling-2-Mini design + feasibility study (docs/INKLING_DESIGN.md, tools/ink_model.py; pure analysis, nothing run on GPU/CPU). Exact budget from the safetensors headers (text 18.89 GB: experts NVFP4 layers 0-19 + MXFP8 layers 20-23 = 15.67 GB, attention 1.29 GB BF16, untied lm_head 0.93 GB; MTP is a separate 0.64 GB block drafter file). Q3 profile 9.7 GiB resident; decode ceiling V100 392 tok/s (bandwidth) / ~206 (kernel-overhead model), CPU 23.8 tok/s; max context on V100 ~478K (per-pass KV) / ~860K (shared KV), 1M only with host KV tier or hybrid expert residency; MTP on MoE 1.3-1.7x (alpha 0.75). One new measurement: requantizing NVFP4 experts to uniform int adds 10% rel. RMS noise at 4-bit g128 and 19-22% at 3-bit.
