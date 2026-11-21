@@ -190,7 +190,7 @@ void rows_kernel(const QMatC& W, const Q8ActC& x, float* y, int r0) {
     __m128 accm[R];
     for (int r = 0; r < R; ++r) {
         wp[r] = W.q + (size_t)(r0 + r) * rw;
-        sp[r] = W.sm + (size_t)(r0 + r) * G * 2;
+        sp[r] = W.sm + (size_t)(r0 + r) * (G >> W.gs) * 2;
         accf[r] = _mm256_setzero_ps();
         accm[r] = _mm_setzero_ps();
     }
@@ -210,7 +210,7 @@ void rows_kernel(const QMatC& W, const Q8ActC& x, float* y, int r0) {
             _mm_prefetch((const char*)(p + PF), _MM_HINT_T0);
             const __m256i d = dot_group<BITS>(p, xlo, xhi);
             uint32_t smw;
-            std::memcpy(&smw, sp[r] + 2 * g, 4);
+            std::memcpy(&smw, sp[r] + 2 * (g >> W.gs), 4);
             const __m128 t = _mm_cvtph_ps(_mm_cvtsi32_si128((int)smw));  // (scale, min)
             accm[r] = _mm_add_ps(accm[r], _mm_mul_ss(_mm_shuffle_ps(t, t, 1), ssum));
             accf[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d), _mm256_mul_ps(dvec, _mm256_broadcastss_ps(t)), accf[r]);
@@ -234,7 +234,7 @@ void rows_kernel_multi(const QMatC& W, const Q8Batch& X, float* Y, size_t ldy, i
     __m128 accm[R][T];
     for (int r = 0; r < R; ++r) {
         wp[r] = W.q + (size_t)(r0 + r) * rw;
-        sp[r] = W.sm + (size_t)(r0 + r) * G * 2;
+        sp[r] = W.sm + (size_t)(r0 + r) * (G >> W.gs) * 2;
         for (int t = 0; t < T; ++t) { accf[r][t] = _mm256_setzero_ps(); accm[r][t] = _mm_setzero_ps(); }
     }
     constexpr int PF = 64;
@@ -258,7 +258,7 @@ void rows_kernel_multi(const QMatC& W, const Q8Batch& X, float* Y, size_t ldy, i
             __m256i lo, hi;
             unpack_group<BITS>(p, lo, hi);
             uint32_t smw;
-            std::memcpy(&smw, sp[r] + 2 * g, 4);
+            std::memcpy(&smw, sp[r] + 2 * (g >> W.gs), 4);
             const __m128 tt = _mm_cvtph_ps(_mm_cvtsi32_si128((int)smw));
             const __m256 sc = _mm256_broadcastss_ps(tt);
             for (int t = 0; t < T; ++t) {
@@ -359,7 +359,7 @@ inline void tile_tokens(const int8_t* wb, size_t wrow, const float* sc, size_t s
 }
 
 template <int BITS>
-void gemm_block(const QMatC& W, const Q8Batch& X, int T, float* Y, size_t ldy, int r0, int nr) {
+void gemm_block(const QMatC& W, const Q8Batch& X, int T, float* Y, size_t ldy, int r0, int nr, int xoff) {
     const int G = W.K / 64;
     const size_t rw = W.row_words();
     alignas(64) static thread_local int8_t wb[kRB * kKCG * 64];
@@ -367,10 +367,10 @@ void gemm_block(const QMatC& W, const Q8Batch& X, int T, float* Y, size_t ldy, i
     scv.resize((size_t)nr * G);
     mnv.resize((size_t)nr * G);
     for (int r = 0; r < nr; ++r) {
-        const uint16_t* sp = W.sm + (size_t)(r0 + r) * G * 2;
+        const uint16_t* sp = W.sm + (size_t)(r0 + r) * (G >> W.gs) * 2;
         for (int g = 0; g < G; ++g) {
-            scv[(size_t)r * G + g] = _cvtsh_ss(sp[2 * g]);
-            mnv[(size_t)r * G + g] = _cvtsh_ss(sp[2 * g + 1]);
+            scv[(size_t)r * G + g] = _cvtsh_ss(sp[2 * (g >> W.gs)]);
+            mnv[(size_t)r * G + g] = _cvtsh_ss(sp[2 * (g >> W.gs) + 1]);
         }
     }
     // Token panels of kTP tokens bound the accumulator array (nr x kTP x 8 fp32) and the working set of the activation
@@ -395,16 +395,16 @@ void gemm_block(const QMatC& W, const Q8Batch& X, int T, float* Y, size_t ldy, i
                 int r = 0;
                 for (; r + kRT <= nr; r += kRT)
                     tile_tokens<kRT>(wb + (size_t)r * kKCG * 64, (size_t)kKCG * 64, scv.data() + (size_t)r * G + g0, G, X,
-                                     tp0 + tl, tn, g0, ng, accv.data() + r * accrow + tl * 8, accrow);
+                                     xoff + tp0 + tl, tn, g0, ng, accv.data() + r * accrow + tl * 8, accrow);
                 for (; r < nr; ++r)
                     tile_tokens<1>(wb + (size_t)r * kKCG * 64, (size_t)kKCG * 64, scv.data() + (size_t)r * G + g0, G, X,
-                                   tp0 + tl, tn, g0, ng, accv.data() + r * accrow + tl * 8, accrow);
+                                   xoff + tp0 + tl, tn, g0, ng, accv.data() + r * accrow + tl * 8, accrow);
             }
         }
         // epilogue: horizontal sum + weight-min term
         for (int tl = 0; tl < tpn; ++tl) {
             const int t = tp0 + tl;
-            const float* xs = X.xs.data() + (size_t)t * G;
+            const float* xs = X.xs.data() + (size_t)(xoff + t) * G;
             for (int r = 0; r < nr; ++r) {
                 const float* mn = mnv.data() + (size_t)r * G;
                 __m256 m = _mm256_setzero_ps();
@@ -419,8 +419,8 @@ void gemm_block(const QMatC& W, const Q8Batch& X, int T, float* Y, size_t ldy, i
 }
 
 template <int BITS>
-void gemm_bits(const QMatC& W, const Q8Batch& X, int T, float* Y, size_t ldy, int row0, int row1) {
-    for (int r = row0; r < row1; r += kRB) gemm_block<BITS>(W, X, T, Y, ldy, r, row1 - r < kRB ? row1 - r : kRB);
+void gemm_bits(const QMatC& W, const Q8Batch& X, int T, float* Y, size_t ldy, int row0, int row1, int xoff) {
+    for (int r = row0; r < row1; r += kRB) gemm_block<BITS>(W, X, T, Y, ldy, r, row1 - r < kRB ? row1 - r : kRB, xoff);
 }
 
 template <int BITS>
@@ -462,14 +462,14 @@ void Q8Batch::quantize_row(int t, const float* x, int kuse) {
     }
 }
 
-void gemm_q(const QMatC& W, const Q8Batch& X, int T, float* Y, size_t ldy, int row0, int row1) {
+void gemm_q(const QMatC& W, const Q8Batch& X, int T, float* Y, size_t ldy, int row0, int row1, int xoff) {
     if (T <= 0) return;
     switch (W.bits) {
-        case 2: gemm_bits<2>(W, X, T, Y, ldy, row0, row1); break;
-        case 3: gemm_bits<3>(W, X, T, Y, ldy, row0, row1); break;
-        case 4: gemm_bits<4>(W, X, T, Y, ldy, row0, row1); break;
-        case 5: gemm_bits<5>(W, X, T, Y, ldy, row0, row1); break;
-        case 6: gemm_bits<6>(W, X, T, Y, ldy, row0, row1); break;
+        case 2: gemm_bits<2>(W, X, T, Y, ldy, row0, row1, xoff); break;
+        case 3: gemm_bits<3>(W, X, T, Y, ldy, row0, row1, xoff); break;
+        case 4: gemm_bits<4>(W, X, T, Y, ldy, row0, row1, xoff); break;
+        case 5: gemm_bits<5>(W, X, T, Y, ldy, row0, row1, xoff); break;
+        case 6: gemm_bits<6>(W, X, T, Y, ldy, row0, row1, xoff); break;
         case 8: {  // q up to 255 needs the two-nibble-plane dot: reuse the GEMV kernel token by token (not optimized)
             Q8ActC a;
             a.K = X.K;
@@ -477,8 +477,8 @@ void gemm_q(const QMatC& W, const Q8Batch& X, int T, float* Y, size_t ldy, int r
             a.ds.resize((size_t)X.G * 4);
             std::vector<float> y((size_t)W.N);
             for (int t = 0; t < T; ++t) {
-                std::memcpy(a.q.data(), X.q.data() + (size_t)t * X.K, X.K);
-                std::memcpy(a.ds.data(), X.ds.data() + (size_t)t * X.G * 4, (size_t)X.G * 16);
+                std::memcpy(a.q.data(), X.q.data() + (size_t)(xoff + t) * X.K, X.K);
+                std::memcpy(a.ds.data(), X.ds.data() + (size_t)(xoff + t) * X.G * 4, (size_t)X.G * 16);
                 gemv_q(W, a, y.data(), row0, row1);
                 for (int r = row0; r < row1; ++r) Y[(size_t)t * ldy + r] = y[r];
             }

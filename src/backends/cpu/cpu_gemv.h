@@ -38,8 +38,9 @@ struct QMatC {
     const uint32_t* q;
     const uint16_t* sm;
     int N, K, bits;
+    int gs = 0;  // (scale,min) group = 64 << gs weights: sm is fp16 [N][(K/64) >> gs][2]; gs = 1 serves group-128 files without duplicating
     size_t row_words() const { return (size_t)(K / 32) * bits; }
-    size_t bytes() const { return (size_t)N * row_words() * 4 + (size_t)N * (K / 64) * 4; }
+    size_t bytes() const { return (size_t)N * row_words() * 4 + (size_t)N * ((K / 64) >> gs) * 4; }
 };
 
 // Quantized activation. For group g (64 values) the int8 bytes q[64g .. 64g+63] are stored permuted:
@@ -98,7 +99,8 @@ void gemv_q(const QMatC& W, const Q8ActC& x, float* y, int row0, int row1);
 // unpacked ONCE (bit planes -> int8 in an L1-sized buffer) and multiplied against all T tokens (register tile of 2 rows x
 // 4 tokens, K processed in chunks so the unpacked tile and the token tile stay in L1). Per-token results equal gemv_q up to
 // fp32 summation order of the weight-min term (<1e-6 relative). bits 8 falls back to per-token gemv_q.
-void gemm_q(const QMatC& W, const Q8Batch& X, int T, float* Y, size_t ldy, int row0, int row1);
+// xoff: the T tokens are rows [xoff, xoff+T) of X (MoE: token-sorted rows of several experts in one batch); Y rows are 0..T-1.
+void gemm_q(const QMatC& W, const Q8Batch& X, int T, float* Y, size_t ldy, int row0, int row1, int xoff = 0);
 // Multi-threaded over the pool: dynamic claims of 8 rows; each claimed block handles all T tokens.
 void gemm_q_par(ThreadPool& pool, const QMatC& W, const Q8Batch& X, int T, float* Y, size_t ldy);
 

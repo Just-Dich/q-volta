@@ -1208,7 +1208,10 @@ class CpuEngine final : public Engine {
 
 }  // namespace
 
+std::unique_ptr<Engine> make_cpu_inkling_engine(const ModelFile& mf, const EngineOptions& opt);  // cpu_inkling_engine.cpp
+
 std::unique_ptr<Engine> make_cpu_engine(const ModelFile& mf, const EngineOptions& opt) {
+    if (mf.cfg.is_inkling()) return make_cpu_inkling_engine(mf, opt);
     return std::make_unique<CpuEngine>(mf, opt);
 }
 
