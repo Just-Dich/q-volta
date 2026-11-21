@@ -19,6 +19,7 @@ struct PrepTArgs {
     __half* relh;    // [T][24][16]
     __half *kc, *vc; // per-kv-head rows: row = glob ? pos : (t + 1024) ; head stride `cap` rows
     int cap;
+    uint8_t *kq = nullptr, *vq = nullptr; __half2 *ks = nullptr, *vs = nullptr;  // int4 KV (global layers)
 };
 void attn_prep_t(const PrepTArgs& a, cudaStream_t s);
 
@@ -31,6 +32,7 @@ struct PfAttnArgs {
     const float* proj;  // sink / gate rows
     int T, pos0, window;
     __half* out;        // [Tpad][3072] sigmoid(gate) * attention
+    const uint8_t *kq = nullptr, *vq = nullptr; const __half2 *ks = nullptr, *vs = nullptr;  // int4 KV (global layers)
 };
 void attn_prefill(const PfAttnArgs& a, cudaStream_t s);
 

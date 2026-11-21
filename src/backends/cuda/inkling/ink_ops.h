@@ -6,6 +6,29 @@
 
 namespace qv::cuda::ink {
 
+// ---- int4 KV rows (global layers): per token and kv head, 128 channels -> 64 B of nibbles (byte b = channels 2b | 2b+1 << 4),
+// plus one (scale, min) fp16 pair per 64-channel group, separately for K and V (K 64+8 B, V 64+8 B = 144 B per head-token).
+// Called by all 128 threads of a block (thread c owns channel c). sh: >= 8 floats of shared memory.
+__device__ __forceinline__ void kv4_store(float val, int c, uint8_t* qrow, __half2* srow, float* sh) {
+    float mn = val, mx = val;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) { mn = fminf(mn, __shfl_xor_sync(0xffffffffu, mn, o)); mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o)); }
+    const int w = c >> 5;
+    __syncthreads();
+    if ((c & 31) == 0) { sh[w * 2] = mn; sh[w * 2 + 1] = mx; }
+    __syncthreads();
+    const int g = c >> 6;
+    mn = fminf(sh[g * 4], sh[g * 4 + 2]);
+    mx = fmaxf(sh[g * 4 + 1], sh[g * 4 + 3]);
+    const __half sh_ = __float2half(fmaxf((mx - mn) * (1.f / 15.f), 1e-5f)), mh = __float2half(mn);
+    const float sc = __half2float(sh_), mf = __half2float(mh);
+    int q = __float2int_rn((val - mf) / sc);
+    q = max(0, min(15, q));
+    const int qn = __shfl_xor_sync(0xffffffffu, q, 1);
+    if ((c & 1) == 0) qrow[c >> 1] = (uint8_t)(q | (qn << 4));
+    if ((c & 63) == 0) srow[g] = __halves2half2(sh_, mh);
+}
+
 constexpr int H = 2304, NH = 24, NKV = 8, HD = 128, FF = 1152, NE = 128, TOPK = 8, KW = 4, REL = 16, REXT = 1024;
 constexpr int HC = H / 32;  // 72 chunks of 32
 
@@ -96,6 +119,7 @@ struct PrepArgs {
     float* qs;      // [24][128] out
     float* rl;      // [24][1024] out (relative bias by distance)
     __half *kc, *vc;
+    uint8_t *kq = nullptr, *vq = nullptr; __half2 *ks = nullptr, *vs = nullptr;  // int4 KV (global layers): kq/vq [8][cap][64], ks/vs [8][cap][2]
     int cap;        // slots per kv head in the cache (ring size 1024 for local layers)
     int ring;
 };
@@ -104,6 +128,7 @@ constexpr int PART_STRIDE = 130;
 struct AttnArgs {
     const float* qs; const float* rl; const __half *kc, *vc;
     int cap, ring, window;
+    const uint8_t *kq = nullptr, *vq = nullptr; const __half2 *ks = nullptr, *vs = nullptr;
     const int* pos;
     float* part;     // [8*nsplit][3][130]
     int nsplit;

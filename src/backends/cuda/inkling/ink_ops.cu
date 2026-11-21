@@ -531,8 +531,14 @@ __global__ void __launch_bounds__(128) k_prep(PrepArgs a) {
         const float fk = fminf(1.f, 22.627416997969522f / (sqrtf(nk) + 1e-6f));
         const float nv = block_sum(vo * vo, red);
         const float fv = rsqrtf(nv / HD + 1e-6f);
-        a.kc[((size_t)g * a.cap + slot) * HD + c] = __float2half(ko * fk);
-        a.vc[((size_t)g * a.cap + slot) * HD + c] = __float2half(vo * fv);
+        if (a.kq) {
+            const size_t r = (size_t)g * a.cap + slot;
+            kv4_store(ko * fk, c, a.kq + r * 64, a.ks + r * 2, red);
+            kv4_store(vo * fv, c, a.vq + r * 64, a.vs + r * 2, red);
+        } else {
+            a.kc[((size_t)g * a.cap + slot) * HD + c] = __float2half(ko * fk);
+            a.vc[((size_t)g * a.cap + slot) * HD + c] = __float2half(vo * fv);
+        }
     }
     // ---- q of the 3 heads sharing this kv head: scale, l2 clip, tau, softmax scale
     for (int hh = 0; hh < 3; ++hh) {
@@ -596,9 +602,23 @@ __global__ void __launch_bounds__(128) k_attn_part(AttnArgs a) {
     for (int j = kb + gi; j < ke; j += 16) {
         const int slot = a.ring ? (j & (a.cap - 1)) : j;
         const size_t base = ((size_t)g * a.cap + slot) * HD + sub * 16;
+        float kf[16], vf[16];
+        if (a.kq) {
+            const size_t r = (size_t)g * a.cap + slot;
+            const uint2 kb8 = __ldg(reinterpret_cast<const uint2*>(a.kq + r * 64) + sub);
+            const uint2 vb8 = __ldg(reinterpret_cast<const uint2*>(a.vq + r * 64) + sub);
+            const float2 ksc = __half22float2(a.ks[r * 2 + (sub >> 2)]), vsc = __half22float2(a.vs[r * 2 + (sub >> 2)]);
+            const uint32_t kw[2] = {kb8.x, kb8.y}, vw[2] = {vb8.x, vb8.y};
+#pragma unroll
+            for (int w = 0; w < 2; ++w)
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    kf[w * 8 + i] = fmaf((float)((kw[w] >> (4 * i)) & 15u), ksc.x, ksc.y);
+                    vf[w * 8 + i] = fmaf((float)((vw[w] >> (4 * i)) & 15u), vsc.x, vsc.y);
+                }
+        } else {
         const uint4 k0 = __ldg(reinterpret_cast<const uint4*>(a.kc + base)), k1 = __ldg(reinterpret_cast<const uint4*>(a.kc + base) + 1);
         const uint4 v0 = __ldg(reinterpret_cast<const uint4*>(a.vc + base)), v1 = __ldg(reinterpret_cast<const uint4*>(a.vc + base) + 1);
-        float kf[16];
         {
             const __half2* p0 = reinterpret_cast<const __half2*>(&k0);
             const __half2* p1 = reinterpret_cast<const __half2*>(&k1);
@@ -607,6 +627,14 @@ __global__ void __launch_bounds__(128) k_attn_part(AttnArgs a) {
                 const float2 f0 = __half22float2(p0[i]), f1 = __half22float2(p1[i]);
                 kf[2 * i] = f0.x; kf[2 * i + 1] = f0.y; kf[8 + 2 * i] = f1.x; kf[8 + 2 * i + 1] = f1.y;
             }
+            const __half2* q0 = reinterpret_cast<const __half2*>(&v0);
+            const __half2* q1 = reinterpret_cast<const __half2*>(&v1);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float2 f0 = __half22float2(q0[i]), f1 = __half22float2(q1[i]);
+                vf[2 * i] = f0.x; vf[2 * i + 1] = f0.y; vf[8 + 2 * i] = f1.x; vf[8 + 2 * i + 1] = f1.y;
+            }
+        }
         }
         float s[3];
 #pragma unroll
@@ -619,16 +647,6 @@ __global__ void __launch_bounds__(128) k_attn_part(AttnArgs a) {
             d += __shfl_xor_sync(gmask, d, 4);
             const int dist = pos - j;
             s[hh] = d + (dist < REXT ? a.rl[(g * 3 + hh) * REXT + dist] : 0.f);
-        }
-        float vf[16];
-        {
-            const __half2* p0 = reinterpret_cast<const __half2*>(&v0);
-            const __half2* p1 = reinterpret_cast<const __half2*>(&v1);
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const float2 f0 = __half22float2(p0[i]), f1 = __half22float2(p1[i]);
-                vf[2 * i] = f0.x; vf[2 * i + 1] = f0.y; vf[8 + 2 * i] = f1.x; vf[8 + 2 * i + 1] = f1.y;
-            }
         }
 #pragma unroll
         for (int hh = 0; hh < 3; ++hh) {

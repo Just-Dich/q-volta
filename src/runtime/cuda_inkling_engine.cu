@@ -51,6 +51,7 @@ struct App { int L, p, idx, kvslot; };
 class InklingEngine final : public Engine {
    public:
     InklingEngine(const ModelFile& mf, const EngineOptions& opt) : opt_(opt) {
+        kv4_ = opt.kv_mode == 1;
         cfg_ = mf.cfg;
         const InklingConfig& k = cfg_.ink;
         if (cfg_.hidden != ik::H || cfg_.n_heads != ik::NH || cfg_.n_kv_heads != ik::NKV || cfg_.head_dim != ik::HD || k.n_experts != ik::NE ||
@@ -169,7 +170,10 @@ class InklingEngine final : public Engine {
     QMat embed_, unembed_;
     const float *embed_norm_, *final_norm_, *out_query_, *msgq_ = nullptr;
     // state
-    __half *lk_, *lv_, *gk_, *gv_;
+    __half *lk_, *lv_, *gk_ = nullptr, *gv_ = nullptr;
+    uint8_t *gkq_ = nullptr, *gvq_ = nullptr; __half2 *gks_ = nullptr, *gvs_ = nullptr;
+    bool kv4_ = false;
+    size_t grow(const App& A) const { return (size_t)A.kvslot * ik::NKV * opt_.max_ctx; }
     float *cst_k_, *cst_v_, *cst_a_, *cst_m_;
     // scratch
     float *h_, *pre_h_, *blocks_, *res_, *araw_, *ymoe_, *proj_, *xn_f_, *u_, *gs_, *gg_, *xm_f_, *mraw_, *mg_, *msgs_, *rlog_, *wts_, *qs_, *rl_,
@@ -351,8 +355,14 @@ class InklingEngine final : public Engine {
         const int H = ik::H;
         lk_ = dalloc<__half>((size_t)n_lslots_ * ik::NKV * 1024 * ik::HD);
         lv_ = dalloc<__half>((size_t)n_lslots_ * ik::NKV * 1024 * ik::HD);
-        gk_ = dalloc<__half>((size_t)n_gslots_ * ik::NKV * opt_.max_ctx * ik::HD);
-        gv_ = dalloc<__half>((size_t)n_gslots_ * ik::NKV * opt_.max_ctx * ik::HD);
+        if (kv4_) {
+            const size_t rows = (size_t)n_gslots_ * ik::NKV * opt_.max_ctx;
+            gkq_ = dalloc<uint8_t>(rows * 64); gvq_ = dalloc<uint8_t>(rows * 64);
+            gks_ = dalloc<__half2>(rows * 2); gvs_ = dalloc<__half2>(rows * 2);
+        } else {
+            gk_ = dalloc<__half>((size_t)n_gslots_ * ik::NKV * opt_.max_ctx * ik::HD);
+            gv_ = dalloc<__half>((size_t)n_gslots_ * ik::NKV * opt_.max_ctx * ik::HD);
+        }
         cst_k_ = dalloc<float>(48 * 3 * 1024);
         cst_v_ = dalloc<float>(48 * 3 * 1024);
         cst_a_ = dalloc<float>((size_t)48 * 3 * H);
@@ -547,8 +557,8 @@ class InklingEngine final : public Engine {
         long kbase;
         __half *ringk = nullptr, *ringv = nullptr;
         if (glob) {
-            kc = gk_ + (size_t)A.kvslot * ik::NKV * opt_.max_ctx * ik::HD;
-            vc = gv_ + (size_t)A.kvslot * ik::NKV * opt_.max_ctx * ik::HD;
+            kc = kv4_ ? nullptr : gk_ + (size_t)A.kvslot * ik::NKV * opt_.max_ctx * ik::HD;
+            vc = kv4_ ? nullptr : gv_ + (size_t)A.kvslot * ik::NKV * opt_.max_ctx * ik::HD;
             cap = opt_.max_ctx; kbase = 0;
         } else {
             ringk = lk_ + (size_t)A.kvslot * ik::NKV * 1024 * ik::HD;
@@ -562,6 +572,7 @@ class InklingEngine final : public Engine {
             P.proj = PB_; P.qscale = W.qscale; P.relscale = W.relscale; P.relproj = W.relproj; P.kw = W.kw; P.vw = W.vw;
             P.kst = cst_k_ + (size_t)A.idx * 3 * 1024; P.vst = cst_v_ + (size_t)A.idx * 3 * 1024;
             P.glob = glob; P.T = T; P.pos0 = pos0; P.qh = qh_; P.relh = relh_; P.kc = kc; P.vc = vc; P.cap = cap;
+            if (glob && kv4_) { P.kq = gkq_ + grow(A) * 64; P.vq = gvq_ + grow(A) * 64; P.ks = gks_ + grow(A) * 2; P.vs = gvs_ + grow(A) * 2; }
             ik::attn_prep_t(P, s);
             ik::conv_commit(PB_ + 3072, ik::PS, T, 1024, cst_k_ + (size_t)A.idx * 3 * 1024, s);
             ik::conv_commit(PB_ + 4096, ik::PS, T, 1024, cst_v_ + (size_t)A.idx * 3 * 1024, s);
@@ -576,6 +587,7 @@ class InklingEngine final : public Engine {
             ik::PfAttnArgs P{};
             P.qh = qh_; P.kc = kc; P.vc = vc; P.kbase = kbase; P.cap = cap; P.rl = rlT_; P.proj = PB_; P.T = T; P.pos0 = pos0;
             P.window = glob ? 0 : K.window; P.out = o16_;
+            if (glob && kv4_) { P.kq = gkq_ + grow(A) * 64; P.vq = gvq_ + grow(A) * 64; P.ks = gks_ + grow(A) * 2; P.vs = gvs_ + grow(A) * 2; }
             ik::attn_prefill(P, s);
             if (!glob) {
                 ik::stage_to_ring(stK_, ringk, SL, pos0, T, s);
@@ -764,14 +776,15 @@ class InklingEngine final : public Engine {
         // ---- 3. prep (q/k/v postprocessing, convs, KV write, rel bias)
         const bool ring = !glob;
         const int cap = glob ? opt_.max_ctx : 1024;
-        __half* kc = glob ? gk_ + (size_t)A.kvslot * ik::NKV * opt_.max_ctx * ik::HD : lk_ + (size_t)A.kvslot * ik::NKV * 1024 * ik::HD;
-        __half* vc = glob ? gv_ + (size_t)A.kvslot * ik::NKV * opt_.max_ctx * ik::HD : lv_ + (size_t)A.kvslot * ik::NKV * 1024 * ik::HD;
+        __half* kc = glob ? (kv4_ ? nullptr : gk_ + (size_t)A.kvslot * ik::NKV * opt_.max_ctx * ik::HD) : lk_ + (size_t)A.kvslot * ik::NKV * 1024 * ik::HD;
+        __half* vc = glob ? (kv4_ ? nullptr : gv_ + (size_t)A.kvslot * ik::NKV * opt_.max_ctx * ik::HD) : lv_ + (size_t)A.kvslot * ik::NKV * 1024 * ik::HD;
         {
             ik::PrepArgs P;
             P.qraw = proj_; P.kraw = proj_ + 3072; P.vraw = proj_ + 4096; P.relraw = proj_ + 8192; P.dwk = proj_ + 8600; P.dwv = proj_ + 8632;
             P.qscale = W.qscale; P.relscale = W.relscale; P.relproj = W.relproj; P.kw = W.kw; P.vw = W.vw;
             P.kst = cst_k_ + (size_t)A.idx * 3 * 1024; P.vst = cst_v_ + (size_t)A.idx * 3 * 1024;
             P.glob = glob; P.pos = d_pos_; P.qs = qs_; P.rl = rl_; P.kc = kc; P.vc = vc; P.cap = cap; P.ring = ring;
+            if (glob && kv4_) { P.kq = gkq_ + grow(A) * 64; P.vq = gvq_ + grow(A) * 64; P.ks = gks_ + grow(A) * 2; P.vs = gvs_ + grow(A) * 2; }
             ik::attn_prep(P, s);
         }
         STAGE("prep");
@@ -779,6 +792,7 @@ class InklingEngine final : public Engine {
         {
             ik::AttnArgs T;
             T.qs = qs_; T.rl = rl_; T.kc = kc; T.vc = vc; T.cap = cap; T.ring = ring; T.window = glob ? 0 : K.window;
+            if (glob && kv4_) { T.kq = gkq_ + grow(A) * 64; T.vq = gvq_ + grow(A) * 64; T.ks = gks_ + grow(A) * 2; T.vs = gvs_ + grow(A) * 2; }
             T.pos = d_pos_; T.part = part_; T.nsplit = glob ? NSPLIT_G : NSPLIT_L;
             T.sink = proj_ + 8576; T.gate = proj_ + 5120; T.out = q8o_;
             ik::attn_part(T, s);

@@ -43,8 +43,14 @@ __global__ void __launch_bounds__(128) k_prep_t(PrepTArgs a) {
         const float nv = block_sum(vo * vo, red);
         const float fv = rsqrtf(nv / HD + 1e-6f);
         const long row = a.glob ? pos : (long)t + 1024;
-        a.kc[((size_t)g * a.cap + row) * HD + c] = __float2half(ko * fk);
-        a.vc[((size_t)g * a.cap + row) * HD + c] = __float2half(vo * fv);
+        if (a.kq) {
+            const size_t r = (size_t)g * a.cap + row;
+            kv4_store(ko * fk, c, a.kq + r * 64, a.ks + r * 2, red);
+            kv4_store(vo * fv, c, a.vq + r * 64, a.vs + r * 2, red);
+        } else {
+            a.kc[((size_t)g * a.cap + row) * HD + c] = __float2half(ko * fk);
+            a.vc[((size_t)g * a.cap + row) * HD + c] = __float2half(vo * fv);
+        }
     }
     for (int hh = 0; hh < 3; ++hh) {
         const int h = g * 3 + hh;
@@ -87,12 +93,24 @@ __global__ void __launch_bounds__(128) k_attn_pf(PfAttnArgs a) {
     const __half* rlrow = a.rl + ((long)(rvalid ? tq : 0) * NH + h) * REXT;
     const float sink = rvalid ? a.proj[(long)tq * PS + 8576 + h] : 0.f;
     float m = sink;
-    auto load_tile = [&](const __half* base, int jb) {
+    auto load_tile = [&](const __half* base, int jb, bool isv) {
         for (int i = tid; i < 64 * 16; i += 128) {
             const int rr = i >> 4, cc = (i & 15) * 8;
             const long j = jb + rr, row = j - a.kbase;
             uint4 v = make_uint4(0, 0, 0, 0);
-            if (j >= 0 && j <= imax && row >= 0) v = *reinterpret_cast<const uint4*>(base + ((long)g * a.cap + row) * HD + cc);
+            if (j >= 0 && j <= imax && row >= 0) {
+                if (a.kq) {
+                    const size_t r = (size_t)g * a.cap + row;
+                    const uint32_t w = *reinterpret_cast<const uint32_t*>((isv ? a.vq : a.kq) + r * 64 + (cc >> 1));
+                    const float2 sc = __half22float2((isv ? a.vs : a.ks)[r * 2 + (cc >> 6)]);
+                    __half2* o = reinterpret_cast<__half2*>(&v);
+#pragma unroll
+                    for (int e = 0; e < 4; ++e)
+                        o[e] = __floats2half2_rn(fmaf((float)((w >> (8 * e)) & 15u), sc.x, sc.y), fmaf((float)((w >> (8 * e + 4)) & 15u), sc.x, sc.y));
+                } else {
+                    v = *reinterpret_cast<const uint4*>(base + ((long)g * a.cap + row) * HD + cc);
+                }
+            }
             *reinterpret_cast<uint4*>(Kt + rr * KLD + cc) = v;
         }
     };
@@ -120,7 +138,7 @@ __global__ void __launch_bounds__(128) k_attn_pf(PfAttnArgs a) {
     };
     // pass 1
     for (int jb = jb0; jb <= imax; jb += 64) {
-        load_tile(a.kc, jb);
+        load_tile(a.kc, jb, false);
         __syncthreads();
         qk(jb);
         for (int c = 0; c < 32; ++c) m = fmaxf(m, score(jb, hf * 32 + c));
@@ -134,7 +152,7 @@ __global__ void __launch_bounds__(128) k_attn_pf(PfAttnArgs a) {
     for (int nt = 0; nt < 8; ++nt) wmma::fill_fragment(of[nt], 0.f);
     float l = 0.f;
     for (int jb = jb0; jb <= imax; jb += 64) {
-        load_tile(a.kc, jb);
+        load_tile(a.kc, jb, false);
         __syncthreads();
         qk(jb);
         for (int c = 0; c < 32; ++c) {
@@ -145,7 +163,7 @@ __global__ void __launch_bounds__(128) k_attn_pf(PfAttnArgs a) {
         }
         __syncwarp();
         __syncthreads();
-        load_tile(a.vc, jb);
+        load_tile(a.vc, jb, true);
         __syncthreads();
 #pragma unroll
         for (int kk = 0; kk < 4; ++kk) {
