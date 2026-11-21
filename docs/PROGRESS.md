@@ -21,3 +21,6 @@ Next: tensor-core attention + dequant/GEMM overlap (prefill at long prompts), ru
 
 ## p10/quant (2026-11-21)
 GPTQ + clip + group128 + meta8 quantizer and kernels; profile e1 10.44 GiB +9.6% ppl (KL 0.112), 55.4 tok/s decode; <=10.4 GiB at +5% not reached. Details and falsified hypotheses: docs/QUANTIZATION.md; data benchmarks/results/quant_2026-11-21.json. ctest 13/13 on the merge with main.
+
+## p11/perf (2026-11-21)
+Fixed the decode regression introduced by p10/quant (bisected: only 28dcefc; tensor-core attention and int4 KV are neutral). Hot GEMV kernels now compile per (group, meta8) mode, so group-64 E0 runs the pre-p10 code; meta8 row scale hoisted. E0 code: plain 48.7 -> 52.2, MTP-3 104.4 -> 131.5 (324ea1e: 52.2 / 129.6); E1: plain 55.4 -> 57.6, MTP-3 114.7 -> 138.2. Bit-exact (ids identical, ctest 13/13, test_cuda_mtp E0+E1). E1 is faster in tok/s but ~9% lower in effective bytes/s than E0. See docs/PERFORMANCE.md, benchmarks/results/gpu_perf_2026-11-21.json.
