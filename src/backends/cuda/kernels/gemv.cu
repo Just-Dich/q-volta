@@ -30,7 +30,7 @@ __device__ __forceinline__ float u2f(uint32_t q) { return __uint_as_float(0x4B00
 
 // Block = WARPS warps that all work on the same R rows and split the K chunks between them (split-K inside the
 // block, reduced through shared memory). R rows share every x load; WARPS trades rows-per-block for parallelism.
-template <int BITS, int R, int WARPS>
+template <int BITS, int R, int WARPS, int MODE>
 __global__ void __launch_bounds__(WARPS * 32) gemv_q_kernel(QMat W, const float* __restrict__ x,
                                                             const float* __restrict__ xsum32, float* __restrict__ y,
                                                             const float* __restrict__ residual) {
@@ -38,8 +38,12 @@ __global__ void __launch_bounds__(WARPS * 32) gemv_q_kernel(QMat W, const float*
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row0 = blockIdx.x * R;
     const int C = W.K >> 5;
-    const int G = W.K >> W.gshift, GS = W.gshift - 5;
+    constexpr int GS = 1 + (MODE & 1);  // log2(group/32)
+    const int G = W.K >> (5 + GS);
     float acc[R];
+    float rsc[R];  // meta8 per-row scale factor, hoisted out of the chunk loop (unused for MODE 0/1)
+#pragma unroll
+    for (int r = 0; r < R; ++r) rsc[r] = row_rsc<MODE>(W, min(row0 + r, W.N - 1));
 #pragma unroll
     for (int r = 0; r < R; ++r) acc[r] = 0.f;
 
@@ -63,7 +67,7 @@ __global__ void __launch_bounds__(WARPS * 32) gemv_q_kernel(QMat W, const float*
                 float d = 0.f;
 #pragma unroll
                 for (int i = 0; i < 32; ++i) d = fmaf(u2f(qval<BITS>(w, i)), xv[i], d);
-                float2 sm = load_sm(W, row, G, c >> GS);
+                float2 sm = load_sm_t<MODE>(W, row, G, c >> GS, rsc[r]);
                 acc[r] = fmaf(sm.x, d, fmaf(sm.y, xs, acc[r]));
             }
         }
@@ -85,7 +89,12 @@ __global__ void __launch_bounds__(WARPS * 32) gemv_q_kernel(QMat W, const float*
 
 template <int BITS, int R, int WARPS>
 static void launch_cfg(const QMat& W, const float* x, const float* xsum32, float* y, const float* res, cudaStream_t s) {
-    gemv_q_kernel<BITS, R, WARPS><<<(W.N + R - 1) / R, WARPS * 32, 0, s>>>(W, x, xsum32, y, res);
+    switch (qmode(W)) {
+        case 0: gemv_q_kernel<BITS, R, WARPS, 0><<<(W.N + R - 1) / R, WARPS * 32, 0, s>>>(W, x, xsum32, y, res); break;
+        case 1: gemv_q_kernel<BITS, R, WARPS, 1><<<(W.N + R - 1) / R, WARPS * 32, 0, s>>>(W, x, xsum32, y, res); break;
+        case 2: gemv_q_kernel<BITS, R, WARPS, 2><<<(W.N + R - 1) / R, WARPS * 32, 0, s>>>(W, x, xsum32, y, res); break;
+        default: gemv_q_kernel<BITS, R, WARPS, 3><<<(W.N + R - 1) / R, WARPS * 32, 0, s>>>(W, x, xsum32, y, res); break;
+    }
 }
 
 template <int BITS>

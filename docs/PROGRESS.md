@@ -32,3 +32,5 @@ tensor table, NVFP4/MXFP8 dequant, tokenizer/template, MTP inventory). tools/ink
 goldens in tests/golden/inkling (4 prompts, 32 greedy tokens each, 48 layer-application hiddens, router ids; 8.9 MB).
 HF logit parity NOT verified (H-I1 partially: spec + behaviourally validated reference, HF comparison pending). Decode bytes/token at
 stored precision 5.4 GiB (68 % dense bf16) -> ~130 tok/s V100 ceiling unless dense weights are quantised.
+## p11/perf (2026-11-21)
+Fixed the decode regression introduced by p10/quant (bisected: only 28dcefc; tensor-core attention and int4 KV are neutral). Hot GEMV kernels now compile per (group, meta8) mode, so group-64 E0 runs the pre-p10 code; meta8 row scale hoisted. E0 code: plain 48.7 -> 52.2, MTP-3 104.4 -> 131.5 (324ea1e: 52.2 / 129.6); E1: plain 55.4 -> 57.6, MTP-3 114.7 -> 138.2. Bit-exact (ids identical, ctest 13/13, test_cuda_mtp E0+E1). E1 is faster in tok/s but ~9% lower in effective bytes/s than E0. See docs/PERFORMANCE.md, benchmarks/results/gpu_perf_2026-11-21.json.

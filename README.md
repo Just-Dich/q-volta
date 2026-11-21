@@ -18,6 +18,7 @@ An original C++20/CUDA inference engine for **Qwen3.8-27B**: one fast engine for
 | wikitext, ctx 2048 | - | - | 50.8 | 76.7 (depth 2) | 1.51x | 0.69 / 0.52 / 0.41 |
 | wikitext, ctx 4088 | - | - | 48.6 | 82.4 (depth 2) | 1.69x | 0.75 / 0.67 / 0.55 |
 
+- **Smaller `e1` weights (10.44 GiB)** on the same V100 after the kernel fix (3 runs, ids identical to plain): code plain 57.6 -> MTP-3 **138.2** tok/s (accept 0.94); prose 57.6 -> 88.2 (MTP-2: 95.6); wikitext ctx 512 57.3 -> 132.2; ctx 2048 55.7 -> 83.6 (MTP-2); ctx 4088 54.6 -> 94.1 (MTP-2). E1 has worse quality than E0 on an agentic check (see QUANTIZATION.md). E0 after the fix: plain 52.2, MTP-3 131.8 on code. An intermediate build had a decode regression (-7% plain, -19% MTP-3) from the group-128 kernel generalization; it was bisected and fixed (docs/PERFORMANCE.md).
 - MTP output is **bit-identical** to plain greedy decoding (checked on all 60 benchmark runs; `test_cuda_mtp` also compares final logits for depth 1-3).
 - Verifying 2 / 3 / 4 tokens costs 1.11x / 1.14x / 1.25x of a single decode step (decode is memory-bandwidth-bound), so accepted drafts are almost free.
 - Q-Volta runs 3 repeats per cell, spread < 1% (except plain at ctx 4088: 47.7-50.0). NInfer numbers are from an earlier run the same day, not re-run, timed through its server (ours: `qv_run` decode window).
