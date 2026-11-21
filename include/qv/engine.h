@@ -54,6 +54,9 @@ class Engine {
     virtual void set_sparse(const std::string&) {}
     virtual void set_mtp_enabled(bool) {}  // runtime switch (needs EngineOptions::mtp at construction)
     virtual void mtp_stats(MtpStats& s) const { s = MtpStats(); }
+    // Inkling engines: integer debug output of the last step (router expert ids [48 applications][8]) when EngineOptions::dump_hidden.
+    // For arch inkling2_loop, hidden_dump() holds the LAST step only: [50][2304] = embedding, 48 layer-application outputs, final-norm output.
+    virtual const std::vector<int>& aux_dump() const { static const std::vector<int> none; return none; }
     virtual size_t device_bytes_weights() const = 0;
     virtual size_t device_bytes_state() const = 0;
     const Config& config() const { return cfg_; }
@@ -63,6 +66,7 @@ class Engine {
 };
 
 std::unique_ptr<Engine> make_cuda_engine(const ModelFile& mf, const EngineOptions& opt);  // needs the qv_cuda library
+std::unique_ptr<Engine> make_cuda_inkling_engine(const ModelFile& mf, const EngineOptions& opt);  // arch inkling2_loop (dispatched by make_cuda_engine)
 std::unique_ptr<Engine> make_cpu_engine(const ModelFile& mf, const EngineOptions& opt);   // needs qv_cpu_engine
 
 }  // namespace qv

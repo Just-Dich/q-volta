@@ -50,12 +50,17 @@ add_library(qv_cuda STATIC
   src/backends/cuda/attention/attn_kv4.cu
   src/backends/cuda/attention/kv4.cu
   src/backends/cuda/attention/attn_seq_tc.cu
+  src/backends/cuda/inkling/ink_ops.cu
+  src/backends/cuda/inkling/ink_prefill.cu
+  src/runtime/cuda_inkling_engine.cu
   src/runtime/cuda_engine.cu)
 target_include_directories(qv_cuda PUBLIC include)
 target_link_libraries(qv_cuda PUBLIC qv_core CUDA::cublas)
 target_compile_options(qv_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${QV_CUDA_FLAGS}>)
 
 
+add_executable(qv_ink tools/ink_run.cpp)
+target_link_libraries(qv_ink PRIVATE qv_cuda CUDA::cudart)
 add_executable(qv_run tools/qv_run.cpp)
 target_link_libraries(qv_run PRIVATE qv_cuda CUDA::cudart)
 target_compile_definitions(qv_run PRIVATE QV_HAVE_CUDA)

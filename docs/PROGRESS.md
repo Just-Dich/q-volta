@@ -39,3 +39,7 @@ CPU engine for Inkling-2-Mini (src/runtime/cpu_inkling_engine.cpp, ink_ops, docs
 batched prefill with token-sorted expert GEMM, fp16 KV (local ring + global per-pass slots). Q3A5: decode 11.0-11.7 tok/s at ctx 128-2048 (54 % of the 54 GB/s bound, ~75 % of the
 39 GB/s this box streamed during the runs), prefill 66-83 tok/s; 32/32 greedy ids on 3 of 4 goldens vs the Q3A5 reference (p1 flips at a 0.056-logit near tie), val NLL +0.0005..0.002.
 Router ids are not identical (int8 activation noise amplified by the loop). New goldens tests/golden/inkling_q3a5 (tools/inkling_golden_q.py).
+
+## p14/ink-gpu (2026-11-21)
+Inkling-2-Mini CUDA engine on V100: decode 122 tok/s (graph, ~33 % of HBM bound, latency bound), batched prefill 2.1-2.8K tok/s at 4K, int4 KV (9216 B/token), max ctx ~580K,
+passkey 32K/128K/256K passed. pi LoRA and ARM Stage B not covered. docs/INKLING_ENGINE.md.

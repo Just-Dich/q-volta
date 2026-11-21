@@ -168,3 +168,19 @@ Details and correctness: docs/INKLING_CPU.md; raw: benchmarks/results/inkling_cp
 Same-session `bench_cpu_gemv` streamed 36-41 GB/s (not 54), so against the measured ceiling the engine is at ~75 %. Design estimate 17-20 tok/s NOT reached.
 MoE decode region 39 GB/s (at the box ceiling); the rest is dense GEMV, lm_head, loop gates and ~100 barriers/token. Prefill is compute bound at ~0.5 TMAC/s;
 chunk size (128-1024) and register tile (4x2, 2x4, 4x4, 3x3) change it by < 10 %. Quality: val NLL 1.465-1.466 vs reference 1.4643. No llama.cpp comparison.
+## Inkling-2-Mini CUDA engine (p14/ink-gpu, 2026-11-21)
+Q3A5 on one V100 (CUDA_VISIBLE_DEVICES=0). Details: docs/INKLING_ENGINE.md; raw: benchmarks/results/inkling_gpu_20261121.json.
+Correctness: greedy 32/32 vs the Q3A5 reference goldens on all four prompts (step decode, batched prefill + decode, int4 KV on p4); vs the fp goldens 32/32 on p1-p3 and a
+4-token prefix on p4 (Q3A5 quantisation drift, same as the CPU engine). Last-position KL to the quantised reference 1e-12..6e-9; vs fp golden top-20 mean abs error 0.77-1.87
+(0.19-0.52 vs the quantised reference).
+| ctx | KV | decode tok/s |
+|---|---|---|
+| 25 | fp16 | 122.4 |
+| 4K (real, after prefill) | fp16 | 113.8 |
+| 4K (synthetic KV) | int4 / fp16 | 113.5 / 112.9 |
+| 32K (synthetic) | int4 / fp16 | 101.1 / 97.3 |
+| 128K (synthetic) | int4 / fp16 | 75.9 / 68.1 |
+| 256K (synthetic) | int4 | 57.4 |
+Prefill (4K prompt): chunk 2048 2118 tok/s, chunk 4096 2764 tok/s (target 2500 met at chunk 4096). 8K 2005 tok/s, 32K 1830, 128K 1164, 256K 766 (int4, chunk 2048, includes quadratic attention; 256K = 334 s).
+Passkey (chat template via HF tokenizers, key at 50 % depth, greedy 200 tokens): found at 8K, 32K, 128K and 256K with int4 KV; also 32K fp16.
+Decode is ~33 % of the HBM bound: latency-bound small kernels (see INKLING_ENGINE.md). "Synthetic" = decode over unwritten KV at that position (speed only).

@@ -901,6 +901,7 @@ class CudaEngine final : public Engine {
 }  // namespace
 
 std::unique_ptr<Engine> make_cuda_engine(const ModelFile& mf, const EngineOptions& opt) {
+    if (mf.cfg.is_inkling()) return make_cuda_inkling_engine(mf, opt);
     return std::make_unique<CudaEngine>(mf, opt);
 }
 
