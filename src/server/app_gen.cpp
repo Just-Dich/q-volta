@@ -310,7 +310,7 @@ Task App::parse_task(const Value& body, Kind kind) {
     std::string rf = o.reasoning_format;
     if (kind == Kind::OaiChat) rf = b.str("reasoning_format", rf);
     if (rf == "auto") rf = "deepseek";
-    if (rf != "none" && rf != "deepseek" && rf != "deepseek-legacy") throw_error(400, "Unknown reasoning format: " + rf);
+    if (rf != "none" && rf != "deepseek" && rf != "deepseek-legacy") throw_error(500, "Unknown reasoning format: " + rf);  // llama-server answers 500 here
     t.reasoning_format = kind == Kind::Native || kind == Kind::Infill ? (o.reasoning_format == "auto" ? "deepseek" : o.reasoning_format) : rf;
     t.model_echo = model_id;
     if (kind == Kind::OaiChat) {
@@ -539,7 +539,7 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
                 for (auto& s : t.stops) { size_t p = pending.find(s); if (p != std::string::npos && p < hit) { hit = p; hit_word = s; } }
                 // (stop strings may also span previously emitted text: llama checks the accumulated text; we hold back partial matches so no span exists)
                 ck.tokens.push_back(tk);
-                if (have_tp) ck.probs.push_back(tp);
+                if (have_tp) { ck.probs.push_back(tp); r.probs.push_back(tp); }
                 ck.n_decoded = n;
                 if (hit != std::string::npos) {
                     pending.resize(hit);

@@ -32,7 +32,7 @@ const OwnFlag kOwn[] = {
     {"--mtp-depth", "mtp-depth", 1}, {"--prefill-chunk", "prefill-chunk", 1}, {"--tokenizer", "tokenizer", 1},
     {"--model-name", "alias", 1}, {"--max-ctx", "ctx-size", 1}, {"--http-threads", "threads-http", 1}, {"--max-queue", "max-queue", 1},
     {"--default-max-tokens", "predict", 1}, {"--quiet", "log-disable", 0}, {"--mock-text", "mock-text", 1},
-    {"--mock-loop", "mock-loop", 0}, {"--mock-delay-us", "mock-delay-us", 1},
+    {"--mock-loop", "mock-loop", 0}, {"--mlock", "mlock", 0}, {"--no-mlock", "no-mlock", 0}, {"--mmap", "mmap", 0}, {"--no-mmap", "no-mmap", 0}, {"--mock-delay-us", "mock-delay-us", 1},
 };
 
 bool truthy(const std::string& v) { return v == "1" || v == "on" || v == "enabled" || v == "true" || v == "yes"; }
@@ -96,7 +96,7 @@ const std::set<std::string>& handled() {
         "backend", "kv", "kv4-kmode", "mtp", "no-mtp", "mtp-depth", "prefill-chunk", "tokenizer", "max-queue", "mock-text", "mock-loop", "mock-delay-us",
         "reasoning-preserve", "context-shift", "warmup", "flash-attn", "mlock", "mmap", "no-mmap", "perf", "escape", "verbosity", "log-colors", "log-timestamps",
         "log-prefix", "kv-unified", "cache-idle-slots", "sse-ping-interval", "lora", "lora-scaled", "ssl-key-file", "ssl-cert-file", "hf-repo", "model-url", "docker-repo",
-        "hf-file", "hf-token", "offline",
+        "hf-file", "hf-token", "offline", "no-mlock",
     };
     return s;
 }
@@ -207,7 +207,7 @@ void apply(Options& o, const Resolved& r, const std::string& flag, const std::st
     else if (c == "ssl-key-file" || c == "ssl-cert-file") fail("the server is built without SSL support (" + flag + ")");
     else if (c == "hf-repo" || c == "model-url" || c == "docker-repo") fail(flag + ": downloading models is not supported; pass a local Q-Volta model with -m");
     else if (c == "context-shift") { if (!r.neg) warn("--context-shift: the recurrent GatedDeltaNet state cannot be shifted; generation stops at the context limit (ignored)"); }
-    else if (c == "kv-unified" || c == "cache-idle-slots" || c == "warmup" || c == "flash-attn" || c == "mlock" || c == "mmap" || c == "perf" || c == "escape" || c == "log-colors" ||
+    else if (c == "kv-unified" || c == "cache-idle-slots" || c == "warmup" || c == "flash-attn" || c == "mlock" || c == "no-mlock" || c == "mmap" || c == "no-mmap" || c == "perf" || c == "escape" || c == "log-colors" ||
              c == "log-timestamps" || c == "log-prefix" || c == "sse-ping-interval" || c == "reasoning-preserve" || c == "hf-file" || c == "hf-token" || c == "offline") {}
     else warn("flag " + flag + " is accepted for llama-server compatibility but has no effect in qv_server");
 }
