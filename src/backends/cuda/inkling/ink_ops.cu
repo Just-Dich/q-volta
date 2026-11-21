@@ -117,7 +117,9 @@ __device__ __forceinline__ float dequant_elem(const QMat& E, size_t row, int c, 
 
 __global__ void __launch_bounds__(NT) k_embed(QMat E, const int* tok, const float* w, float* h, float* blk0) {
     __shared__ float sm[NW];
-    const size_t row = (size_t)tok[0];
+    const size_t row = (size_t)tok[blockIdx.x];
+    h += (size_t)blockIdx.x * H;
+    blk0 += (size_t)blockIdx.x * H;
     const size_t C = E.K >> 5;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     float v[3];
@@ -144,8 +146,8 @@ __global__ void __launch_bounds__(NT) k_embed(QMat E, const int* tok, const floa
         blk0[i] = o;
     }
 }
-void embed_norm(const QMat& E, const int* tok, const float* w, float* h, float* blk0, cudaStream_t s) {
-    k_embed<<<1, NT, 0, s>>>(E, tok, w, h, blk0);
+void embed_norm(const QMat& E, const int* tok, const float* w, float* h, float* blk0, cudaStream_t s, int T) {
+    k_embed<<<T, NT, 0, s>>>(E, tok, w, h, blk0);
 }
 
 __global__ void k_softcap(float* x, int n, float cap) {
@@ -161,6 +163,7 @@ __global__ void __launch_bounds__(NT) k_ar(ArArgs a) {
     __shared__ float sm[NW * 25 + 32];
     const int t = threadIdx.x;
     const float* queries = a.queries + (long)blockIdx.x * a.qbs;
+    const long tok = a.allpar ? (long)blockIdx.x : (long)a.tok0, NTK = a.ntok;
     float v[5][3];
 #pragma unroll
     for (int b = 0; b < 5; ++b)
@@ -172,10 +175,10 @@ __global__ void __launch_bounds__(NT) k_ar(ArArgs a) {
 #pragma unroll
         for (int b = 0; b < 4; ++b)
 #pragma unroll
-            for (int j = 0; j < 3; ++j) v[b][j] = (b < a.B) ? a.blocks[b * H + t + NT * j] : 0.f;
+            for (int j = 0; j < 3; ++j) v[b][j] = (b < a.B) ? a.blocks[((long)b * NTK + tok) * H + t + NT * j] : 0.f;
 #pragma unroll
         for (int j = 0; j < 3; ++j) {
-            const float hv = a.h[t + NT * j];
+            const float hv = a.h[tok * H + t + NT * j];
             for (int b = 0; b < 5; ++b)
                 if (b == a.B) v[b][j] = hv;
         }
@@ -184,23 +187,31 @@ __global__ void __launch_bounds__(NT) k_ar(ArArgs a) {
 #pragma unroll
         for (int j = 0; j < 3; ++j) {
             const int c = t + NT * j;
-            const float x = a.araw[c];
-            const float s0 = a.cst[c], s1 = a.cst[H + c], s2 = a.cst[2 * H + c];
+            const float x = a.araw[tok * H + c];
+            float s0, s1, s2;
+            {
+                const long i3 = tok - 3, i2 = tok - 2, i1 = tok - 1;
+                s0 = i3 >= 0 ? a.araw[i3 * H + c] : a.cst[(3 + i3) * H + c];
+                s1 = i2 >= 0 ? a.araw[i2 * H + c] : a.cst[(3 + i2) * H + c];
+                s2 = i1 >= 0 ? a.araw[i1 * H + c] : a.cst[(3 + i1) * H + c];
+            }
             const float4 w = *reinterpret_cast<const float4*>(a.cw + 4 * c);
             const float y = w.x * s0 + w.y * s1 + w.z * s2 + w.w * x;
             const float av = (y + x) * 0.44721359549995794f;  // 1/sqrt(5)
-            a.cst[c] = s1;
-            a.cst[H + c] = s2;
-            a.cst[2 * H + c] = x;
-            hin[j] = a.h[c];
+            if (NTK == 1) {
+                a.cst[c] = s1;
+                a.cst[H + c] = s2;
+                a.cst[2 * H + c] = x;
+            }
+            hin[j] = a.h[tok * H + c];
             res[j] = a.boundary ? av : av + hin[j];
-            a.res_out[c] = res[j];
+            a.res_out[tok * H + c] = res[j];
         }
         NB = a.B + 1 + (a.boundary ? 1 : 0);
 #pragma unroll
         for (int b = 0; b < 4; ++b)
 #pragma unroll
-            for (int j = 0; j < 3; ++j) v[b][j] = (b < a.B) ? a.blocks[b * H + t + NT * j] : 0.f;
+            for (int j = 0; j < 3; ++j) v[b][j] = (b < a.B) ? a.blocks[((long)b * NTK + tok) * H + t + NT * j] : 0.f;
 #pragma unroll
         for (int j = 0; j < 3; ++j) {
             for (int b = 0; b < 5; ++b) {
@@ -211,7 +222,7 @@ __global__ void __launch_bounds__(NT) k_ar(ArArgs a) {
                     v[b][j] = res[j];
                 }
             }
-            if (a.boundary && blockIdx.x == 0) a.blocks[a.B * H + t + NT * j] = hin[j];
+            if (a.boundary) a.blocks[((long)a.B * NTK + tok) * H + t + NT * j] = hin[j];
         }
     }
     float out[QM][3];
@@ -271,7 +282,22 @@ __global__ void __launch_bounds__(NT) k_ar(ArArgs a) {
 #pragma unroll
         for (int q = 0; q < QM; ++q)
 #pragma unroll
-            for (int j = 0; j < 3; ++j) a.raw_out[(long)blockIdx.x * a.rbs + (long)q * H + t + NT * j] = out[q][j];
+            for (int j = 0; j < 3; ++j) a.raw_out[(long)blockIdx.x * a.rbs + ((long)q * NTK + tok) * H + t + NT * j] = out[q][j];
+    } else if (a.epi == 2) {
+        float ssq[QM];
+#pragma unroll
+        for (int q = 0; q < QM; ++q) ssq[q] = out[q][0] * out[q][0] + out[q][1] * out[q][1] + out[q][2] * out[q][2];
+        bred<QM>(ssq, sm);
+#pragma unroll
+        for (int q = 0; q < QM; ++q) {
+            const float f = rsqrtf(ssq[q] / H + 1e-6f);
+#pragma unroll
+            for (int j = 0; j < 3; ++j) {
+                const float xv = a.nw[q][t + NT * j] * (out[q][j] * f);
+                a.xh_out[((long)q * NTK + tok) * H + t + NT * j] = __float2half(xv);
+                if (a.xn_out) a.xn_out[((long)q * NTK + tok) * H + t + NT * j] = xv;
+            }
+        }
     } else {
         float ssq[QM];
 #pragma unroll
@@ -299,16 +325,25 @@ void attn_res(const ArArgs& a, int nblocks, cudaStream_t s) {
 
 __global__ void __launch_bounds__(NT) k_norm(NormArgs a) {
     __shared__ float sm[NW * 32];
-    const int t = threadIdx.x, s = blockIdx.x, warp = t >> 5;
+    const int t = threadIdx.x, s = a.T > 1 ? blockIdx.y : blockIdx.x, warp = t >> 5, tk = a.T > 1 ? blockIdx.x : 0;
     float v[3], ss = 0.f;
 #pragma unroll
     for (int j = 0; j < 3; ++j) {
-        v[j] = a.in[s][t + NT * j];
+        v[j] = a.in[s][(long)tk * H + t + NT * j];
         ss += v[j] * v[j];
     }
     float r[1] = {ss};
     bred<1>(r, sm);
     const float f = rsqrtf(r[0] / H + 1e-6f);
+    if (a.xh_out) {
+#pragma unroll
+        for (int j = 0; j < 3; ++j) {
+            const float xv = a.nw[s][t + NT * j] * (v[j] * f);
+            a.xh_out[((long)s * a.T + tk) * H + t + NT * j] = __float2half(xv);
+            if (a.xn_out) a.xn_out[((long)s * a.T + tk) * H + t + NT * j] = xv;
+        }
+        return;
+    }
     const Q8Buf o = q8_stream(a.q8, s);
 #pragma unroll
     for (int j = 0; j < 3; ++j) {
@@ -317,7 +352,7 @@ __global__ void __launch_bounds__(NT) k_norm(NormArgs a) {
         q8_store_chunk(xn, warp + NW * j, o);
     }
 }
-void norm_q8(const NormArgs& a, cudaStream_t s) { k_norm<<<a.S, NT, 0, s>>>(a); }
+void norm_q8(const NormArgs& a, cudaStream_t s) { k_norm<<<a.T > 1 ? dim3(a.Tg ? a.Tg : a.T, a.S) : dim3(a.S), NT, 0, s>>>(a); }
 
 // ------------------------------------------------------------------------------------------------------------------
 // loop message gates: g = down @ [rms_u(h), rms_u(msg)] ; out = (1 - tanh(F g)) h + tanh(G g) msg
@@ -830,22 +865,44 @@ void moe_w2(const ExpertW& W, const Q8Vec& act, const int* ids, const float* wts
     std::abort();
 }
 
-__global__ void __launch_bounds__(NT) k_finish(const float* res, const float* y, const float* cw, float* cst, float* h_out) {
+__global__ void __launch_bounds__(NT) k_finish(const float* res, const float* y, const float* cw, float* cst, float* h_out, int ntok) {
+    const long tok = blockIdx.x;
 #pragma unroll
     for (int j = 0; j < 3; ++j) {
         const int c = threadIdx.x + NT * j;
-        const float x = y[c];
-        const float s0 = cst[c], s1 = cst[H + c], s2 = cst[2 * H + c];
+        const float x = y[tok * H + c];
+        const long i3 = tok - 3, i2 = tok - 2, i1 = tok - 1;
+        const float s0 = i3 >= 0 ? y[i3 * H + c] : cst[(3 + i3) * H + c];
+        const float s1 = i2 >= 0 ? y[i2 * H + c] : cst[(3 + i2) * H + c];
+        const float s2 = i1 >= 0 ? y[i1 * H + c] : cst[(3 + i1) * H + c];
         const float4 w = *reinterpret_cast<const float4*>(cw + 4 * c);
         const float yy = w.x * s0 + w.y * s1 + w.z * s2 + w.w * x;
-        cst[c] = s1;
-        cst[H + c] = s2;
-        cst[2 * H + c] = x;
-        h_out[c] = res[c] + (yy + x) * 0.44721359549995794f;
+        if (ntok == 1) {
+            cst[c] = s1;
+            cst[H + c] = s2;
+            cst[2 * H + c] = x;
+        }
+        h_out[tok * H + c] = res[tok * H + c] + (yy + x) * 0.44721359549995794f;
     }
 }
-void finish(const float* res, const float* y, const float* cw, float* cst, float* h_out, cudaStream_t s) {
-    k_finish<<<1, NT, 0, s>>>(res, y, cw, cst, h_out);
+void finish(const float* res, const float* y, const float* cw, float* cst, float* h_out, cudaStream_t s, int T) {
+    k_finish<<<T, NT, 0, s>>>(res, y, cw, cst, h_out, T);
+}
+
+// causal-conv state update after a chunk of T rows (row stride `rs` floats, D channels): state = last 3 of [state, rows]
+__global__ void k_conv_commit(const float* rows, long rs, int T, int D, float* st) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= D) return;
+    float old[3] = {st[c], st[D + c], st[2 * D + c]}, nw[3];
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+        const int idx = T + i;
+        nw[i] = idx < 3 ? old[idx] : rows[(long)(idx - 3) * rs + c];
+    }
+    st[c] = nw[0]; st[D + c] = nw[1]; st[2 * D + c] = nw[2];
+}
+void conv_commit(const float* rows, long rs, int T, int D, float* st, cudaStream_t s) {
+    k_conv_commit<<<(D + 255) / 256, 256, 0, s>>>(rows, rs, T, D, st);
 }
 
 }  // namespace qv::cuda::ink

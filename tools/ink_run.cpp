@@ -30,7 +30,7 @@ static std::vector<int> read_i32(const std::string& p) {
 int main(int argc, char** argv) {
     std::string model, ids_path, out;
     int gen = 32, max_ctx = 8192, n = 128, synth = 0, chunk = 2048;
-    bool bench = false, use_prefill = false, no_graph = false;
+    bool bench = false, use_prefill = false, no_graph = false, pfgen = false;
     std::string kv = "fp16";
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -45,6 +45,8 @@ int main(int argc, char** argv) {
         else if (a == "--bench") bench = true;
         else if (a == "--prefill") use_prefill = true;
         else if (a == "--no-graph") no_graph = true;
+        else if (a == "--pf-gen") pfgen = true;
+        else if (a == "--chunk") chunk = std::stoi(next());
         else if (a == "--prefill-chunk") chunk = std::stoi(next());
         else if (a == "--kv") kv = next();
         else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
@@ -54,7 +56,7 @@ int main(int argc, char** argv) {
     opt.max_ctx = max_ctx;
     opt.prefill_chunk = chunk;
     opt.kv_mode = kv == "int4" ? 1 : kv == "fp16" ? 2 : 0;
-    opt.dump_hidden = !bench && !out.empty();
+    opt.dump_hidden = !bench && !pfgen && !out.empty();
     auto t0 = std::chrono::steady_clock::now();
     auto eng = qv::make_cuda_engine(mf, opt);
     eng->sync();
@@ -67,6 +69,7 @@ int main(int argc, char** argv) {
     const int N = (int)ids.size();
     using clk = std::chrono::steady_clock;
     if (bench) {
+        if (use_prefill) { eng->prefill(ids.data(), N, 0); eng->sync(); eng->reset(); }  // warm-up (allocations, cuBLAS)
         auto e0 = clk::now();
         eng->prefill(ids.data(), N, 0);
         int next = eng->argmax();
@@ -86,6 +89,31 @@ int main(int argc, char** argv) {
                     "\"decode_tokens\": %d, \"decode_ms\": %.2f, \"decode_tok_s\": %.2f, \"vram_used_gib\": %.3f, \"ids\": [",
                     N, pos + 4, synth > N ? "true" : "false", pre_ms, N / (pre_ms / 1e3), n, dec_ms, n / (dec_ms / 1e3), (tot - fr) / 1073741824.0);
         for (size_t i = 0; i < rest.size() && i < 32; ++i) std::printf("%s%d", i ? ", " : "", rest[i]);
+        std::printf("]}\n");
+        return 0;
+    }
+    if (pfgen) {  // batched prefill, then greedy decode (graph); prints last-position logits stats and ids
+        auto e0 = clk::now();
+        eng->prefill(ids.data(), N, 0);
+        eng->sync();
+        const double pre_s = std::chrono::duration<double>(clk::now() - e0).count();
+        std::vector<float> lg;
+        eng->logits(lg);
+        int first = eng->argmax();
+        std::vector<int> rest;
+        if (gen > 1) eng->decode_greedy(first, N, gen - 1, rest, true);
+        rest.insert(rest.begin(), first);
+        if (!out.empty() && !eng->hidden_dump().empty()) {
+            std::ofstream o(out + ".hid", std::ios::binary);
+            o.write((const char*)eng->hidden_dump().data(), eng->hidden_dump().size() * 4);
+        }
+        if (!out.empty()) {
+            std::ofstream o(out, std::ios::binary);
+            o.write((const char*)lg.data(), lg.size() * 4);
+            o.write((const char*)rest.data(), rest.size() * 4);
+        }
+        std::printf("{\"prompt_tokens\": %d, \"prefill_s\": %.3f, \"prefill_tok_s\": %.1f, \"ids\": [", N, pre_s, N / pre_s);
+        for (size_t i = 0; i < rest.size(); ++i) std::printf("%s%d", i ? ", " : "", rest[i]);
         std::printf("]}\n");
         return 0;
     }

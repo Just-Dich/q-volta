@@ -11,16 +11,24 @@
 #include <vector>
 
 #include "../backends/cuda/common.cuh"
+#include <cublas_v2.h>
+
 #include "../backends/cuda/inkling/ink_ops.h"
+#include "../backends/cuda/inkling/ink_prefill.h"
+#include "../backends/cuda/kernels/dequant.h"
 #include "../backends/cuda/kernels/elementwise.h"
 #include "../backends/cuda/kernels/gemv.h"
 #include "qv/engine.h"
+
+#define QV_CUBLAS(x) do { cublasStatus_t st_ = (x); if (st_ != CUBLAS_STATUS_SUCCESS) { std::fprintf(stderr, "cuBLAS error %d at %s:%d\n", (int)st_, __FILE__, __LINE__); std::abort(); } } while (0)
 
 namespace qv {
 using namespace qv::cuda;
 namespace ik = qv::cuda::ink;
 
 namespace {
+static bool g_pfdump = std::getenv("QV_INK_PF_DUMP") != nullptr;
+static int g_dbgapp = std::getenv("QV_INK_DBGAPP") ? std::atoi(std::getenv("QV_INK_DBGAPP")) : -1;
 static bool g_trace = std::getenv("QV_INK_TRACE") != nullptr;
 #define STAGE(name) do { if (g_trace) { cudaError_t e_ = cudaStreamSynchronize(stream_); std::fprintf(stderr, "app %d L%d p%d %s -> %s\n", A.idx, A.L, A.p, name, cudaGetErrorString(e_)); } } while (0)
 
@@ -56,6 +64,7 @@ class InklingEngine final : public Engine {
         reset();
     }
     ~InklingEngine() override {
+        if (cublas_) cublasDestroy(cublas_);
         if (g_fwd_) cudaGraphExecDestroy(g_fwd_);
         if (g_dec_) cudaGraphExecDestroy(g_dec_);
         if (h_tp_) cudaFreeHost(h_tp_);
@@ -81,8 +90,19 @@ class InklingEngine final : public Engine {
     }
 
     void prefill(const int* tokens, int T, int pos0) override {
-        for (int i = 0; i < T; ++i) step(tokens[i], pos0 + i);  // TODO(batched prefill): token-by-token for now
-        if (opt_.row_logits) QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
+        const bool batched = !opt_.dump_hidden && std::getenv("QV_INK_STEP_PREFILL") == nullptr;
+        if (pos0 + T > opt_.max_ctx) throw std::runtime_error("context overflow");
+        int off = 0;
+        while (off < T) {
+            const int n = std::min(T - off, opt_.prefill_chunk);
+            if (!batched || n < 4) {
+                for (int i = 0; i < n; ++i) step(tokens[off + i], pos0 + off + i);
+            } else {
+                prefill_chunk(tokens + off, n, pos0 + off);
+            }
+            off += n;
+        }
+        QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
     }
 
     void decode_greedy(int first, int start_pos, int n, std::vector<int>& out, bool use_graph) override {
@@ -375,6 +395,246 @@ class InklingEngine final : public Engine {
         }
     }
 
+
+    // ======================================== batched prefill ========================================
+    cublasHandle_t cublas_ = nullptr;
+    int Tp_ = 0;  // allocated rows (multiple of 64)
+    float *hT_, *preT_, *blocksT_, *resT_, *arawT_, *ymoeT_, *mrawT_, *prevhT_, *prevb2T_, *uT_, *gsT_, *msgsT_, *PB_, *xmf_, *router32_, *rlogT_, *wtsT_, *g32_, *fT_, *gT_;
+    __half *xhT_, *xmh_, *qh_, *relh_, *rlT_, *o16_, *stK_, *stV_, *Xs_, *Y13_, *Ah_, *Y2_, *xcat_, *g16_, *slab_, *relproj_h_;
+    int *idsT_, *permT_, *invT_, *cntT_, *offsT_, *fillT_, *d_ptok_, *h_offs_ = nullptr;
+    size_t slab_bytes_ = (size_t)32 << 20;
+
+    template <class T> T* palloc(size_t n) { return dalloc<T>(n); }
+    void alloc_prefill() {
+        Tp_ = (opt_.prefill_chunk + 63) / 64 * 64;
+        const size_t T = Tp_, H = ik::H;
+        QV_CUBLAS(cublasCreate(&cublas_));
+        QV_CUBLAS(cublasSetStream(cublas_, stream_));
+        QV_CUBLAS(cublasSetMathMode(cublas_, CUBLAS_TENSOR_OP_MATH));
+        hT_ = palloc<float>(T * H); preT_ = palloc<float>(T * H); blocksT_ = palloc<float>(4 * T * H); resT_ = palloc<float>(T * H);
+        arawT_ = palloc<float>(T * H); ymoeT_ = palloc<float>(T * H); mrawT_ = palloc<float>(T * H); prevhT_ = palloc<float>(T * H);
+        prevb2T_ = palloc<float>(T * H); uT_ = palloc<float>(3 * T * H); gsT_ = palloc<float>(3 * T * H); msgsT_ = palloc<float>(4 * T * H);
+        PB_ = palloc<float>(T * ik::PS); xmf_ = palloc<float>(T * H); router32_ = palloc<float>((size_t)24 * 128 * H); rlogT_ = palloc<float>(T * 128); wtsT_ = palloc<float>(T * 8);
+        g32_ = palloc<float>(T * 64); fT_ = palloc<float>(T * H); gT_ = palloc<float>(T * H);
+        xhT_ = palloc<__half>(3 * T * H); xmh_ = palloc<__half>(T * H); qh_ = palloc<__half>(T * 3072); relh_ = palloc<__half>(T * 24 * 16);
+        rlT_ = palloc<__half>(T * 24 * 1024); o16_ = palloc<__half>(T * 3072);
+        stK_ = palloc<__half>((size_t)8 * (1024 + T) * 128); stV_ = palloc<__half>((size_t)8 * (1024 + T) * 128);
+        Xs_ = palloc<__half>(T * 8 * H); Y13_ = palloc<__half>(T * 8 * 2 * 1152); Ah_ = palloc<__half>(T * 8 * 1152); Y2_ = palloc<__half>(T * 8 * H);
+        xcat_ = palloc<__half>(T * 2 * H); g16_ = palloc<__half>(T * 64);
+        slab_ = (__half*)((void*)palloc<uint8_t>(slab_bytes_));
+        idsT_ = palloc<int>(T * 8); permT_ = palloc<int>(T * 8); invT_ = palloc<int>(T * 8);
+        cntT_ = palloc<int>(130); offsT_ = palloc<int>(130); fillT_ = palloc<int>(130); d_ptok_ = palloc<int>(T);
+        QV_CUDA_CHECK(cudaMallocHost(&h_offs_, 130 * 4));
+        // fp16 copies of rel_logits_proj [16][1024] for the bias-table GEMM
+        relproj_h_ = palloc<__half>((size_t)24 * 16 * 1024);
+        for (int L = 0; L < 24; ++L) ik::f32_to_f16(lw_[L].relproj, 16 * 1024, relproj_h_ + (size_t)L * 16 * 1024, stream_);
+        for (int L = 0; L < 24; ++L) ik::f16_to_f32(lw_[L].router.w, 128 * H, router32_ + (size_t)L * 128 * H, stream_);
+        QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
+    }
+
+    // C[M][N] (row-major, ld ldc) = A[M][K] * B[N][K]^T ; fp16 inputs, fp32 accumulate
+    void gemm_nt(const __half* A, int M, int K, const __half* B, int N, void* C, int ldc, bool c16) {
+        const float alpha = 1.f, beta = 0.f;
+        QV_CUBLAS(cublasGemmEx(cublas_, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha, B, CUDA_R_16F, K, A, CUDA_R_16F, K, &beta, C,
+                               c16 ? CUDA_R_16F : CUDA_R_32F, ldc, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    }
+    void qgemm(const QMat& W, const __half* A, int M, float* C, int ldc) {
+        dequant_rows_f16(W, 0, W.N, slab_, stream_);
+        gemm_nt(A, M, W.K, slab_, W.N, C, ldc, false);
+    }
+    void dgemm(const DMat16& W, const __half* A, int M, float* C, int ldc) { gemm_nt(A, M, W.K, W.w, W.N, C, ldc, false); }
+    QMat expert_view(const ik::ExpertW& E, int e) {
+        QMat m;
+        const size_t C = E.K >> 5, G = E.K >> E.gshift;
+        m.q = E.q + (size_t)e * E.N * C * E.bits;
+        m.sm8 = E.sm8 + (size_t)e * E.N * G;
+        m.rs = E.rs + (size_t)e * E.N;
+        m.N = E.N; m.K = E.K; m.bits = E.bits; m.gshift = E.gshift; m.zlo = E.zlo; m.zstep = E.zstep;
+        return m;
+    }
+    void gate_t(const float* h, const float* msg, const Ctrl& c, float* out, int T) {
+        ik::gate_cat(h, msg, T, xcat_, stream_);
+        gemm_nt(xcat_, T, 2 * ik::H, c.down, 64, g32_, 64, false);
+        ik::f32_to_f16(g32_, (long)T * 64, g16_, stream_);
+        gemm_nt(g16_, T, 64, c.forget, ik::H, fT_, ik::H, false);
+        gemm_nt(g16_, T, 64, c.gain, ik::H, gT_, ik::H, false);
+        ik::gate_apply_t(fT_, gT_, h, msg, (long)T * ik::H, out, stream_);
+    }
+
+    void prefill_chunk(const int* tokens, int T, int pos0) {
+        if (!cublas_) alloc_prefill();
+        if (T > Tp_) throw std::runtime_error("prefill chunk larger than allocation");
+        cudaStream_t s = stream_;
+        QV_CUDA_CHECK(cudaMemcpyAsync(d_ptok_, tokens, T * 4, cudaMemcpyHostToDevice, s));  // caller keeps `tokens` alive until sync: copy via pinned below
+        QV_CUDA_CHECK(cudaStreamSynchronize(s));
+        ik::embed_norm(embed_, d_ptok_, embed_norm_, hT_, blocksT_, s, T);
+        const long TH = (long)Tp_ * ik::H;
+        const InklingConfig& K = cfg_.ink;
+        for (const App& A : apps_) {
+            prefill_app(A, T, pos0);
+            if (g_pfdump) {
+                QV_CUDA_CHECK(cudaStreamSynchronize(s));
+                hidden_.resize((size_t)50 * ik::H);
+                const float* ho = (A.L == K.loop_start - 1) ? preT_ : hT_;
+                QV_CUDA_CHECK(cudaMemcpy(hidden_.data() + (size_t)(A.idx + 1) * ik::H, ho + (size_t)(T - 1) * ik::H, ik::H * 4, cudaMemcpyDeviceToHost));
+            }
+            if (A.L == K.loop_end - 1 && A.p < K.loop_passes - 1) {
+                ik::copy_f32(hT_, prevhT_, TH, s);
+                ik::copy_f32(blocksT_ + 2 * TH, prevb2T_, TH, s);
+            }
+        }
+        // last token: final mix + norm + head
+        ik::ArArgs f;
+        f.mode = 0; f.B = 4; f.Q = 1; f.mix = 1; f.epi = 0;
+        f.h = hT_; f.blocks = blocksT_; f.queries = out_query_; f.ntok = Tp_; f.tok0 = T - 1; f.raw_out = uT_;
+        ik::attn_res(f, 1, s);
+        ik::NormArgs n;
+        n.S = 1; n.in[0] = uT_ + (size_t)(T - 1) * ik::H; n.nw[0] = final_norm_; n.xn_out = xn_f_; n.q8 = q8x_;
+        ik::norm_q8(n, s);
+        gemv_q8(unembed_, q8x_, logits_, nullptr, s);
+        ik::softcap_inplace(logits_, cfg_.ink.unpadded_vocab, cfg_.ink.final_logit_softcap, s);
+    }
+
+    void prefill_app(const App& A, int T, int pos0) {
+        const InklingConfig& K = cfg_.ink;
+        const LayerW& W = lw_[A.L];
+        cudaStream_t s = stream_;
+        const int H = ik::H, L = A.L, p = A.p, li = A.L - K.loop_start;
+        const long TH = (long)Tp_ * H;
+        const bool glob = W.glob, msg = p > 0;
+        const float* hin = (L == K.loop_start) ? preT_ : hT_;
+        const int Battn = (L + 5) / 6;
+        const int Qa = glob ? 3 : 1;
+        // ---- 1. attention input
+        if (!msg) {
+            ik::ArArgs a;
+            a.mode = 0; a.B = Battn; a.Q = Qa; a.mix = L > 0; a.epi = 2; a.ntok = Tp_; a.allpar = 1;
+            a.h = hin; a.blocks = blocksT_; a.queries = W.attn_q;
+            for (int q = 0; q < Qa; ++q) a.nw[q] = W.nw[q];
+            a.xh_out = xhT_;
+            ik::attn_res(a, T, s);
+        } else {
+            ik::ArArgs m;
+            m.mode = 0; m.B = 1; m.Q = 4; m.mix = 1; m.epi = 0; m.ntok = Tp_; m.allpar = 1;
+            m.h = prevhT_; m.blocks = prevb2T_; m.queries = msgq_ + (size_t)li * 4 * H; m.raw_out = msgsT_;
+            ik::attn_res(m, T, s);
+            ik::ArArgs a;
+            a.mode = 0; a.B = Battn; a.Q = Qa; a.mix = 1; a.epi = 0; a.ntok = Tp_; a.allpar = 1;
+            a.h = hin; a.blocks = blocksT_; a.queries = W.attn_q; a.raw_out = uT_;
+            ik::attn_res(a, T, s);
+            for (int q = 0; q < 3; ++q) gate_t(glob ? uT_ + q * TH : uT_, msgsT_ + q * TH, W.ctrl[q], gsT_ + q * TH, T);
+            ik::NormArgs n;
+            n.S = 3; n.T = Tp_; n.Tg = T; n.xh_out = xhT_;
+            for (int q = 0; q < 3; ++q) { n.in[q] = gsT_ + q * TH; n.nw[q] = W.nw[q]; }
+            ik::norm_q8(n, s);
+        }
+        const int sk = (glob || msg) ? 1 : 0, sv = (glob || msg) ? 2 : 0;
+        // ---- 2. projections
+        qgemm(W.wq, xhT_, T, PB_ + 0, ik::PS);
+        qgemm(W.wk, xhT_ + sk * TH, T, PB_ + 3072, ik::PS);
+        qgemm(W.wv, xhT_ + sv * TH, T, PB_ + 4096, ik::PS);
+        qgemm(W.wg, xhT_, T, PB_ + 5120, ik::PS);
+        dgemm(W.wr, xhT_, T, PB_ + 8192, ik::PS);
+        dgemm(W.sink, xhT_, T, PB_ + 8576, ik::PS);
+        if (glob) {
+            dgemm(W.kproj, xhT_ + sk * TH, T, PB_ + 8600, ik::PS);
+            dgemm(W.vproj, xhT_ + sv * TH, T, PB_ + 8632, ik::PS);
+        }
+        // ---- 3. prep (+ staging of the local window)
+        const int SL = 1024 + Tp_;
+        __half *kc, *vc;
+        int cap;
+        long kbase;
+        __half *ringk = nullptr, *ringv = nullptr;
+        if (glob) {
+            kc = gk_ + (size_t)A.kvslot * ik::NKV * opt_.max_ctx * ik::HD;
+            vc = gv_ + (size_t)A.kvslot * ik::NKV * opt_.max_ctx * ik::HD;
+            cap = opt_.max_ctx; kbase = 0;
+        } else {
+            ringk = lk_ + (size_t)A.kvslot * ik::NKV * 1024 * ik::HD;
+            ringv = lv_ + (size_t)A.kvslot * ik::NKV * 1024 * ik::HD;
+            ik::ring_to_stage(ringk, stK_, SL, pos0, s);
+            ik::ring_to_stage(ringv, stV_, SL, pos0, s);
+            kc = stK_; vc = stV_; cap = SL; kbase = (long)pos0 - 1024;
+        }
+        {
+            ik::PrepTArgs P{};
+            P.proj = PB_; P.qscale = W.qscale; P.relscale = W.relscale; P.relproj = W.relproj; P.kw = W.kw; P.vw = W.vw;
+            P.kst = cst_k_ + (size_t)A.idx * 3 * 1024; P.vst = cst_v_ + (size_t)A.idx * 3 * 1024;
+            P.glob = glob; P.T = T; P.pos0 = pos0; P.qh = qh_; P.relh = relh_; P.kc = kc; P.vc = vc; P.cap = cap;
+            ik::attn_prep_t(P, s);
+            ik::conv_commit(PB_ + 3072, ik::PS, T, 1024, cst_k_ + (size_t)A.idx * 3 * 1024, s);
+            ik::conv_commit(PB_ + 4096, ik::PS, T, 1024, cst_v_ + (size_t)A.idx * 3 * 1024, s);
+        }
+        {  // relative-bias table: rl[t*24+h][d] = rel[t,h,:] . proj[:, d]
+            const float alpha = 1.f, beta = 0.f;
+            QV_CUBLAS(cublasGemmEx(cublas_, CUBLAS_OP_N, CUBLAS_OP_N, 1024, T * 24, 16, &alpha, relproj_h_ + (size_t)A.L * 16 * 1024, CUDA_R_16F, 1024,
+                                   relh_, CUDA_R_16F, 16, &beta, rlT_, CUDA_R_16F, 1024, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        }
+        // ---- 4. attention
+        {
+            ik::PfAttnArgs P{};
+            P.qh = qh_; P.kc = kc; P.vc = vc; P.kbase = kbase; P.cap = cap; P.rl = rlT_; P.proj = PB_; P.T = T; P.pos0 = pos0;
+            P.window = glob ? 0 : K.window; P.out = o16_;
+            ik::attn_prefill(P, s);
+            if (!glob) {
+                ik::stage_to_ring(stK_, ringk, SL, pos0, T, s);
+                ik::stage_to_ring(stV_, ringv, SL, pos0, T, s);
+            }
+        }
+        // ---- 5. output projection
+        qgemm(W.wo, o16_, T, arawT_, H);
+        // ---- 6. post-attention conv + residual, MLP-input mix
+        {
+            ik::ArArgs b;
+            b.mode = 1; b.B = Battn; b.Q = 1; b.mix = 1; b.boundary = (L % 6 == 0); b.ntok = Tp_; b.allpar = 1;
+            b.h = hin; b.araw = arawT_; b.cw = W.attn_sconv; b.cst = cst_a_ + (size_t)A.idx * 3 * H; b.res_out = resT_; b.blocks = blocksT_;
+            b.queries = W.mlp_q;
+            if (!msg) {
+                b.epi = 2; b.nw[0] = W.mlp_norm; b.xh_out = xmh_; b.xn_out = xmf_;
+                ik::attn_res(b, T, s);
+            } else {
+                b.epi = 0; b.raw_out = mrawT_;
+                ik::attn_res(b, T, s);
+                gate_t(mrawT_, msgsT_ + 3 * TH, W.ctrl[3], gsT_, T);
+                ik::NormArgs n;
+                n.S = 1; n.T = Tp_; n.Tg = T; n.in[0] = gsT_; n.nw[0] = W.mlp_norm; n.xh_out = xmh_; n.xn_out = xmf_;
+                ik::norm_q8(n, s);
+            }
+            ik::conv_commit(arawT_, H, T, H, cst_a_ + (size_t)A.idx * 3 * H, s);
+        }
+        // ---- 7. router
+        {
+            const float alpha = 1.f, beta = 0.f;
+            QV_CUBLAS(cublasSgemm(cublas_, CUBLAS_OP_T, CUBLAS_OP_N, 128, T, H, &alpha, router32_ + (size_t)A.L * 128 * H, H, xmf_, H, &beta, rlogT_, 128));
+        }
+        ik::topk_t(rlogT_, W.router_bias, idsT_, wtsT_, T, K.route_scale, s);
+        // ---- 8. experts: token-sorted grouped GEMM
+        ik::moe_sort(idsT_, T, cntT_, offsT_, fillT_, permT_, invT_, s);
+        QV_CUDA_CHECK(cudaMemcpyAsync(h_offs_, offsT_, 129 * 4, cudaMemcpyDeviceToHost, s));
+        QV_CUDA_CHECK(cudaStreamSynchronize(s));
+        ik::moe_gather(xmh_, permT_, T * 8, Xs_, s);
+        for (int e = 0; e < ik::NE; ++e) {
+            const int n = h_offs_[e + 1] - h_offs_[e];
+            if (n <= 0) continue;
+            dequant_rows_f16(expert_view(W.w13, e), 0, 2304, slab_, s);
+            gemm_nt(Xs_ + (size_t)h_offs_[e] * H, n, H, slab_, 2 * ik::FF, Y13_ + (size_t)h_offs_[e] * 2 * ik::FF, 2 * ik::FF, true);
+        }
+        ik::moe_act(Y13_, T * 8, K.gate_softcap, K.up_softcap, Ah_, s);
+        for (int e = 0; e < ik::NE; ++e) {
+            const int n = h_offs_[e + 1] - h_offs_[e];
+            if (n <= 0) continue;
+            dequant_rows_f16(expert_view(W.w2, e), 0, 2304, slab_, s);
+            gemm_nt(Ah_ + (size_t)h_offs_[e] * ik::FF, n, ik::FF, slab_, H, Y2_ + (size_t)h_offs_[e] * H, H, true);
+        }
+        ik::moe_combine(Y2_, invT_, wtsT_, T, ymoeT_, s);
+        // ---- 9. MLP conv + residual
+        float* hout = (L == K.loop_start - 1) ? preT_ : hT_;
+        ik::finish(resT_, ymoeT_, W.mlp_sconv, cst_m_ + (size_t)A.idx * 3 * H, hout, s, Tp_);
+        ik::conv_commit(ymoeT_, H, T, H, cst_m_ + (size_t)A.idx * 3 * H, s);
+        if (g_dbgapp == A.idx) dbg_write("/tmp/ink/dbg_pf.bin", arawT_, resT_, xmf_, ymoeT_, idsT_, wtsT_, T - 1);
+    }
+
     cudaGraphExec_t capture(bool with_argmax) {
         // warm-up outside capture (lazy one-time allocations of the shared argmax scratch)
         argmax_advance(logits_, cfg_.ink.unpadded_vocab, d_arg_, nullptr, nullptr, stream_);
@@ -390,6 +650,18 @@ class InklingEngine final : public Engine {
         return ge;
     }
 
+    int dbg_n_ = 0;
+    void dbg_write(const char* path, const float* a, const float* b, const float* c, const float* d, const int* ids, const float* w, int row) {
+        QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
+        std::vector<float> buf(4 * ik::H + 16);
+        const float* src[4] = {a, b, c, d};
+        for (int i = 0; i < 4; ++i) QV_CUDA_CHECK(cudaMemcpy(&buf[(size_t)i * ik::H], src[i] + (size_t)row * ik::H, ik::H * 4, cudaMemcpyDeviceToHost));
+        QV_CUDA_CHECK(cudaMemcpy(&buf[4 * ik::H], ids + (size_t)row * 8, 32, cudaMemcpyDeviceToHost));
+        QV_CUDA_CHECK(cudaMemcpy(&buf[4 * ik::H + 8], w + (size_t)row * 8, 32, cudaMemcpyDeviceToHost));
+        FILE* f = std::fopen(path, "wb");
+        std::fwrite(buf.data(), 4, buf.size(), f);
+        std::fclose(f);
+    }
     void collect_dump() {
         QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
         hidden_.resize((size_t)50 * ik::H);
@@ -557,6 +829,7 @@ class InklingEngine final : public Engine {
         // ---- 9. MLP conv + residual
         float* hout = (L == K.loop_start - 1) ? pre_h_ : h_;
         ik::finish(res_, ymoe_, W.mlp_sconv, cst_m_ + (size_t)A.idx * 3 * H, hout, s);
+        if (g_dbgapp == A.idx) dbg_write((std::string("/tmp/ink/dbg_step") + std::to_string(dbg_n_++) + ".bin").c_str(), araw_, res_, xm_f_, ymoe_, ids_, wts_, 0);
         if (dump_d_) {
             QV_CUDA_CHECK(cudaMemcpyAsync(dump_d_ + (size_t)(A.idx + 1) * H, hout, H * 4, cudaMemcpyDeviceToDevice, s));
             QV_CUDA_CHECK(cudaMemcpyAsync(rid_d_ + A.idx * 8, ids_, 32, cudaMemcpyDeviceToDevice, s));

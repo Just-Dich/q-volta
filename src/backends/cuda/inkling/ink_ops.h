@@ -11,7 +11,7 @@ constexpr int HC = H / 32;  // 72 chunks of 32
 
 // ---- embedding + final -------------------------------------------------------------------------------------------
 // h = rms_w(dequant(embed[tok]), w); also copies h to blk0.
-void embed_norm(const QMat& E, const int* tok, const float* w, float* h, float* blk0, cudaStream_t s);
+void embed_norm(const QMat& E, const int* tok, const float* w, float* h, float* blk0, cudaStream_t s, int T = 1);
 void softcap_inplace(float* x, int n, float cap, cudaStream_t s);
 
 // ---- attention residual (+ optional fused sconv/residual of the attention branch, norm and int8 quantization) ----------
@@ -20,7 +20,9 @@ struct ArArgs {
     int B = 0;          // number of stored block states before this layer
     int Q = 1;          // number of queries
     int mix = 1;        // 0: out = partial (no attention residual; layer 0)
-    int epi = 0;        // 0: write raw mix to raw_out ; 1: rms_w (nw[q]) -> xn_out + q8 (stream q)
+    int epi = 0;        // 0: write raw mix to raw_out ; 1: rms_w (nw[q]) -> xn_out + q8 (stream q) ; 2: rms_w -> xh_out (fp16)
+    int ntok = 1, tok0 = 0, allpar = 0;  // prefill: ntok rows per buffer, allpar: token = blockIdx.x (else tok0)
+    __half* xh_out = nullptr;            // epi 2: fp16 normalised rows [q][ntok][H]
     int boundary = 0;   // mode 1: layer % 6 == 0: residual = a (no h), and h is appended to blocks[B]
     const float* h = nullptr;
     const float* araw = nullptr;
@@ -44,6 +46,9 @@ struct NormArgs {
     const float* nw[4] = {};
     float* xn_out = nullptr;
     Q8Buf q8;
+    int T = 1;                 // prefill: row stride (rows per stream); grid (Tg, S) when T > 1
+    int Tg = 0;
+    __half* xh_out = nullptr;  // fp16 output instead of xn_out/q8
 };
 void norm_q8(const NormArgs& a, cudaStream_t s);
 
@@ -120,6 +125,7 @@ struct ExpertW {  // stacked [E][N][K] bit-plane tensor
 void moe_w13(const ExpertW& W, const Q8Vec& x, const int* ids, Q8Buf act, float gcap, float ucap, cudaStream_t s);
 void moe_w2(const ExpertW& W, const Q8Vec& act, const int* ids, const float* wts, float* y, cudaStream_t s);
 // h_out = res + sconv(y)
-void finish(const float* res, const float* y, const float* cw, float* cst, float* h_out, cudaStream_t s);
+void finish(const float* res, const float* y, const float* cw, float* cst, float* h_out, cudaStream_t s, int T = 1);
+void conv_commit(const float* rows, long rs, int T, int D, float* st, cudaStream_t s);
 
 }  // namespace qv::cuda::ink

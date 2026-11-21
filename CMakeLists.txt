@@ -51,6 +51,7 @@ add_library(qv_cuda STATIC
   src/backends/cuda/attention/kv4.cu
   src/backends/cuda/attention/attn_seq_tc.cu
   src/backends/cuda/inkling/ink_ops.cu
+  src/backends/cuda/inkling/ink_prefill.cu
   src/runtime/cuda_inkling_engine.cu
   src/runtime/cuda_engine.cu)
 target_include_directories(qv_cuda PUBLIC include)
