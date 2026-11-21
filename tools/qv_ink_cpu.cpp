@@ -78,6 +78,10 @@ int main(int argc, char** argv) {
         auto eng = qv::make_cpu_engine(mf, opt);
         auto* info = dynamic_cast<qv::InklingCpuInfo*>(eng.get());
         std::fprintf(stderr, "loaded in %.1f s, decode bytes/token %.3f GB\n", now() - t0, info->decode_bytes_per_token() / 1e9);
+        {
+            std::ifstream sm("/proc/self/smaps_rollup");
+            for (std::string l; std::getline(sm, l);) if (l.rfind("AnonHugePages", 0) == 0 || l.rfind("Rss", 0) == 0) std::fprintf(stderr, "%s\n", l.c_str());
+        }
         if (nll) {
             t0 = now();
             eng->prefill(ids.data(), (int)ids.size(), 0);
@@ -93,6 +97,7 @@ int main(int argc, char** argv) {
                 tp = now() - tp;
                 std::vector<const char*> nm; std::vector<double> ms; std::vector<long> cn;
                 info->phase_report(nm, ms, cn);
+                for (size_t i = 0; i < nm.size(); ++i) std::printf("  prefill phase %-14s %9.1f ms  (%.1f%%)\n", nm[i], ms[i], 100.0 * ms[i] / (tp * 1e3));
                 std::vector<int> out;
                 int tok = eng->argmax();
                 eng->decode_greedy(tok, ctx, 4, out, false);  // warm-up

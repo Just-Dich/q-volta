@@ -1,0 +1,15 @@
+{
+ "date": "2026-11-21", "branch": "p14/ink-cpu", "host": "Xeon E5-2683 v4 AVX2, 32 pinned threads, huge pages, shared box (load avg 7-24)",
+ "model": "q3a5.qv (9.886 GiB)", "decode_bytes_per_token_GB": 2.592,
+ "dram_ceiling_nominal_GBs": 54, "dram_ceiling_measured_this_session_GBs": "36-41 (bench_cpu_gemv 3/4-bit, 32 threads)",
+ "decode_tok_s": {"ctx128": [11.269, 11.668], "ctx512": [11.222, 11.184], "ctx2048": [10.964, 10.966]},
+ "decode_ms_per_token": {"ctx128": [88.74, 85.70], "ctx512": [89.11, 89.41], "ctx2048": [91.20, 91.19]},
+ "effective_GBs": {"ctx128": [29.21, 30.24], "ctx512": [29.09, 28.99], "ctx2048": [28.42, 28.42]},
+ "fraction_of_54GBs_bound": 0.54, "fraction_of_measured_ceiling_39GBs": 0.75,
+ "prefill_tok_s_chunk256": {"ctx128": [70.35, 69.17], "ctx512": [83.08, 77.22], "ctx2048": [66.47, 67.55]},
+ "prefill_chunk_sweep_ctx1024_tok_s": {"128": 69.9, "512": 76.6, "1024": 70.8, "256_ctx512": 79.4},
+ "gemm_tile_sweep_ctx512_tok_s": {"RT4xTB2_default": 79.4, "RT2xTB4": 72.8, "RT4xTB4": 74.9, "RT3xTB3": 72.7},
+ "decode_profile_ms_ctx128": {"moe": 31.6, "proj": 18.1, "wo": 7.4, "lm_head": 5.5, "gate": 5.0, "router": 2.4, "attention": 2.9, "attention_ctx2048": 8.9},
+ "quality": {"val0_nll_engine": [1.46477, 1.46620], "val0_nll_reference_q3a5": 1.4643, "greedy_32_match_vs_q3a5_ref": {"p1": 28, "p2": 32, "p3": 32, "p4": 32}, "router_set_mismatch_frac": {"p1": 0.156, "p2": 0.167, "p3": 0.202, "p4": 0.503}},
+ "llama_cpp": "not compared (no Inkling GGUF, no inkling2_loop arch)"
+}

@@ -54,6 +54,9 @@ void ink_attn_partial(const InkAttnArgs& a, float* acc, float* ml);
 // group) together with the sink logit (value 0): out[d] = sum_s acc_s[d] e^{m_s - M} / (sum_s l_s e^{m_s - M} + e^{sink - M}) * sigmoid(gate[d]).
 void ink_attn_merge(const float* part, int ns, size_t stride, int i, float sink, const float* gate, float* out);
 
+// x = cap * tanh(x / cap), in place
+void softcap_inplace(float* x, int n, float cap);
+
 // fp32 vector -> fp16 row (round to nearest even), 128-element rows
 void store_f16(const float* x, uint16_t* out, int n);
 

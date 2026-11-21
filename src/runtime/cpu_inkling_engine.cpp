@@ -393,7 +393,7 @@ class InkCpuEngine final : public Engine, public InklingCpuInfo {
         F(prevB_, T * H); F(prevH_, T * H); F(preH_, T * H); F(msgs_, T * 4 * H); F(blk_, T * MAX_BLK * H);
         F(qraw_, T * QD); F(gat_, T * QD); F(kraw_, T * KD); F(vraw_, T * KD); F(rraw_, T * NH * DREL); F(sraw_, T * NH);
         F(dwk_, T * 32); F(dwv_, T * 32); F(kc_, T * KD); F(vc_, T * KD); F(qp_, T * QD); F(relp_, T * NH * DREL);
-        F(part_, std::max(T * 8 * 390, (size_t)8 * 4 * 390));
+        F(part_, std::max(T * 8 * 390, (size_t)8 * 16 * 390));
         F(ob_, T * QD); F(gcat_, T * 2 * H); F(rl_, T * NE); F(fin_, T * H);
         sel_.assign(T * TOPK, 0); rw_.assign(T * TOPK, 0.f); pairpos_.assign(T * TOPK, 0);
         const size_t P = T * TOPK;
@@ -452,23 +452,26 @@ class InkCpuEngine final : public Engine, public InklingCpuInfo {
         MJob j; j.wf = w; j.N = N; j.K = K; j.xf = x; j.ldx = ldx; j.y = y; j.ldy = ldy;
         jobs_.push_back(j);
     }
+    static size_t ntb(const MJob& j, int T) { return (j.w || T <= 64) ? 1 : (size_t)((T + 63) / 64); }
     void run_jobs(int T, int claim = 4) {
         constexpr int CH = 16;
         size_t total = 0;
         std::vector<size_t> pre(jobs_.size() + 1, 0);
-        for (size_t i = 0; i < jobs_.size(); ++i) { pre[i] = total; total += (size_t)(jobs_[i].N + CH - 1) / CH; }
+        for (size_t i = 0; i < jobs_.size(); ++i) { pre[i] = total; total += (size_t)(jobs_[i].N + CH - 1) / CH * ntb(jobs_[i], T); }
         pre[jobs_.size()] = total;
         pool_.parallel_for_dyn(total, [&](size_t b, size_t e, int) {
             for (size_t i = b; i < e; ++i) {
                 size_t j = 0;
                 while (pre[j + 1] <= i) ++j;
                 const MJob& jb = jobs_[j];
-                const int r0 = (int)(i - pre[j]) * CH, r1 = std::min(jb.N, r0 + CH);
+                const size_t nrc = (size_t)(jb.N + CH - 1) / CH, li = i - pre[j];
+                const int r0 = (int)(li % nrc) * CH, r1 = std::min(jb.N, r0 + CH), tb = (int)(li / nrc);
                 if (jb.w) {
                     if (T == 1) gemv_q(*jb.w, jb.a->a1, jb.y, r0, r1);
                     else gemm_q(*jb.w, jb.a->b, T, jb.y, jb.ldy, r0, r1, jb.act_off);
                 } else {
-                    gemm_f16_rows(jb.wf, jb.K, jb.xf, jb.ldx, T, jb.y, jb.ldy, r0, r1);
+                    const int t0 = tb * 64, tn = std::min(64, T - t0);
+                    gemm_f16_rows(jb.wf, jb.K, jb.xf + (size_t)t0 * jb.ldx, jb.ldx, tn, jb.y + (size_t)t0 * jb.ldy, jb.ldy, r0, r1);
                 }
             }
         }, (size_t)claim);
@@ -548,15 +551,18 @@ class InkCpuEngine final : public Engine, public InklingCpuInfo {
                 for (size_t it = b; it < e; ++it) {
                     const int s = (int)(it / nch), c0 = (int)(it % nch) * CHR;
                     const Ctrl& ct = w.ctl[which[s]];
-                    alignas(32) float fgt[64], mg[64];
+                    static thread_local std::vector<float> fgt, mg;
+                    fgt.resize((size_t)T * 64); mg.resize((size_t)T * 64);
+                    gemm_f16_rows(ct.forget, 64, g64_[s].data(), 64, T, fgt.data() - c0, 64, c0, c0 + CHR);
+                    gemm_f16_rows(ct.gain, 64, g64_[s].data(), 64, T, mg.data() - c0, 64, c0, c0 + CHR);
                     for (int t = 0; t < T; ++t) {
-                        const float* g = g64_[s].data() + (size_t)t * 64;
-                        gemm_f16_rows(ct.forget, 64, g, 64, 1, fgt - c0, 64, c0, c0 + CHR);
-                        gemm_f16_rows(ct.gain, 64, g, 64, 1, mg - c0, 64, c0, c0 + CHR);
+                        float* f = fgt.data() + (size_t)t * 64;
+                        float* m = mg.data() + (size_t)t * 64;
+                        softcap_inplace(f, CHR, 1.0f);
+                        softcap_inplace(m, CHR, 1.0f);
                         for (int i = 0; i < CHR; ++i) {
-                            const float f = std::tanh(fgt[i]), m = std::tanh(mg[i]);
                             const size_t o = (size_t)t * H + c0 + i;
-                            os[s][o] = (1.0f - f) * hs[s][o] + m * ms[s][(size_t)t * msg_ld + c0 + i];
+                            os[s][o] = (1.0f - f[i]) * hs[s][o] + m[i] * ms[s][(size_t)t * msg_ld + c0 + i];
                         }
                     }
                 }
@@ -708,7 +714,7 @@ class InkCpuEngine final : public Engine, public InklingCpuInfo {
             if (T == 1) {
                 const int p = pos0;
                 const int n = glob ? p + 1 : std::min(p + 1, WIN);
-                attn_ns_ = std::max(1, std::min(4, n / 128));
+                attn_ns_ = std::max(1, std::min(16, n / 128));
             }
             const int ns = attn_ns_;
             pool_.parallel_for_dyn((size_t)T * NKV * ns, [&](size_t b, size_t e, int) {
@@ -994,15 +1000,16 @@ class InkCpuEngine final : public Engine, public InklingCpuInfo {
         {
             Scope sc(this, P_HEAD);
             const int nl = all_rows ? T : 1;
-            std::vector<float> lg((size_t)nl * V_);
+            lg_.resize((size_t)nl * V_);
             quant(aqf_, fin_.data() + (size_t)(T - nl) * H, H, nl);
-            qjob(head_, aqf_, lg.data(), (size_t)V_);
+            qjob(head_, aqf_, lg_.data(), (size_t)V_);
             run_jobs(nl, 16);
-            for (auto& x : lg) x = 30.0f * std::tanh(x / 30.0f);
-            if (opt_.dump_hidden) std::memcpy(logits_dump_.data() + (size_t)dump_off_ * V_, lg.data(), (size_t)nl * V_ * 4);
+            const float cap = cfg_.ink.final_logit_softcap;
+            pool_.parallel_for((size_t)nl * V_, [&](size_t b, size_t e, int) { softcap_inplace(lg_.data() + b, (int)(e - b), cap); }, 4096);
+            if (opt_.dump_hidden) std::memcpy(logits_dump_.data() + (size_t)dump_off_ * V_, lg_.data(), (size_t)nl * V_ * 4);
             if (opt_.row_logits)
-                for (int t = 0; t < nl; ++t) opt_.row_logits(pos0 + t, lg.data() + (size_t)t * V_);
-            std::memcpy(logits_.data(), lg.data() + (size_t)(nl - 1) * V_, (size_t)V_ * 4);
+                for (int t = 0; t < nl; ++t) opt_.row_logits(pos0 + t, lg_.data() + (size_t)t * V_);
+            std::memcpy(logits_.data(), lg_.data() + (size_t)(nl - 1) * V_, (size_t)V_ * 4);
         }
     }
 
@@ -1030,6 +1037,7 @@ class InkCpuEngine final : public Engine, public InklingCpuInfo {
     std::vector<float> hid_, resid_, hm_, xm_, aout_, xin_[3], xn_[3], g64_[3], gcat_, gcat3_, prevB_, prevH_, preH_, msgs_, blk_;
     std::vector<float> qraw_, gat_, kraw_, vraw_, rraw_, sraw_, dwk_, dwv_, kc_, vc_, qp_, relp_, part_, ob_, rl_, fin_, rw_, ypair_, gu8_, act8_, actf_,
         logits_, cstate_;
+    std::vector<float> lg_;
     std::vector<int> sel_, pairpos_, order_;
     ActQ aq_[3], aqo_, aqm_, aqf_, aq8_[8], aqx_, aqa_;
     PaddedAtomic cnt_[8], ready_[8];

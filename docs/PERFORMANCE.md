@@ -157,3 +157,14 @@ E1 matrix (3 runs, [min-max] tok/s; all ids identical to plain; accept rate in p
 | wikitext 2048 | 55.7 [55.69-55.74] | 76.8 [76.70-76.84] (0.684) | 83.6 [83.38-83.77] (0.537) | 76.4 [76.26-76.54] (0.420) |
 | wikitext 4088 | 54.6 [54.18-54.79] | 78.1 [77.51-79.04] (0.789) | 94.1 [92.93-96.21] (0.731) | 81.4 [80.16-83.31] (0.527) |
 Note: during this session another job intermittently used the GPU/lock; runs were serialized with flock and retried when the GPU was occupied, and the spreads above are tight. Raw data: benchmarks/results/gpu_perf_2026-11-21.json.
+
+## CPU Inkling-2-Mini (Q3A5, p14/ink-cpu, 2026-11-21)
+Details and correctness: docs/INKLING_CPU.md; raw: benchmarks/results/inkling_cpu_20261121.json. 32 pinned threads, AVX2, one session on a shared box.
+| ctx | decode tok/s | GB/s (2.592 GB/token) | of 54 GB/s | prefill tok/s (chunk 256) |
+|---:|---:|---:|---:|---:|
+| 128 | 11.3-11.7 | 29-30 | 54-56 % | 69-70 |
+| 512 | 11.2 | 29 | 54 % | 77-83 |
+| 2048 | 11.0 | 28.4 | 53 % | 66-68 |
+Same-session `bench_cpu_gemv` streamed 36-41 GB/s (not 54), so against the measured ceiling the engine is at ~75 %. Design estimate 17-20 tok/s NOT reached.
+MoE decode region 39 GB/s (at the box ceiling); the rest is dense GEMV, lm_head, loop gates and ~100 barriers/token. Prefill is compute bound at ~0.5 TMAC/s;
+chunk size (128-1024) and register tile (4x2, 2x4, 4x4, 3x3) change it by < 10 %. Quality: val NLL 1.465-1.466 vs reference 1.4643. No llama.cpp comparison.

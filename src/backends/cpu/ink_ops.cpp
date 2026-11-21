@@ -131,7 +131,23 @@ void gemm_f16_rows(const uint16_t* W, int K, const float* X, size_t ldx, int T, 
         int k = 0;
         for (; k + 8 <= K; k += 8) _mm256_storeu_ps(wf.data() + k, load_f16x8(w + k));
         for (; k < K; ++k) wf[k] = _cvtsh_ss(w[k]);
-        for (int t = 0; t < T; ++t) Y[(size_t)t * ldy + n] = dot_f32(wf.data(), X + (size_t)t * ldx, K);
+        int t = 0;
+        for (; t + 4 <= T; t += 4) {
+            const float* x0 = X + (size_t)t * ldx;
+            __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+            int k2 = 0;
+            for (; k2 + 8 <= K; k2 += 8) {
+                const __m256 wv = _mm256_loadu_ps(wf.data() + k2);
+                a0 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(x0 + k2), a0);
+                a1 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(x0 + ldx + k2), a1);
+                a2 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(x0 + 2 * ldx + k2), a2);
+                a3 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(x0 + 3 * ldx + k2), a3);
+            }
+            float r0 = hsum(a0), r1 = hsum(a1), r2 = hsum(a2), r3 = hsum(a3);
+            for (; k2 < K; ++k2) { r0 += wf[k2] * x0[k2]; r1 += wf[k2] * x0[ldx + k2]; r2 += wf[k2] * x0[2 * ldx + k2]; r3 += wf[k2] * x0[3 * ldx + k2]; }
+            Y[(size_t)t * ldy + n] = r0; Y[(size_t)(t + 1) * ldy + n] = r1; Y[(size_t)(t + 2) * ldy + n] = r2; Y[(size_t)(t + 3) * ldy + n] = r3;
+        }
+        for (; t < T; ++t) Y[(size_t)t * ldy + n] = dot_f32(wf.data(), X + (size_t)t * ldx, K);
     }
 }
 
@@ -203,6 +219,13 @@ void expert_act_interleaved(const float* gu, float* act, int n_pairs, float gcap
         const float g = gu[2 * i], u = gu[2 * i + 1];
         act[i] = gcap * std::tanh(g / gcap) * (1.0f / (1.0f + std::exp(-g))) * (ucap * std::tanh(u / ucap));
     }
+}
+
+void softcap_inplace(float* x, int n, float cap) {
+    const __m256 c = _mm256_set1_ps(cap), ci = _mm256_set1_ps(1.0f / cap);
+    int i = 0;
+    for (; i + 8 <= n; i += 8) _mm256_storeu_ps(x + i, _mm256_mul_ps(c, tanh256(_mm256_mul_ps(_mm256_loadu_ps(x + i), ci))));
+    for (; i < n; ++i) x[i] = cap * std::tanh(x[i] / cap);
 }
 
 void store_f16(const float* x, uint16_t* out, int n) {
@@ -302,7 +325,7 @@ void ink_attn_merge(const float* part, int ns, size_t stride, int i, float sink,
     constexpr int D = 128;
     float M = sink;
     for (int s = 0; s < ns; ++s) M = std::max(M, part[s * stride + 3 * D + 2 * i]);
-    float w[8], L = std::exp(sink - M);
+    float w[16], L = std::exp(sink - M);
     for (int s = 0; s < ns; ++s) {
         const float m = part[s * stride + 3 * D + 2 * i];
         w[s] = m == -INFINITY ? 0.f : std::exp(m - M);

@@ -34,3 +34,8 @@ HF logit parity NOT verified (H-I1 partially: spec + behaviourally validated ref
 stored precision 5.4 GiB (68 % dense bf16) -> ~130 tok/s V100 ceiling unless dense weights are quantised.
 ## p11/perf (2026-11-21)
 Fixed the decode regression introduced by p10/quant (bisected: only 28dcefc; tensor-core attention and int4 KV are neutral). Hot GEMV kernels now compile per (group, meta8) mode, so group-64 E0 runs the pre-p10 code; meta8 row scale hoisted. E0 code: plain 48.7 -> 52.2, MTP-3 104.4 -> 131.5 (324ea1e: 52.2 / 129.6); E1: plain 55.4 -> 57.6, MTP-3 114.7 -> 138.2. Bit-exact (ids identical, ctest 13/13, test_cuda_mtp E0+E1). E1 is faster in tok/s but ~9% lower in effective bytes/s than E0. See docs/PERFORMANCE.md, benchmarks/results/gpu_perf_2026-11-21.json.
+## p14/ink-cpu (2026-11-21)
+CPU engine for Inkling-2-Mini (src/runtime/cpu_inkling_engine.cpp, ink_ops, docs/INKLING_CPU.md): decode (one parallel region per MoE layer application, experts x row chunks),
+batched prefill with token-sorted expert GEMM, fp16 KV (local ring + global per-pass slots). Q3A5: decode 11.0-11.7 tok/s at ctx 128-2048 (54 % of the 54 GB/s bound, ~75 % of the
+39 GB/s this box streamed during the runs), prefill 66-83 tok/s; 32/32 greedy ids on 3 of 4 goldens vs the Q3A5 reference (p1 flips at a 0.056-logit near tie), val NLL +0.0005..0.002.
+Router ids are not identical (int8 activation noise amplified by the loop). New goldens tests/golden/inkling_q3a5 (tools/inkling_golden_q.py).
