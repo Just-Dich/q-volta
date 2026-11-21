@@ -82,10 +82,10 @@ class QInkling(Inkling):
             self.ecache.pop(key); self.ecache_bytes -= (w13.numel() + w2.numel()) * 2
             out = []
             for W in (w13.float(), w2.float()):
-                q, S, M, rs = Q.rtn(W, b, g, clip=clip, meta8=True)
-                out.append(Q.dequant_g(q, S, M, g, b, rs).half())
+                q, S, M, rs = Q.rtn(W.cuda(), b, g, clip=clip, meta8=True)  # GPU: CPU RTN+clip is ~50x slower
+                out.append(Q.dequant_g(q, S, M, g, b, rs).half().cpu())
             w13, w2 = out
-        self.ecache[key] = (w13, w2)
+        res = self.ecache[key] = (w13, w2)
         self.ecache_bytes += (w13.numel() + w2.numel()) * 2
         if self.ecache_bytes > self.ecache_limit:
             for k in list(self.ecache.keys()):
@@ -93,7 +93,7 @@ class QInkling(Inkling):
                     t = self.ecache.pop(k); self.ecache_bytes -= sum(x.numel() * 2 for x in t)
                     if self.ecache_bytes < 0.9 * self.ecache_limit:
                         break
-        return self.ecache[key]
+        return res
 
 
 def kl(a, b):
@@ -135,6 +135,16 @@ def eval_nll(m, d=K.MODEL, n=512):
     return dict(nll=float(-lp.gather(1, torch.tensor(ids[1:])[:, None]).mean()), n=len(ids) - 1)
 
 
+def eval_val(m, calib="/workspace/q-volta-models/scratch-inkling/calib"):
+    """NLL on the held-out calibration-dump sequence val0 (1024 wikitext-train + 1024 python-source tokens; never used for calibration)."""
+    ids = [int(x) for x in np.load(os.path.join(calib, "seq_val0.npz"))["ids"]]
+    with torch.no_grad():
+        lg = m.forward(ids, m.new_cache(), all_logits=True)
+    lp = torch.log_softmax(lg[:-1].float(), -1)
+    nl = -lp.gather(1, torch.tensor(ids[1:])[:, None]).squeeze(1)
+    return dict(nll=float(nl.mean()), nll_wiki=float(nl[:1023].mean()), nll_code=float(nl[1024:].mean()), n=len(ids) - 1)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=K.MODEL)
@@ -152,7 +162,7 @@ def main():
     res = json.load(open(a.out)) if os.path.exists(a.out) else {}
     names = {"p1": "p1_en", "p2": "p2_code", "p3": "p3_multi", "p4": "p4_long4k"}
     for t in a.tasks.split(","):
-        r = eval_nll(m) if t == "nll" else eval_prompt(m, a.golden, names[t])
+        r = eval_nll(m) if t == "nll" else eval_val(m) if t == "val" else eval_prompt(m, a.golden, names[t])
         res[t] = r
         print(a.label or a.qv or a.sim or "ref", t, json.dumps(r), flush=True)
         json.dump(res, open(a.out, "w"), indent=1)

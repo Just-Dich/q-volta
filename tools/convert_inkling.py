@@ -157,7 +157,7 @@ def quant_layer_experts(f, L, X, I, a, dev, log, val=None):
             if cnt[e0 + b] > 0:
                 e13["onum"] += float(((D[b] @ Hm[b]) * D[b]).sum()) * int(cnt[e0 + b])
                 e13["oden"] += float(((w13[b] @ Hm[b]) * w13[b]).sum()) * int(cnt[e0 + b])
-        out13[0].append(F.pack(q.view(B * K.H * 2, K.H).contiguous(), bits).view(B, 2 * K.FF, K.H // 32, bits).cpu())
+        out13[0].append(F.pack(q.view(B * 2 * K.FF, K.H).contiguous(), bits).view(B, 2 * K.FF, K.H // 32, bits).cpu())
         out13[1].append(Q.pack_meta(S, M, rs).cpu()); out13[2].append(rs.cpu())
         del w13, q, S, M, rs, dq, D, Hm, H2
         torch.cuda.empty_cache()
@@ -264,7 +264,7 @@ def main():
     ap.add_argument("--layers", default="0:24", help="a:b layer range of expert tensors (test files); dense tensors of those layers only")
     ap.add_argument("--expert-bits", type=int); ap.add_argument("--expert-group", type=int)
     ap.add_argument("--method", choices=["rtn", "gptq"]); ap.add_argument("--dense-bits", type=int); ap.add_argument("--dense-group", type=int)
-    ap.add_argument("--prior", type=float, default=256.0, help="Hessian shrinkage prior sample count c (inf = pooled only)")
+    ap.add_argument("--prior", type=float, default=1024.0, help="Hessian shrinkage prior sample count c (inf = pooled only)")
     ap.add_argument("--clip", action="store_true", default=True)
     ap.add_argument("--expert-batch", type=int, default=8)
     ap.add_argument("--max-seconds", type=float, default=1e9)
