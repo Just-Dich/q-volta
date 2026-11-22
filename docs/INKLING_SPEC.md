@@ -10,9 +10,9 @@ IMPORTANT facts about the reference situation (read first):
 * The installed transformers 5.17 has only the OLD `inkling` model (the first Inkling); PyPI 5.23.0 (newest) has `inkling2`
   (= "Inkling 2 Small", NO loop, no `controllers`, no `middle_cycle_*`). `inkling2_loop` exists only in the open PR #51050.
   Nothing in the installed environment can run this checkpoint.
-* The PR code was READ, but not executed: running the downloaded unmerged PR tree was refused by the permission system of
-  this session. Therefore **no numeric comparison against HF-executed logits exists** (see "Validation status").
-  Everything below is transcribed from the code text; every claim is tagged `[HF]` (read in PR code), `[CKPT]` (read from
+* UPDATE 2026-11-22: the PR code (a10ebc3; the model dir is byte-identical at PR head 430050f) WAS executed in an isolated venv
+  (`/workspace/q-volta-models/scratch-hfparity`, owner-authorised) on CPU in bf16; see section 15 for the numeric comparison.
+  Original text: the PR code was first only READ; everything below is transcribed from the code text; every claim is tagged `[HF]` (read in PR code), `[CKPT]` (read from
   checkpoint/config files), `[README]`, or `[ours]` (our implementation / measurement).
 * The MTP head has NO reference code in HF (the PR ignores `model.mtp.*`); only tensor names/shapes and config are known.
 
@@ -347,39 +347,45 @@ Inferences (NOT confirmed by any code we could read; HF PR ignores `model.mtp.*`
 The exact graph (RoPE layout, how fuse_weight/rnn_proj consume inputs, acceptance rule) is an OPEN QUESTION; engine work on H-I4
 must obtain reference code (vLLM/SGLang `inkling2_loop` + MTP, or the Thinking Machines tinker-cookbook) before implementing it.
 
-## 15. Validation status (honest)
+## 15. Validation status
 
-H-I1 as stated ("reproduce HF logits, KL < 1e-3") is **NOT verified**: HF cannot be executed here (see top). What exists instead:
+H-I1 HF parity (2026-11-22, `tools/hfparity/`, results `docs/results/inkling_hf_parity_20261122.json`,
+`inkling_hf_attn_unit_20261122.jsonl`). HF `Inkling2LoopForCausalLM` (PR #51050, bf16, CPU) loaded the checkpoint natively
+(its own `Inkling2LoopDequantizeExperts` loader works on CPU; no custom loader needed), compared against `tests/golden/inkling` (our fp32):
 
-1. Own implementation `tools/inkling_ref.py` (fp32 compute on the dequantised checkpoint, CPU) transcribed op by op from the HF PR text.
-2. Behavioural evidence that the transcription is right (all in `tests/golden/inkling`, `benchmarks/results/inkling_ablation_20261121.json`):
-   * greedy generations are fluent and on-task for all 4 prompts, in the shape documented in the HF doc
-     (`<|message_model|><|content_thinking|>The user asks ...`), including a Chinese/French prompt (the model quotes it exactly) and a
-     4096-token prompt where it identifies the question about "each token is routed to 8" (long-context retrieval through the
-     4 global layers works);
-   * next-token NLL on 511 plain-text tokens: reference 1.756 nats/token; every single-op ablation is worse: static-conv tap order
-     reversed 6.57, gate/up swapped 3.42, no output sigmoid gate 12.82, no attention sink 2.39, no relative bias 5.50,
-     softmax scale 1/128 instead of 1/sqrt(128) 2.89, no residual reset at block boundaries 8.08, loop messages removed (== a
-     single pass) 2.36; dynamic k/v conv taps removed 1.780 (only +0.02 at 511 tokens; weak sensitivity, so the dynamic-conv transcription is the least tightly validated op);
-   * dequantisation sanity: NVFP4 (layers 0-19) and MXFP8 (layers 20-23) experts dequantise to the same std (w13 0.0208 = 1/sqrt(2304),
-     w2 0.0294 = 1/sqrt(1152)) and all values finite;
-   * state handling: one-shot prefill vs two-chunk prefill vs prefill + per-token decode agree to KL 5.5e-14 / 2.5e-13
-     (max |dlogit| 2e-5), i.e. the per-pass conv/KV slots are consistent;
-   * bf16-flow emulation (`emu_bf16`, activations rounded to bf16 at module outputs) vs the fp32 golden: top-1 identical on the 3
-     short prompts, max |dlogit| 0.16 / 0.63 / 0.79 (KL 1e-11 only because the first-token distribution is extremely peaked:
-     top-1 logit ~27 vs 7). So an HF-bf16 run is expected to differ from our fp32 golden by up to ~0.8 logit at some positions;
-     use top-20 logit tolerance rather than KL on peaked positions.
-3. What is still unverified against HF: exact bf16 rounding points, the router tie behaviour, `message_gate` rounding, and that the PR
-   code equals the Thinking Machines original (the PR states it is a port; the checkpoint loads through its conversion mapping).
-   First action for a follow-up with permission to run the PR: run `Inkling2LoopForCausalLM` (transformers @ a10ebc3, dtype bf16)
-   on `tests/golden/inkling/*.npz` ids and compare logits_last / hid_* with `tools/inkling_selfcheck.compare`.
+| prompt | greedy ids (teacher-forced, 32) | last-pos top-1 | last-pos top-20 max abs (mean) | KL(ref||HF) full vocab | worst step top-20 max abs (median) | layer-app hidden rel err (max) | router expert-set match (mean) |
+|---|---|---|---|---|---|---|---|
+| p1_en | 32/32 | yes | 0.22 (0.07) | 3.9e-11 | 1.17 (0.36) | 0.047 | 0.91 |
+| p2_code | 32/32 | yes | 0.24 (0.11) | 5.4e-12 | 1.24 (0.39) | 0.110 | 0.89 |
+| p3_multi | 32/32 | yes | 1.10 (0.62) | 5.6e-11 | 4.61 (0.65) | 0.095 | 0.87 |
+| p4_long4k (HF in 512-token chunks) | 31/32 (step 17) | yes | 2.05 (0.75) | 9.7e-11 | 2.05 (0.66) | 0.168 | 0.54 |
+
+* No semantic difference was found; **no change to `tools/inkling_ref.py` or the goldens was needed**. Hidden-state error versus the
+  layer application grows smoothly (0.005 at layer 0, a few % mid-network, 0.05-0.17 late) with no step, which is bf16 noise, not an op error.
+  The single id mismatch (p4 step 17) is a near-tie: ref 28.760 (id 170289) vs 28.744 (id 149904); HF 28.708 vs 28.790, flipped by bf16 noise.
+  Router expert sets differ for 10-46% of tokens per layer (near-tied sigmoid scores under bf16 inputs); the logits stay close.
+* Tolerance: p1/p2 last-position top-20 diff (0.22/0.24) is inside the earlier bf16-emulation band (0.16-0.79); p3 (1.10) and p4 (2.05) are
+  above it: the emulation under-estimated real HF bf16 noise on the less peaked / longer prompts. Use top-20 abs err <= ~2.1, top-1 id, and
+  KL < 1e-9 as engine gates versus these goldens, not the 0.79 figure. KL is tiny only because the distributions are peaked.
+* Dequant: HF `Inkling2LoopDequantizeExperts` output vs our `Inkling.expert()` (4 experts x w13/w2 x layers 0, 13, 19 NVFP4 and 20, 23 MXFP8)
+  is bit-identical (max abs diff 0.0, `tools/hfparity/dq_check.py`), including the w13 de-interleave.
+* Module-level fp32-vs-fp32 check (HF attention module with the real weights vs our `attention()`, same random inputs): rel err 3e-9..1e-7 for
+  global layers 5, 11, 17, 23 (dynamic k/v conv, log scaling, rel bias, sink, gate, sliding-free causal) and 4e-7 for local layers 0, 4 (window 1024, T=2048).
+* Log scaling (tau != 1): NOT exercised by the end-to-end runs (all <= 4096 tokens, tau == 1). HF on CPU runs ~2.6 tok/s (4096 tokens = 46 min in
+  chunks, bf16 matmul without AVX512-BF16), so a 16-20K end-to-end HF run (many hours, ~54 GB RAM) was not done. Instead tau != 1 was checked at
+  the attention-module level, fp32 vs fp32: (a) real floor 8192, T=8800 (tau_last 1.0072): rel err 1.7e-7 (L5) and 1.3e-7 (L23); disabling tau in
+  ours changes the output by 1.4-1.8%, so the check is sensitive; (b) floor overridden to 256 on both sides, T=2048 (tau_last 1.208): rel err
+  2.8e-8..6.6e-8 on layers 5/11/17/23, while no-tau differs by 31-45%. So the tau formula and where it applies (q and rel states, global layers only) agree with HF.
+* MTP: confirmed the PR contains NO MTP/draft code (no `mtp`/`speculat`/`draft` hits in `models/inkling2_loop`, config, docs page or tests; `mtp.safetensors` and `mtp_config` are ignored). The MTP graph (section 14) remains an open question.
+* Earlier behavioural evidence (kept): ablations, state-handling consistency (chunked vs one-shot KL 5.5e-14), bf16-flow emulation.
 
 Reference speed (CPU, 64 threads shared, fp32): prefill 17-41 s for 25-37 tokens (first call incl. lazy expert dequant),
 285 s for 4096 tokens (14 tok/s); decode 1.4-2.5 s/token. Memory: lazily dequantised bf16 experts, cache cap 26-40 GiB.
+HF bf16 CPU (same host, 48 threads): 36-token prefill 6.8 s, 4096 tokens 2789 s total incl. 31 decode steps; peak RSS ~52 GB.
 
 ## 16. Open questions
 
-1. HF parity (above). 2. MTP graph (section 14). 3. Activation quantisation of the vendor runtime for expert matmuls (NVFP4 per-token
+1. (HF parity: done for <=4K, see section 15; tau != 1 only at module level.) 2. MTP graph (section 14). 3. Activation quantisation of the vendor runtime for expert matmuls (NVFP4 per-token
 amax / `fouroversix_mae`, MXFP8) - HF ignores it; how much quality does it cost / is it required for the intended accuracy?
 4. Router tie-breaking and `topk(sorted=False)` ordering (irrelevant for the sum, relevant for bit-exactness of fp32 accumulation order).
 5. `is_varloop` / research checkpoint: other pass counts are possible for speed trading; the main checkpoint was trained at 3.
