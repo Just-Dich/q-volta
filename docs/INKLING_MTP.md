@@ -113,3 +113,23 @@ Files: `src/runtime/cuda_inkling_mtp.inc` (included in the engine class), `src/b
 ## 7. Results
 
 See `docs/PERFORMANCE.md` ("Inkling MTP") and `benchmarks/results/inkling_mtp_20261123.json` for tok/s, acceptance per position and verify cost.
+
+## 8. Measured results (V100, device 0, int4 KV, ctx ~40, 3 runs each, 128 timed tokens; ids FNV hash identical to plain in every run)
+
+| text | depth | plain tok/s | MTP tok/s | tokens per cycle (1 + accepted) |
+|---|---|---|---|---|
+| code | 7 | 118.6 | 148.8 | 4.63 |
+| code | 3 | 118.6 | 149.0 | 3.21 |
+| code | 1 | 118.6 | 114.1 | 1.90 |
+| prose | 7 | 118.6 | 151.0 | 4.73 |
+| prose | 3 | 118.6 | 152.2 | 3.29 |
+| prose | 1 | 118.6 | 114.6 | 1.91 |
+
+Also measured earlier (code, ctx 512, depth 7, 2 runs): plain 115.4, MTP 134.4 tok/s, 4.32 tokens per cycle.
+Exactness (`tests/test_ink_mtp.cpp`, 80 tokens, depths 7/3/1, prompts p1_en, p2_code, p3_multi and a 4096-token code prompt): ids and next-step logits identical in all 12 cases.
+Implied cycle time (tokens per cycle / MTP tok/s): about 31 ms at depth 7, 21 ms at depth 3, 17 ms at depth 1, against 8.4 ms for one plain step. The cycle is the cost
+driver: draft + 8-row verify is about 3.7 plain steps, so the gain is 1.25x, not the ~4x token yield. Per-position acceptance on the CUDA path is not broken out
+(only totals per cycle); the torch reference table in section 5 has per-position numbers.
+
+Not done: the ctx 512/4K/32K x code/prose matrix (the GPU lock was held by another agent for the rest of the session), verify cost at 2/4/9 rows in isolation,
+adaptive depth, acceptance versus sidecar bits (only 5/6-bit was built), CPU engine, `qv_server --mtp`.
