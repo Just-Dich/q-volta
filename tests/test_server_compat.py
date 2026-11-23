@@ -704,6 +704,352 @@ def test_cli_refuses_unsafe_ignores():
         assert r.returncode == 1 and "error:" in r.stderr, args
 
 
+# =============================================================================================== part 1b: web UI, streams, Anthropic / Responses
+import gzip, hashlib
+
+GZ = {"Accept-Encoding": "gzip"}
+
+
+def ui_get(s, path, headers=None, method="GET"):
+    st, hd, b = s.req(method, path, headers=headers, raw=True)
+    return st, hdrs(hd), b
+
+
+def test_webui_routes_and_headers():
+    s = Srv(qv_cmd(), name="ui")
+    try:
+        st, h, b = ui_get(s, "/", GZ)
+        assert st == 200
+        assert h["content-type"] == "text/html; charset=utf-8" and h["content-encoding"] == "gzip"
+        assert h["cache-control"] == "no-cache"
+        assert h["cross-origin-embedder-policy"] == "require-corp" and h["cross-origin-opener-policy"] == "same-origin"
+        assert re.fullmatch(r'"[0-9a-f]{64}"', h["etag"]) and h["etag"] == '"%s"' % hashlib.sha256(b).hexdigest()   # ETag = SHA-256 of the served (gzip) bytes
+        html = gzip.decompress(b).decode()
+        assert "<!doctype html" in html.lower() and "_app/immutable" in html
+        assert ui_get(s, "/index.html", GZ)[2] == b
+        # gzip-only like llama-server: a client without gzip gets 415
+        st, h2, b2 = ui_get(s, "/")
+        assert st == 415 and h2["content-type"] == "text/plain" and b2 == b"Error: gzip is not supported by this browser"
+        # conditional request
+        st, h3, b3 = ui_get(s, "/", dict(GZ, **{"If-None-Match": h["etag"]}))
+        assert st == 304 and b3 == b"" and h3["etag"] == h["etag"]
+        assert ui_get(s, "/", dict(GZ, **{"If-None-Match": "W/" + h["etag"]}))[0] == 304
+        assert ui_get(s, "/", dict(GZ, **{"If-None-Match": '"other"'}))[0] == 200
+        st, hd, body = ui_get(s, "/", GZ, method="HEAD")
+        assert st == 200 and body == b"" and int(hd["content-length"]) == len(b)
+        # hashed asset: immutable; revalidated files: no-cache without ETag; content types by extension
+        js = re.search(r'_app/immutable/entry/start\.[A-Za-z0-9_-]+\.js', html)
+        assert js, "entry script not referenced by index.html"
+        st, h4, b4 = ui_get(s, "/" + js.group(0), GZ)
+        assert st == 200 and h4["content-type"] == "application/javascript" and h4["content-encoding"] == "gzip"
+        assert h4["cache-control"] == "public, max-age=31536000, immutable" and "etag" in h4
+        assert b"import" in gzip.decompress(b4)
+        for path, ct in (("/build.json", "application/json"), ("/sw.js", "application/javascript"), ("/service-worker.js", "application/javascript"),
+                         ("/manifest.webmanifest", "application/manifest+json"), ("/_app/version.json", "application/json")):
+            st, h5, b5 = ui_get(s, path, GZ)
+            assert st == 200 and h5["content-type"] == ct and h5["cache-control"] == "no-cache" and "etag" not in h5 and h5["content-encoding"] == "gzip", path
+        assert json.loads(gzip.decompress(ui_get(s, "/build.json", GZ)[2]))["version"]
+        for path, ct in (("/favicon.svg", "image/svg+xml"), ("/favicon.ico", "image/x-icon"), ("/pwa-192x192.png", "image/png")):
+            st, h6, _ = ui_get(s, path, GZ)
+            assert st == 200 and h6["content-type"] == ct, path
+        assert ui_get(s, "/nope.js", GZ)[0] == 404
+        st, _, b = s.req("GET", "/nope.js", headers=GZ)
+        assert st == 404 and b == {"error": {"message": "File Not Found", "type": "not_found_error", "code": 404}}
+        # props advertise the UI
+        _, _, p = s.req("GET", "/props")
+        assert p["ui"] is True and p["ui_settings"] == {} and p["cors_proxy_enabled"] is False
+        # features that are off by default
+        for m in ("GET", "POST"):
+            for path in ("/tools", "/cors-proxy"):
+                st, _, b = s.req(m, path, {} if m == "POST" else None)
+                assert st == 403 and b == {"error": {"message": "this feature is disabled", "type": "feature_disabled"}}, (m, path)
+    finally:
+        s.stop()
+
+
+def test_webui_assets_served_while_loading():
+    s = Srv(qv_cmd(), env={"QV_MOCK_LOAD_MS": "2500"}, wait=False, name="uiload")
+    try:
+        t0 = time.time(); got = None
+        while time.time() - t0 < 2:
+            try: got = ui_get(s, "/", GZ); break
+            except OSError: time.sleep(0.05)
+        assert got and got[0] == 200, "the UI must load while the model loads (it shows the loading state)"
+        assert s.req("GET", "/props")[0] == 503
+        s.wait_ready()
+    finally:
+        s.stop()
+
+
+def test_webui_disabled():
+    s = Srv(qv_cmd("--no-webui"), name="noui")
+    try:
+        for path in ("/", "/index.html", "/_app/version.json", "/build.json", "/favicon.svg"):
+            st, h, b = ui_get(s, path, GZ)
+            assert st == 404, path
+            assert json.loads(b) == {"error": {"message": "File Not Found", "type": "not_found_error", "code": 404}}
+        # a browser that used the UI keeps a service worker: the update check is answered with a self-removing one
+        for path in ("/sw.js", "/service-worker.js"):
+            st, h, b = ui_get(s, path)
+            assert st == 200 and h["content-type"] == "application/javascript" and h["cache-control"] == "no-cache" and b"registration.unregister()" in b
+        assert s.req("GET", "/props")[2]["ui"] is False
+    finally:
+        s.stop()
+    s = Srv(qv_cmd("--ui"), name="ui2")           # --ui / --webui spellings, env var
+    try: assert ui_get(s, "/", GZ)[0] == 200
+    finally: s.stop()
+    s = Srv(qv_cmd(), env={"LLAMA_ARG_UI": "0"}, name="uienv")
+    try: assert ui_get(s, "/", GZ)[0] == 404
+    finally: s.stop()
+
+
+def test_webui_with_api_key():
+    s = Srv(qv_cmd("--api-key", "sekret"), name="uikey")
+    try:
+        for path in ("/", "/index.html", "/build.json", "/_app/version.json", "/manifest.webmanifest", "/health"):
+            assert ui_get(s, path, GZ)[0] == 200, path           # the UI shell and /health are public, as in llama-server
+        assert s.req("GET", "/props")[0] == 401 and s.req("GET", "/v1/models")[0] == 401
+        assert s.req("GET", "/props", headers={"Authorization": "Bearer sekret"})[0] == 200
+        assert s.req("GET", "/tools")[0] == 401
+    finally:
+        s.stop()
+    s = Srv(qv_cmd("--no-webui", "--api-key", "sekret"), name="noui_key")
+    try: assert ui_get(s, "/", GZ)[0] == 404                    # public path: passes the key check, then 404 (llama-server frontend_paths)
+    finally: s.stop()
+
+
+def test_webui_path_dir_and_api_prefix():
+    d = tempfile.mkdtemp(prefix="qvpublic_")
+    open(os.path.join(d, "index.html"), "w").write("<html>custom</html>")
+    open(os.path.join(d, "a.js"), "w").write("var x=1;")
+    s = Srv(qv_cmd("--path", d), name="uipath")
+    try:
+        st, h, b = ui_get(s, "/")
+        assert st == 200 and b == b"<html>custom</html>" and h["content-type"].startswith("text/html") and "content-encoding" not in h
+        st, h, b = ui_get(s, "/a.js")
+        assert st == 200 and b == b"var x=1;" and "javascript" in h["content-type"]
+        assert ui_get(s, "/_app/version.json")[0] == 404         # embedded assets are not served when --path is given
+        assert ui_get(s, "/../etc/passwd")[0] == 404
+        assert ui_get(s, "/sw.js")[0] == 200                      # self-removing worker when --path replaces the UI
+    finally:
+        s.stop()
+    s = Srv(qv_cmd("--api-prefix", "/qv"), wait=False, name="prefix")
+    try:
+        t0 = time.time()
+        while time.time() - t0 < 30:
+            try:
+                if s.req("GET", "/qv/health")[0] == 200: break
+            except OSError: pass
+            time.sleep(0.1)
+        assert ui_get(s, "/qv/", GZ)[0] == 200 and ui_get(s, "/qv/index.html", GZ)[0] == 200
+        assert ui_get(s, "/", GZ)[0] == 404
+        assert s.req("GET", "/qv/props")[0] == 200
+    finally:
+        s.stop()
+
+
+def test_ui_config_flags():
+    s = Srv(qv_cmd("--ui-config", '{"showThoughtInProgress": true, "x": [1, 2]}'), name="uicfg")
+    try: assert s.req("GET", "/props")[2]["ui_settings"] == {"showThoughtInProgress": True, "x": [1, 2]}
+    finally: s.stop()
+    f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False); f.write('{"theme": "dark"}'); f.close()
+    s = Srv(qv_cmd("--webui-config-file", f.name), name="uicfgf")
+    try: assert s.req("GET", "/props")[2]["ui_settings"] == {"theme": "dark"}
+    finally: s.stop()
+    s = Srv(qv_cmd(), env={"LLAMA_ARG_UI_CONFIG": '{"a": 1}'}, name="uicfge")
+    try: assert s.req("GET", "/props")[2]["ui_settings"] == {"a": 1}
+    finally: s.stop()
+    r = subprocess.run([c.replace("@PORT@", str(free_port())) for c in qv_cmd("--ui-config", "{bad")], capture_output=True, text=True, timeout=30)
+    assert r.returncode == 1 and "UI config" in r.stderr
+
+
+def sse_events(raw):
+    """Parse event-style SSE ('event: x\\ndata: {...}') into [(event, json)]."""
+    out = []
+    for blk in raw.decode().split("\n\n"):
+        if not blk.strip(): continue
+        ev, data = None, None
+        for ln in blk.split("\n"):
+            if ln.startswith("event: "): ev = ln[7:]
+            elif ln.startswith("data: "): data = json.loads(ln[6:])
+        out.append((ev, data))
+    return out
+
+
+@pytest.fixture(scope="module")
+def msrv():
+    s = Srv(qv_cmd("--mock-text", "I should greet.\n</think>\n\nHello there, friend!", "--metrics"), name="msg")
+    yield s
+    s.stop()
+
+
+def test_anthropic_messages(msrv):
+    st, h, b = msrv.req("POST", "/v1/messages", {"model": "x", "max_tokens": 64, "temperature": 0, "system": "be brief", "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]})
+    assert st == 200 and hdrs(h)["content-type"] == "application/json; charset=utf-8"
+    assert b["type"] == "message" and b["role"] == "assistant" and b["stop_reason"] == "end_turn" and b["stop_sequence"] is None
+    assert [x["type"] for x in b["content"]] == ["thinking", "text"] and b["content"][0]["signature"] == ""
+    assert b["content"][1]["text"] == "Hello there, friend!"
+    assert set(b["usage"]) == {"cache_read_input_tokens", "input_tokens", "output_tokens"} and b["usage"]["output_tokens"] > 0
+    st, _, b = msrv.req("POST", "/v1/messages", {"max_tokens": 3, "temperature": 0, "messages": [{"role": "user", "content": "hi"}]})
+    assert st == 200 and b["stop_reason"] == "max_tokens" and b["usage"]["output_tokens"] == 3
+    st, _, raw = msrv.req("POST", "/v1/messages", {"max_tokens": 64, "temperature": 0, "stream": True, "messages": [{"role": "user", "content": "hi"}]}, raw=True)
+    assert st == 200
+    ev = sse_events(raw)
+    types = [e for e, _ in ev]
+    assert types[0] == "message_start" and types[-2:] == ["message_delta", "message_stop"] and all(d["type"] == e for e, d in ev)
+    assert [d["content_block"]["type"] for e, d in ev if e == "content_block_start"] == ["thinking", "text"]
+    assert [d["index"] for e, d in ev if e == "content_block_stop"] == [0, 1]
+    assert "".join(d["delta"]["text"] for e, d in ev if e == "content_block_delta" and d["delta"]["type"] == "text_delta") == "Hello there, friend!"
+    assert any(d["delta"]["type"] == "signature_delta" for e, d in ev if e == "content_block_delta")
+    md = [d for e, d in ev if e == "message_delta"][0]
+    assert md["delta"] == {"stop_reason": "end_turn", "stop_sequence": None} and md["usage"]["output_tokens"] > 0
+    st, _, b = msrv.req("POST", "/v1/messages/count_tokens", {"messages": [{"role": "user", "content": "hi"}]})
+    assert st == 200 and list(b) == ["input_tokens"] and b["input_tokens"] > 0
+    st, _, b = msrv.req("POST", "/v1/messages", {"max_tokens": 5})
+    assert st == 400 and b["error"]["message"] == "'messages' is required"
+
+
+def test_anthropic_tool_use_roundtrip():
+    s = Srv(qv_cmd("--mock-text", CALL), name="atool")
+    try:
+        tools = [{"name": "get_weather", "description": "w", "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]
+        body = {"max_tokens": 200, "temperature": 0, "tools": tools, "chat_template_kwargs": NOTHINK, "messages": [{"role": "user", "content": "weather in Paris?"}]}
+        st, _, b = s.req("POST", "/v1/messages", body)
+        assert st == 200 and b["stop_reason"] == "tool_use"
+        tu = [x for x in b["content"] if x["type"] == "tool_use"][0]
+        assert tu["name"] == "get_weather" and tu["input"] == {"city": "Paris"} and tu["id"]
+        st, _, raw = s.req("POST", "/v1/messages", dict(body, stream=True), raw=True)
+        ev = sse_events(raw)
+        assert [d["content_block"]["type"] for e, d in ev if e == "content_block_start"] == ["tool_use"]
+        assert "".join(d["delta"]["partial_json"] for e, d in ev if e == "content_block_delta" and d["delta"]["type"] == "input_json_delta") .replace(" ", "") == '{"city":"Paris"}'
+        assert [d for e, d in ev if e == "message_delta"][0]["delta"]["stop_reason"] == "tool_use"
+        # tool_result round trip is accepted
+        msgs = body["messages"] + [{"role": "assistant", "content": [{"type": "tool_use", "id": tu["id"], "name": "get_weather", "input": {"city": "Paris"}}]},
+                                   {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tu["id"], "content": "sunny"}]}]
+        st, _, b = s.req("POST", "/v1/messages", dict(body, messages=msgs))
+        assert st == 200
+    finally:
+        s.stop()
+
+
+def test_responses_api(msrv):
+    st, h, b = msrv.req("POST", "/v1/responses", {"input": "hi", "max_output_tokens": 64, "temperature": 0})
+    assert st == 200 and b["object"] == "response" and b["status"] == "completed" and b["id"].startswith("resp_")
+    assert [o["type"] for o in b["output"]] == ["reasoning", "message"]
+    assert b["output"][1]["content"][0] == {"type": "output_text", "annotations": [], "logprobs": [], "text": "Hello there, friend!"}
+    assert set(b["usage"]) == {"input_tokens", "output_tokens", "total_tokens", "input_tokens_details"}
+    st, _, raw = msrv.req("POST", "/v1/responses", {"input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}], "stream": True, "temperature": 0}, raw=True)
+    ev = sse_events(raw)
+    types = [e for e, _ in ev]
+    assert types[:2] == ["response.created", "response.in_progress"] and types[-1] == "response.completed"
+    for want in ("response.output_item.added", "response.reasoning_text.delta", "response.content_part.added", "response.output_text.delta", "response.output_text.done",
+                 "response.content_part.done", "response.output_item.done"):
+        assert want in types, want
+    assert "".join(d["delta"] for e, d in ev if e == "response.output_text.delta") == "Hello there, friend!"
+    done = ev[-1][1]["response"]
+    assert done["status"] == "completed" and [o["type"] for o in done["output"]] == ["reasoning", "message"]
+    assert msrv.req("POST", "/v1/responses/input_tokens", {"input": "hi"})[2]["object"] == "response.input_tokens"
+    st, _, b = msrv.req("POST", "/v1/responses", {"input": "x", "previous_response_id": "r1"})
+    assert st == 400 and "previous_response_id" in b["error"]["message"]
+    st, _, b = msrv.req("POST", "/v1/responses", {})
+    assert st == 400 and b["error"]["message"] == "'input' is required"
+
+
+def test_stream_progress_timings_and_ping():
+    s = Srv(qv_cmd("--mock-text", "one two three four", "--mock-delay-us", "1200000"), name="ping")
+    try:
+        body = {"messages": [{"role": "user", "content": "hi"}], "stream": True, "max_tokens": 3, "return_progress": True, "timings_per_token": True, "temperature": 0,
+                "sse_ping_interval": 1, "chat_template_kwargs": NOTHINK}
+        st, _, raw = s.req("POST", "/v1/chat/completions", body, raw=True)
+        txt = raw.decode()
+        assert st == 200 and ":\n\n" in txt, "SSE comment ping while the stream is silent"
+        ev = [json.loads(x[6:]) for x in txt.split("\n\n") if x.startswith("data: {")]
+        prog = [e["prompt_progress"] for e in ev if "prompt_progress" in e]
+        assert len(prog) >= 2 and set(prog[0]) == {"total", "cache", "processed", "time_ms"} and prog[0]["processed"] == prog[0]["cache"] and prog[-1]["processed"] == prog[-1]["total"]
+        tm = [e["timings"] for e in ev if "timings" in e and e.get("choices") and e["choices"][0]["delta"].get("content")]
+        assert tm and set(tm[0]) == {"cache_n", "prompt_n", "prompt_ms", "prompt_per_token_ms", "prompt_per_second", "predicted_n", "predicted_ms", "predicted_per_token_ms", "predicted_per_second"}
+        assert [t["predicted_n"] for t in tm] == sorted(t["predicted_n"] for t in tm)
+    finally:
+        s.stop()
+
+
+def test_resumable_stream_conversation_id():
+    s = Srv(qv_cmd("--mock-text", "alpha beta gamma delta epsilon zeta eta theta", "--mock-delay-us", "150000"), name="resume")
+    try:
+        body = {"messages": [{"role": "user", "content": "hi"}], "stream": True, "temperature": 0, "chat_template_kwargs": NOTHINK}
+        c = http.client.HTTPConnection("127.0.0.1", s.port, timeout=30)
+        c.request("POST", "/v1/chat/completions", json.dumps(body), {"Content-Type": "application/json", "X-Conversation-Id": "conv1::m"})
+        r = c.getresponse()
+        first = r.read1(4096) if hasattr(r, "read1") else r.read(1)
+        assert b"data:" in first
+        c.close()                                                   # the browser tab goes away mid-generation
+        st, _, lk = s.req("POST", "/v1/streams/lookup", {"conversation_ids": ["conv1", "other"]})
+        assert st == 200 and len(lk) == 1 and lk[0]["conversation_id"] == "conv1::m" and set(lk[0]) == {"conversation_id", "is_done", "total_bytes", "started_at", "completed_at"}
+        st, h, raw = s.req("GET", "/v1/stream?conv_id=conv1::m&from=0", raw=True)         # replay + live tail until the generation finishes
+        assert st == 200 and hdrs(h)["content-type"] == "text/event-stream"
+        txt = raw.decode()
+        assert txt.rstrip().endswith("data: [DONE]")
+        got = "".join(json.loads(x[6:])["choices"][0]["delta"].get("content") or "" for x in txt.split("\n\n") if x.startswith("data: {") and json.loads(x[6:]).get("choices"))
+        assert got == "alpha beta gamma delta epsilon zeta eta theta"
+        st, _, lk = s.req("POST", "/v1/streams/lookup", {"conversation_ids": ["conv1"]})
+        assert lk[0]["is_done"] is True and lk[0]["total_bytes"] == len(raw) + 0 or lk[0]["total_bytes"] >= len(raw)
+        off = len(raw.decode().split("\n\n")[0]) + 2
+        st, _, raw2 = s.req("GET", "/v1/stream?conv_id=conv1::m&from=%d" % off, raw=True)
+        assert st == 200 and raw2 == raw[off:]
+        assert s.req("GET", "/v1/stream?conv_id=nope")[0] == 404 and s.req("GET", "/v1/stream")[0] == 400
+        st, _, b = s.req("DELETE", "/v1/stream?conv_id=conv1::m", raw=True)
+        assert st == 204 and s.req("GET", "/v1/stream?conv_id=conv1::m")[0] == 404
+        # explicit stop while generating: DELETE cancels the producer
+        c = http.client.HTTPConnection("127.0.0.1", s.port, timeout=30)
+        c.request("POST", "/v1/chat/completions", json.dumps(body), {"Content-Type": "application/json", "X-Conversation-Id": "conv2"})
+        r = c.getresponse(); r.read1(4096); c.close()
+        t0 = time.time()
+        assert s.req("DELETE", "/v1/stream?conv_id=conv2", raw=True)[0] == 204
+        while time.time() - t0 < 5:
+            sl = s.req("GET", "/slots")[2]
+            if not any(x["is_processing"] for x in sl): break
+            time.sleep(0.1)
+        assert not any(x["is_processing"] for x in s.req("GET", "/slots")[2]), "DELETE /v1/stream must stop the generation"
+        # without the header a disconnect aborts the generation (existing behaviour)
+    finally:
+        s.stop()
+
+
+def test_reasoning_control_endpoint():
+    s = Srv(qv_cmd("--mock-text", "hmm " * 60, "--mock-delay-us", "30000"), name="ctl")
+    try:
+        body = {"messages": [{"role": "user", "content": "hi"}], "stream": True, "reasoning_control": True, "temperature": 0}
+        c = http.client.HTTPConnection("127.0.0.1", s.port, timeout=30)
+        c.request("POST", "/v1/chat/completions", json.dumps(body), {"Content-Type": "application/json"})
+        r = c.getresponse(); first = r.read1(4096).decode()
+        cid = re.search(r'"id":"(chatcmpl-[A-Za-z0-9]+)"', first).group(1)
+        st, _, b = s.req("POST", "/v1/chat/completions/control", {"id": cid, "action": "reasoning_end"})
+        assert st == 200 and b == {"success": True}
+        rest = r.read().decode(); c.close()
+        assert '"content":"' in rest and '"reasoning_content"' in first + rest, "after reasoning_end the rest of the answer is plain content"
+        assert s.req("POST", "/v1/chat/completions/control", {"id": "nope", "action": "reasoning_end"})[2] == {"success": False, "message": "no active completion for this id"}
+        assert s.req("POST", "/v1/chat/completions/control", {"id": "x", "action": "bogus"})[0] == 400
+        assert s.req("POST", "/v1/chat/completions/control", {"action": "reasoning_end"})[0] == 400
+    finally:
+        s.stop()
+
+
+def test_sleep_idle_seconds():
+    s = Srv(qv_cmd("--sleep-idle-seconds", "1", "--metrics"), name="sleep")
+    try:
+        assert s.req("GET", "/props")[2]["is_sleeping"] is False
+        t0 = time.time()
+        while time.time() - t0 < 6 and not s.req("GET", "/props")[2]["is_sleeping"]: time.sleep(0.2)
+        assert s.req("GET", "/props")[2]["is_sleeping"] is True
+        assert s.req("GET", "/health")[0] == 200 and s.req("GET", "/v1/models")[0] == 200 and s.req("GET", "/metrics")[0] == 200
+        assert s.req("GET", "/props")[2]["is_sleeping"] is True          # exempt endpoints do not wake the model
+        st, _, b = s.req("POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 2})
+        assert st == 200
+        assert s.req("GET", "/props")[2]["is_sleeping"] is False
+    finally:
+        s.stop()
+
+
 # =============================================================================================== part 2: structural diff vs llama-server
 def shape(v):
     if isinstance(v, dict): return {k: shape(x) for k, x in v.items()}
@@ -890,6 +1236,147 @@ def test_structure_matches_llama(pair, c):
                 if x != y: problems.append(f"SSE event {i}: llama={x!r:.60} ours={y!r:.60}")
             else: problems += [f"SSE event {i}: {k} {p}" for k, p in diff(x, y) if not allowed(name, k, p)]
     assert not problems, "\n" + "\n".join(problems)
+
+
+PW_PY = os.environ.get("PLAYWRIGHT_PY", "/tmp/pwenv/bin/python")
+PW_BROWSERS = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "/tmp/pwbrowsers")
+BROWSER_SCRIPT = os.path.join(ROOT, "tests", "webui_browser_check.py")
+
+
+def run_browser(url, *flags):
+    out = tempfile.mkdtemp(prefix="webui_shots_")
+    r = subprocess.run([PW_PY, BROWSER_SCRIPT, url, out] + list(flags), capture_output=True, text=True, timeout=180, env=dict(os.environ, PLAYWRIGHT_BROWSERS_PATH=PW_BROWSERS))
+    assert r.returncode == 0, r.stderr[-2000:]
+    return json.loads(r.stdout.strip().splitlines()[-1]), out
+
+
+@pytest.mark.skipif(not (os.path.exists(PW_PY) and os.path.isdir(PW_BROWSERS)), reason="playwright + chromium not installed (see tests/webui_browser_check.py)")
+def test_webui_in_browser():
+    """The real UI in headless Chromium: loads, shows the model, streams an answer with reasoning, runs a browser tool call, stops a generation."""
+    s = Srv(qv_cmd("--mock-text", "The user says hi.\n</think>\n\nHello from **Q-Volta**!\n\n1. one\n2. two\n", "--temp", "0", "--top-k", "1", "--mock-delay-us", "20000", "-a", "mock-model"), name="browser")
+    try:
+        res, out = run_browser(f"http://127.0.0.1:{s.port}/")
+        assert not res["page_errors"], res["page_errors"]
+        assert "Hello from Q-Volta!" in res["text"].replace("\n", " ") or "Hello from" in res["text"], res["text"][-400:]
+        calls = {(m, p.split("?")[0]): st for m, p, st in res["requests"]}
+        assert calls[("GET", "props")] == 200 and calls[("GET", "v1/models")] == 200 and calls[("POST", "v1/chat/completions")] == 200 and calls[("POST", "v1/streams/lookup")] == 200
+        assert calls[("GET", "tools")] == 403            # server tools are disabled by default, the UI copes
+        assert "Settings" in res["settings_text"] and "API Key" in res["settings_text"]
+        for f in ("webui_home.png", "webui_streaming.png", "webui_chat.png", "webui_settings.png"): assert os.path.getsize(os.path.join(out, f)) > 5000
+    finally:
+        s.stop()
+    s = Srv(qv_cmd("--mock-text", "I will check the time.\n</think>\n\n" + "<tool_call>\n<function=get_datetime>\n</function>\n</tool_call>", "--temp", "0", "--top-k", "1", "--mock-delay-us", "20000"), name="browser_tool")
+    try:
+        res, _ = run_browser(f"http://127.0.0.1:{s.port}/", "--tool", "--prompt", "what time is it?", "--wait", "5")
+        n_chat = sum(1 for m, p, st in res["requests"] if p == "v1/chat/completions")
+        assert n_chat >= 2, "the UI must run the browser-side tool and send the tool result back (2nd completion request)"
+        assert "Current time" in res["text"]
+    finally:
+        s.stop()
+    s = Srv(qv_cmd("--mock-text", "word " * 200, "--mock-delay-us", "100000"), name="browser_stop")
+    try:
+        res, _ = run_browser(f"http://127.0.0.1:{s.port}/", "--stop")
+        assert not res["page_errors"]
+        dels = [r for r in res["requests"] if r[0] == "DELETE" and r[1].startswith("v1/stream")]
+        assert dels and dels[0][2] == 204, res["requests"]
+        t0 = time.time()
+        while time.time() - t0 < 5 and any(x["is_processing"] for x in s.req("GET", "/slots")[2]): time.sleep(0.1)
+        assert not any(x["is_processing"] for x in s.req("GET", "/slots")[2]), "Stop in the UI must end the generation on the server"
+    finally:
+        s.stop()
+
+
+# ---- web UI routes and Anthropic / Responses endpoints against the real llama-server (UI enabled in both)
+UI_PATHS = ["/", "/index.html", "/build.json", "/sw.js", "/service-worker.js", "/manifest.webmanifest", "/_app/version.json", "/favicon.svg", "/favicon.ico", "/nope.js", "/tools", "/cors-proxy"]
+UI_HDRS = ("content-type", "content-encoding", "cache-control", "cross-origin-embedder-policy", "cross-origin-opener-policy")
+
+
+@pytest.fixture(scope="module")
+def ui_pair():
+    if not HAVE_LLAMA: pytest.skip("llama-server / gguf not available (set LLAMA_SERVER, LLAMA_GGUF)")
+    ll = Srv([LLAMA_SERVER, "-m", LLAMA_GGUF, "--port", "@PORT@", "-t", "4", "-c", "2048"], name="llama_ui")
+    ours = Srv(qv_cmd("--mock-text", "Hello! How can I help you today? I am a mock model."), name="qv_ui")
+    yield ll, ours
+    ll.stop(); ours.stop()
+
+
+@pytest.mark.parametrize("enc", ["gzip", "identity"])
+@pytest.mark.parametrize("path", UI_PATHS)
+def test_ui_routes_match_llama(ui_pair, path, enc):
+    ll, ours = ui_pair
+    hd = {"Accept-Encoding": enc}
+    a, b = ui_get(ll, path, hd), ui_get(ours, path, hd)
+    problems = []
+    if a[0] != b[0]: problems.append(f"status llama={a[0]} ours={b[0]}")
+    for k in UI_HDRS:
+        if a[1].get(k) != b[1].get(k): problems.append(f"{k}: llama={a[1].get(k)!r} ours={b[1].get(k)!r}")
+    if ("etag" in a[1]) != ("etag" in b[1]): problems.append("etag presence differs")
+    if "etag" in a[1] and not re.fullmatch(r'"[0-9a-f]{64}"', b[1].get("etag", "")): problems.append("etag format")
+    for hname in sorted((set(a[1]) ^ set(b[1])) - HDR_IGNORE - {"etag"}): problems.append(f"header {hname} only in {'llama' if hname in a[1] else 'ours'}")
+    if a[0] in (404, 403, 415): 
+        if a[2] != b[2]: problems.append(f"error body llama={a[2][:80]!r} ours={b[2][:80]!r}")
+    if path == "/sw.js" and a[0] == 200 and a[2] != b[2]: problems.append("sw.js differs")
+    assert not problems, "\n" + "\n".join(problems)
+
+
+def test_ui_conditional_and_hashed_assets_match_llama(ui_pair):
+    ll, ours = ui_pair
+    for srv_ in (ll, ours):
+        st, h, b = ui_get(srv_, "/", GZ)
+        assert ui_get(srv_, "/", dict(GZ, **{"If-None-Match": h["etag"]}))[0] == 304
+    entries = []
+    for srv_ in (ll, ours):
+        html = gzip.decompress(ui_get(srv_, "/", GZ)[2]).decode()
+        m = re.search(r'_app/immutable/entry/start\.[A-Za-z0-9_-]+\.js', html)
+        assert m
+        entries.append(m.group(0))
+    a, b = ui_get(ll, "/" + entries[0], GZ), ui_get(ours, "/" + entries[1], GZ)
+    assert a[0] == b[0] == 200
+    for k in UI_HDRS + ("etag",): assert (k in a[1]) == (k in b[1]) and (k == "etag" or a[1].get(k) == b[1].get(k)), k
+
+
+def test_ui_disabled_and_api_key_match_llama():
+    if not HAVE_LLAMA: pytest.skip("llama-server / gguf not available")
+    for extra in (["--no-webui"], ["--api-key", "k"], ["--no-webui", "--api-key", "k"]):
+        ll = Srv([LLAMA_SERVER, "-m", LLAMA_GGUF, "--port", "@PORT@", "-t", "4", "-c", "2048"] + extra, name="llama_uiflag")
+        ours = Srv(qv_cmd("--mock-text", "x", *extra), name="qv_uiflag")
+        try:
+            for path in ("/", "/index.html", "/build.json", "/sw.js", "/service-worker.js", "/_app/version.json", "/health", "/props", "/tools", "/v1/models", "/nope"):
+                a, b = ui_get(ll, path, GZ), ui_get(ours, path, GZ)
+                assert a[0] == b[0], (extra, path, a[0], b[0])
+                assert a[1].get("content-type") == b[1].get("content-type"), (extra, path)
+                if a[0] in (401, 403, 404): assert a[2] == b[2], (extra, path, a[2], b[2])
+                if path == "/sw.js" and a[0] == 200: assert a[2] == b[2]
+        finally:
+            ll.stop(); ours.stop()
+
+
+def collapse(evs):
+    """[(event, data)] -> list of (event, key-shape) with consecutive duplicates removed."""
+    out = []
+    for e, d in evs:
+        item = (e, json.dumps(shape(d), sort_keys=True))
+        if not out or out[-1] != item: out.append(item)
+    return out
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("path,body", [
+    ("/v1/messages", {"max_tokens": 6, "temperature": 0, "system": "be brief", "messages": [{"role": "user", "content": "Hi"}], "chat_template_kwargs": {"enable_thinking": False}}),
+    ("/v1/responses", {"input": "Hi", "max_output_tokens": 6, "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}}),
+])
+def test_anthropic_and_responses_match_llama(pair, path, body, stream):
+    ll, ours = pair
+    body = dict(body, stream=stream)
+    a, b = ll.req("POST", path, body, raw=True), ours.req("POST", path, body, raw=True)
+    assert a[0] == b[0] == 200, (a[0], b[0], a[2][:200], b[2][:200])
+    assert hdrs(a[1]).get("content-type") == hdrs(b[1]).get("content-type")
+    if not stream:
+        problems = [f"{k} {p}" for k, p in diff(shape(json.loads(a[2])), shape(json.loads(b[2]))) if not (k == "extra" and p.endswith(("/id",)))]
+        assert not problems, problems
+    else:
+        ea, eb = collapse(sse_events(a[2])), collapse(sse_events(b[2]))
+        assert ea == eb, "\nllama: %s\nours:  %s" % (ea, eb)
 
 
 if __name__ == "__main__":

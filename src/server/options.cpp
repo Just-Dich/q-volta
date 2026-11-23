@@ -1,5 +1,7 @@
 #include "server/options.h"
 
+#include "core/json_doc.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -96,8 +98,9 @@ const std::set<std::string>& handled() {
         "slot-save-path", "special", "cors-origins", "cors-methods", "cors-headers", "cors-credentials", "api-prefix", "min-keep", "grammar", "grammar-file", "json-schema", "json-schema-file", "help", "version",
         "backend", "kv", "kv4-kmode", "mtp", "no-mtp", "mtp-depth", "prefill-chunk", "tokenizer", "max-queue", "mock-text", "mock-loop", "mock-delay-us",
         "reasoning-preserve", "context-shift", "warmup", "flash-attn", "mlock", "mmap", "no-mmap", "perf", "escape", "verbosity", "log-colors", "log-timestamps",
-        "log-prefix", "kv-unified", "cache-idle-slots", "sse-ping-interval", "lora", "lora-scaled", "ssl-key-file", "ssl-cert-file", "hf-repo", "model-url", "docker-repo",
+        "log-prefix", "kv-unified", "cache-idle-slots", "lora", "lora-scaled", "ssl-key-file", "ssl-cert-file", "hf-repo", "model-url", "docker-repo",
         "hf-file", "hf-token", "offline", "no-mlock", "vision-file", "allow-remote-images", "image-root", "image-max-side", "image-token",
+        "ui-config", "ui-config-file", "sse-ping-interval", "sleep-idle-seconds", "ui-mcp-proxy", "tools",
     };
     return s;
 }
@@ -177,6 +180,14 @@ void apply(Options& o, const Resolved& r, const std::string& flag, const std::st
     } else if (c == "timeout") o.timeout = to_int(val, flag);
     else if (c == "path") o.path = val;
     else if (c == "ui") o.webui = !r.neg;
+    else if (c == "ui-config" || c == "ui-config-file") {
+        o.ui_config = c == "ui-config" ? val : read_file(val);
+        if (!o.ui_config.empty()) { try { (void)jd::parse(o.ui_config); } catch (const std::exception& e) { fail(std::string("failed to parse UI config: ") + e.what()); } }
+    }
+    else if (c == "ui-mcp-proxy") { if (!r.neg) warn("--ui-mcp-proxy: the CORS proxy (/cors-proxy) is not implemented by qv_server; the endpoint answers 403 as in a default llama-server"); }
+    else if (c == "sleep-idle-seconds") o.sleep_idle_seconds = to_int(val, flag);
+    else if (c == "sse-ping-interval") o.sse_ping_interval = to_int(val, flag);
+    else if (c == "tools") { o.tools = val; if (!val.empty()) warn("--tools: server-side built-in tools (/tools: shell, file read/write) are deliberately not implemented by qv_server; the endpoint answers 403"); }
     else if (c == "log-disable") o.log_disable = true;
     else if (c == "verbose") o.verbosity = 4;
     else if (c == "log-verbosity" || c == "verbosity") o.verbosity = to_int(val, flag);
@@ -214,7 +225,7 @@ void apply(Options& o, const Resolved& r, const std::string& flag, const std::st
     else if (c == "hf-repo" || c == "model-url" || c == "docker-repo") fail(flag + ": downloading models is not supported; pass a local Q-Volta model with -m");
     else if (c == "context-shift") { if (!r.neg) warn("--context-shift: the recurrent GatedDeltaNet state cannot be shifted; generation stops at the context limit (ignored)"); }
     else if (c == "kv-unified" || c == "cache-idle-slots" || c == "warmup" || c == "flash-attn" || c == "mlock" || c == "no-mlock" || c == "mmap" || c == "no-mmap" || c == "perf" || c == "escape" || c == "log-colors" ||
-             c == "log-timestamps" || c == "log-prefix" || c == "sse-ping-interval" || c == "reasoning-preserve" || c == "hf-file" || c == "hf-token" || c == "offline") {}
+             c == "log-timestamps" || c == "log-prefix" || c == "reasoning-preserve" || c == "hf-file" || c == "hf-token" || c == "offline") {}
     else warn("flag " + flag + " is accepted for llama-server compatibility but has no effect in qv_server");
 }
 

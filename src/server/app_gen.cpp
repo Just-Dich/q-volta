@@ -160,7 +160,10 @@ Value App::gen_settings(const Task& t, int flavor) const {  // flavor 0: complet
     return o;
 }
 
-Value App::timings_json(const GenResult& r) const {
+Value App::timings_json(const GenResult& r) const { return timings_json(r.n_cache, r.n_prompt_eval, r.prompt_ms, r.n_decoded, r.predicted_ms); }
+
+Value App::timings_json(int cache, int pn, double pms, int dn, double dms) const {
+    struct { int n_cache, n_prompt_eval, n_decoded; double prompt_ms, predicted_ms; } r{cache, pn, dn, pms, dms};
     Value o = Value::object();
     o.set("cache_n", r.n_cache);
     o.set("prompt_n", r.n_prompt_eval);
@@ -290,6 +293,9 @@ void App::parse_sampling(const Value& bv, Task& t) {
     t.cache_prompt = b.boolean("cache_prompt", o.cache_prompt);
     t.id_slot = b.integer("id_slot", -1);
     t.timings_per_token = b.boolean("timings_per_token", false);
+    t.return_progress = b.boolean("return_progress", false);
+    if (b.boolean("reasoning_control", false)) t.reasoning_end = std::make_shared<std::atomic<bool>>(false);
+    t.sse_ping_interval = b.integer("sse_ping_interval", o.sse_ping_interval);
     t.return_tokens = b.boolean("return_tokens", false);
     t.stream = b.boolean("stream", false);
     t.n_predict = b.integer("n_predict", b.integer("max_tokens", b.integer("max_completion_tokens", o.n_predict)));
@@ -557,7 +563,8 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
     // ---- admission: FIFO ticket, slots are logical (one engine)
     long ticket = lease_acquire(alive);
     if (ticket < 0) { r.aborted = true; return r; }
-    struct Release { App& a; long ticket; ~Release() { a.lease_release(ticket); } } rel{*this, ticket};
+    struct Release { App& a; long ticket; ~Release() { a.last_task_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count(); a.lease_release(ticket); } } rel{*this, ticket};
+    try { ensure_engine(); } catch (const std::exception& e) { throw_error(503, std::string("model reload failed: ") + e.what(), "unavailable_error"); }
 
     int sid = 0;
     {
@@ -590,6 +597,7 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
         { std::lock_guard<std::mutex> lk(mu_); slots_[sid].n_prompt_cache = (int)start; }
         on_start(sid);
         auto tp0 = now();
+        if (t.on_progress) t.on_progress(N, (int)start, (int)start, 0.0);
         std::vector<std::vector<float>> img_emb;  // encoder output per image (only images with rows at or after `start`)
         for (auto& ip : t.images) {
             img_emb.emplace_back();
@@ -604,8 +612,8 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
             if (t.images.empty()) eng->prefill(t.prompt.data() + off, n, (int)off);
             else prefill_with_images(t, (int)off, n, img_emb);
             cached_.insert(cached_.end(), t.prompt.begin() + off, t.prompt.begin() + off + n);
-            std::lock_guard<std::mutex> lk(mu_);
-            slots_[sid].n_prompt_processed = (int)(off + n - start);
+            { std::lock_guard<std::mutex> lk(mu_); slots_[sid].n_prompt_processed = (int)(off + n - start); }
+            if (t.on_progress) t.on_progress(N, (int)start, (int)(off + n), ms(tp0, now()));
         }
         r.prompt_ms = ms(tp0, now());
         if (t.n_predict == 0) { r.stop_type = "limit"; r.tokens_cached = (int)cached_.size(); goto done; }
@@ -628,11 +636,13 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
             std::vector<int> lookahead;
             size_t la = 0;
             const bool want_probs = t.n_probs > 0;
-            const bool use_chunk = o.mtp && argmax_ok && !want_probs;
+            const bool use_chunk = o.mtp && argmax_ok && !want_probs && !t.reasoning_end;
+            std::vector<int> forced;
             Chunk ck;
             bool hit_stop_word = false;
             const int budget = t.n_predict;  // <0: unlimited
             auto td0 = now();
+            auto stamp = [&](Chunk& k) { k.n_cache = r.n_cache; k.n_prompt_eval = r.n_prompt_eval; k.prompt_ms = r.prompt_ms; k.predicted_ms = ms(td0, now()); };
             auto pick = [&](TokProb& tp, bool& have_tp) -> int {
                 have_tp = false;
                 if (argmax_ok && !want_probs) return eng->argmax();
@@ -685,6 +695,7 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
                     ck.text = pending;
                     r.content += pending;
                     pending.clear();
+                    stamp(ck);
                     if (!on_chunk(ck)) r.aborted = true;
                     ck = Chunk();
                     break;
@@ -698,6 +709,7 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
                 if (!out.empty() || have_tp) {
                     ck.text = out;
                     r.content += out;
+                    stamp(ck);
                     if (!on_chunk(ck)) { r.aborted = true; break; }
                     ck = Chunk();
                 }
@@ -720,13 +732,21 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
                 }
                 eng->step(tk, (int)cached_.size());
                 cached_.push_back(tk);
-                tk = pick(tp, have_tp);
+                if (forced.empty() && t.reasoning_end && t.reasoning_end->exchange(false)) {
+                    // "skip reasoning": close the thinking block by feeding the end marker as if the model had written it
+                    const std::string seen = r.content + pending;
+                    const bool inside = (t.thinking_open || seen.find(t.think_start) != std::string::npos) && seen.find(t.think_end) == std::string::npos;
+                    if (inside) { auto ids = tok.encode("\n" + t.think_end + "\n\n", true); forced.assign(ids.begin(), ids.end()); }
+                }
+                if (!forced.empty()) { tk = forced.front(); forced.erase(forced.begin()); have_tp = false; }
+                else tk = pick(tp, have_tp);
             }
             if (!r.aborted && !hit_stop_word) {  // flush held-back text
                 pending += dec.flush();
                 if (!pending.empty() || !ck.tokens.empty()) {
                     ck.text = pending;
                     r.content += pending;
+                    stamp(ck);
                     on_chunk(ck);
                 }
             }

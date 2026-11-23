@@ -7,7 +7,21 @@ status (implemented / partial / n/a / unsupported) is in [SERVER_COMPAT.md](SERV
 
 Chat templates run through the Jinja interpreter (`src/jinja`): the model's own `chat_template.jinja`, `--chat-template chatml|TEXT`, `--chat-template-file`. Tools (`tools`, `tool_choice`,
 `parallel_tool_calls`, tool-call history) produce OpenAI `tool_calls`, also as streaming deltas; `grammar`, `json_schema`, `response_format` and forced tool choices are enforced by the GBNF sampler (`src/grammar`)
-on host logits. Still unavailable: embeddings, vision, runtime LoRA. Generation is serialized: `--parallel N` reports N logical slots, requests queue FIFO.
+on host logits. Anthropic `/v1/messages` and OpenAI `/v1/responses` are translated onto the chat path. Still unavailable: embeddings, rerank, audio, runtime LoRA, router mode, `/tools`, `/cors-proxy`. Generation is serialized: `--parallel N` reports N logical slots, requests queue FIFO.
+
+## Web UI
+
+`GET /` serves llama.cpp's own web UI (SvelteKit, commit 9d6f04f), embedded in the binary: no runtime file dependency. The built assets live gzip-compressed in `src/server/webui/gzip/` (provenance, licence and rebuild script: `src/server/webui/README.md`, `scripts/vendor_webui.sh`, THIRD_PARTY.md) and `cmake/qv_embed_webui.cmake` turns them into a generated C++ source at build time.
+Behaviour matches llama-server: gzip only (415 without `Accept-Encoding: gzip`), `ETag`/304, `Cache-Control`, COEP/COOP on the shell, UI routes public with `--api-key` and available while the model loads. `--no-webui` -> 404 (and a self-removing service worker for old browsers), `--path DIR` replaces the UI by a directory, `--ui-config JSON` / `--ui-config-file` feed `/props.ui_settings`, `--api-prefix` is honoured.
+Endpoints the UI needs and that were added for it: `/v1/streams/lookup`, `/v1/stream` (resumable generation via `X-Conversation-Id`), `/v1/chat/completions/control`, `return_progress` / `timings_per_token` / `sse_ping_interval` request fields, `/tools` and `/cors-proxy` (403 `feature_disabled`, as llama-server by default).
+Screenshots from headless Chromium: `docs/img/webui_*.png`; the browser check is `tests/webui_browser_check.py` (run by `test_webui_in_browser` when Playwright is installed).
+
+## Sleep, streams, queueing
+
+* `--sleep-idle-seconds N`: after N idle seconds the engine is destroyed (weights and KV freed) and rebuilt on the next generation (`is_sleeping` in `/props`; `/health`, `/props`, `/models`, `/metrics` do not wake it).
+* Streams with `X-Conversation-Id` survive client disconnects; see SERVER_COMPAT.md.
+* `--parallel N` is honest queueing: one engine sequence, FIFO, no concurrent decoding (SERVER_COMPAT.md section 4).
+* Logging is a single line per request in Q-Volta's own format, not llama's.
 
 ## Build
 

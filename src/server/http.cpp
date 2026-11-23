@@ -67,7 +67,7 @@ std::string Conn::head(int status, const std::string& ct, const Headers& extra, 
     return h;
 }
 
-bool Conn::respond(int status, const std::string& ct, const std::string& body, const Headers& extra) {
+bool Conn::respond(int status, const std::string& ct, std::string_view body, const Headers& extra) {
     if (status >= 400) close_after = true;
     headers_sent = true;
     std::string h = head(status, ct, extra, "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n");

@@ -32,11 +32,14 @@ fails to evaluate and no tools were requested), `tools` / `tool_choice` / `paral
 | `GET /lora-adapters`, `POST /lora-adapters` | partial | no runtime LoRA: GET returns `[]`, POST of `[]` returns `{"success":true}`, non-empty -> 400 (adapters are merged at conversion time) |
 | `POST /embedding`, `/embeddings`, `/v1/embeddings` | n/a | 501 `not_supported_error` with llama's message (the engines do not expose a pooled hidden state) |
 | `POST /rerank`, `/reranking`, `/v1/rerank(ing)` | n/a | 501 like a llama-server started without `--reranking` |
-| `POST /v1/messages`, `/v1/messages/count_tokens` (Anthropic) | not implemented | 501 `not_supported_error` |
-| `POST /v1/responses`, `/responses`, `/v1/responses/input_tokens` | not implemented | 501 |
-| `/v1/audio/*`, `/tts`, `/v1/realtime`, `/v1/systemone`, `/v1/chat/completions/control` | n/a | 501 / no WebSocket |
-| `/v1/stream`, `/v1/streams/lookup`, `/cors-proxy`, `/tools`, `/models/load` ... (router / MCP / agent features) | n/a | 404 |
-| web UI (`/`) | n/a | none embedded; `--path DIR` serves static files |
+| `POST /v1/messages`, `/v1/messages/count_tokens` (Anthropic) | implemented | translated onto the chat path like llama: system, content blocks, `tool_use`/`tool_result`, streaming event sequence (`message_start` ... `message_stop`) and non-stream shape verified against llama-server. `message_start.usage` reports `cache_read_input_tokens: 0` (the cache hit is unknown that early) |
+| `POST /v1/responses`, `/responses`, `/v1/responses/input_tokens` | implemented | same translation; event sequence (`response.created` ... `response.completed`, with `timings`) and non-stream shape verified against llama-server |
+| `/v1/audio/*`, `/tts`, `/v1/realtime`, `/v1/systemone` | n/a | 501 / no WebSocket |
+| `POST /v1/chat/completions/control` | implemented | `{id, action:"reasoning_end"}` (the UI's "skip reasoning" button): forces `\n</think>\n\n` into the running generation; `{"success":false,...}` for unknown ids. Needs `reasoning_control:true` in the request; disables the MTP chunk path for that request |
+| `GET/DELETE /v1/stream`, `POST /v1/streams/lookup` | implemented | resumable streams: a request with `X-Conversation-Id` keeps generating after the client disconnects (4 MiB ring buffer, kept 300 s after completion); `from=` replays; DELETE cancels (204) |
+| `/tools`, `/cors-proxy` | n/a | 403 `feature_disabled` exactly like a default llama-server (the features are off unless `--tools` / `--ui-mcp-proxy`; those are not implemented here) |
+| router mode: `/models/load`, `/models/unload`, `/models/sse`, `POST/DELETE /models` | n/a | 404, as in a non-router llama-server. Router mode (child processes per model) is not implemented: a `.qv` model is loaded once per server process |
+| web UI: `/`, `/index.html`, `/_app/*`, `/build.json`, `/sw.js`, `/service-worker.js`, `/manifest.webmanifest`, `/favicon.*` | implemented | llama.cpp's own SvelteKit UI built from commit 9d6f04f (`src/server/webui/`, MIT, THIRD_PARTY.md), embedded as a generated source (`cmake/qv_embed_webui.cmake`), gzip with `Content-Encoding: gzip` (415 for clients without gzip, like llama), `ETag` = quoted SHA-256 + 304, `Cache-Control` `no-cache` for the shell and `public, max-age=31536000, immutable` for hashed assets, COEP/COOP headers on the shell. Public even with `--api-key`, served while the model loads; routes diffed against llama-server in `tests/test_server_compat.py`; driven in headless Chromium (docs/img/webui_*.png) |
 | `OPTIONS *` | implemented | `200 text/html`, empty body, `Access-Control-Allow-Origin/Credentials/Methods/Headers` as llama |
 
 Cross-cutting behaviour (all verified against the real llama-server in `tests/test_server_compat.py`):
@@ -49,7 +52,7 @@ Cross-cutting behaviour (all verified against the real llama-server in `tests/te
 * **Headers**: `Server: qv_server` (llama sends `llama.cpp`: deliberately not impersonated), `Access-Control-Allow-Origin` (echoes `Origin` with `--cors-credentials`, as llama),
   `Content-Type: application/json; charset=utf-8`, `Keep-Alive: timeout=5, max=100`, `X-Accel-Buffering: no` + `Transfer-Encoding: chunked` for SSE. HEAD answers without body. Chunked request bodies are accepted.
 * **SSE**: `data: <json>\n\n` framing, OpenAI streams end with `data: [DONE]`, native `/completion` streams end with the final result object (no `[DONE]`), as llama. Chat streams: role chunk with `content:null`, content / `reasoning_content` deltas, finish chunk with `delta:{}`, optional `usage` chunk with `choices:[]`, `timings` on the last chunk.
-  Errors that occur after the headers were sent are emitted as a `data: {"error":...}` event. No SSE keep-alive pings.
+  Errors that occur after the headers were sent are emitted as a `data: {"error":...}` event. SSE keep-alive comments (`:\n\n`) after `--sse-ping-interval` (30 s) of silence. Per request: `return_progress` (prompt progress chunks), `timings_per_token`, `sse_ping_interval`.
 * **Queueing / slots**: see section 4.
 
 ## 2. `/completion` and sampling parameters
@@ -87,7 +90,9 @@ True concurrent multi-slot decoding (batched sequences) needs per-slot recurrent
 | Slot concurrency | one decoding sequence | engine design, see section 4 |
 | `/slots` save/restore | token-list files, restore = re-prefill | no KV snapshot API in the engines |
 | `meta.n_params`, `model_ftype` | 0 / `Q-Volta` | not recorded in the `.qv` header |
-| Anthropic / Responses / audio / realtime / router / MCP APIs | 501 or 404 | out of scope |
+| audio / realtime / router / `/tools` / `/cors-proxy` | 501 / 404 / 403 | out of scope (see section 1) |
+| log format | own single-line format, not llama's `srv/slot` lines | not machine-compatible; content (request, status, timing) is equivalent |
+| web UI build | `build.json` is `{"version":"b0000"}` | built from source outside a llama.cpp checkout; UI code is identical to 9d6f04f |
 | Embeddings, reranking, LoRA at runtime, vision | 501 / 400 | not supported by the engines (LoRA is merged at conversion time) |
 | `n > 1` | run sequentially (re-prefills per choice, cost x n) | one sequence |
 | JSON parse error text | `[json.exception.parse_error.101] parse error: <our parser message>` | different parser |

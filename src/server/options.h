@@ -31,8 +31,13 @@ struct Options {
     int port = 9931;                   // llama-server default of the reference commit
     int http_threads = -1;
     int timeout = 3600;
+    int sse_ping_interval = 30;
+    int sleep_idle_seconds = -1;
     std::string path, api_prefix;
     bool webui = true;
+    std::string ui_config;             // --ui-config JSON (returned as props.ui_settings)
+    bool ui_mcp_proxy = false;
+    std::string tools;
     std::vector<std::string> api_keys;
     std::vector<std::string> alias;    // first entry is the model id reported by the API
     std::string cors_origins = "*", cors_methods = "GET, POST, DELETE, OPTIONS", cors_headers = "*";
