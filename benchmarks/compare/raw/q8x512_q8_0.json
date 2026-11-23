@@ -1,0 +1,1 @@
+{"engine": "llama.cpp", "tag": "q8_0", "mode": "none", "tokens": 4096, "window": 512, "scored": 4088, "ppl": 8.46727, "mean_nll": 2.136208}

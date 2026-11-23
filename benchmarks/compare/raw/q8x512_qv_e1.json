@@ -1,0 +1,8 @@
+{"mode": "write", "kv": "fp32", "kmode": "channel", "tokens": 512, "scored": 511, "ppl": 6.38249, "mean_nll": 1.853558, "seconds": 2.7}
+{"mode": "write", "kv": "fp32", "kmode": "channel", "tokens": 512, "scored": 511, "ppl": 10.91912, "mean_nll": 2.390516, "seconds": 2.7}
+{"mode": "write", "kv": "fp32", "kmode": "channel", "tokens": 512, "scored": 511, "ppl": 9.22619, "mean_nll": 2.222046, "seconds": 3.0}
+{"mode": "write", "kv": "fp32", "kmode": "channel", "tokens": 512, "scored": 511, "ppl": 9.28169, "mean_nll": 2.228044, "seconds": 2.6}
+{"mode": "write", "kv": "fp32", "kmode": "channel", "tokens": 512, "scored": 511, "ppl": 8.07001, "mean_nll": 2.088155, "seconds": 2.7}
+{"mode": "write", "kv": "fp32", "kmode": "channel", "tokens": 512, "scored": 511, "ppl": 10.35131, "mean_nll": 2.337113, "seconds": 2.6}
+{"mode": "write", "kv": "fp32", "kmode": "channel", "tokens": 512, "scored": 511, "ppl": 9.81050, "mean_nll": 2.283453, "seconds": 2.7}
+{"mode": "write", "kv": "fp32", "kmode": "channel", "tokens": 512, "scored": 511, "ppl": 11.22653, "mean_nll": 2.418280, "seconds": 2.7}

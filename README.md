@@ -45,6 +45,18 @@ An original C++20/CUDA inference engine for **Qwen3.8-27B**: one fast engine for
 
 CPU decode is bound by DRAM bandwidth (about 54 GB/s here, 13.6 GB read per token). MTP reads the weights once for two tokens, which is the main lever.
 
+## Comparison with llama.cpp on the same V100 (measured 2026-11-21..23, not a claim of "best")
+Full protocol, commands, caveats and raw data: [benchmarks/compare/README.md](benchmarks/compare/README.md). llama.cpp 9d6f04f CUDA build (sm_70), same prompts, 3 interleaved rounds under the GPU lock; quality is measured against one common reference (llama.cpp Q8_0, a near-lossless proxy, not BF16).
+
+| | file GiB | ppl 8x512 (BF16 8.468) | KL to Q8_0 | plain decode tok/s | MTP best (code) | prefill 2048 / 4088 tok/s | max ctx (best KV) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| llama.cpp Q3_K_M | 12.77 | 8.905 | 0.054 | 42.3 | 74.8 | 931 / 920 | 132K (q4_0) |
+| Q-Volta e0 | 12.63 | 9.511 | 0.102 | 52.2 | 131.7 | 1250 / 1223 | 140K (int4) |
+| llama.cpp IQ3_XXS + imatrix | 10.89 | 8.992 | 0.075 | 38.7 | 68.8 | 779 / 775 | 219K (q4_0) |
+| Q-Volta e1 | 10.44 | 9.278 | 0.092 | 57.6 | 135.9 | 1250 / 1220 | 267K (int4) |
+
+Reading: at about equal bytes Q-Volta decodes and prefills faster and fits a longer int4 KV cache, while llama.cpp's K-/I-quants are clearly better in quality. Not comparable: KL reference (Q8_0), llama.cpp output of its MTP was not checked for exactness, file sizes differ by 1-4%. ExLlamaV2/V3, vLLM, SGLang: not run on this V100 (reasons in the compare README).
+
 ## Honest caveats (read before comparing)
 - **Smaller file `e1`**: GPTQ (group 128, compact 8-bit metadata) gives 10.44 GiB with wikitext ppl +9.6% (E0: 12.63 GiB, +12.3%); GPTQ at E0 size reaches +6.1%. It is weaker than E0 on an agentic/tool-calling check (KL 1.34 vs 1.13), see [docs/QUANTIZATION.md](docs/QUANTIZATION.md).
 - **Quality is behind the strongest baseline.** Our E0 weights are plain round-to-nearest (3-bit MLP, 4-bit attention/GDN): wikitext perplexity +12% vs BF16 (8.468 -> 9.508, top-1 agreement 84.6%). NInfer's mixed-precision file is +0.3%. Part of our decode lead is simply fewer bytes read (12.6 vs 14.0 GiB). Better quantization (GPTQ-style, bit allocation) is the next big item; speed gained at worse quality is not a clean win.

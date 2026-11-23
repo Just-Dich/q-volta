@@ -1,0 +1,2 @@
+{"engine": "qv", "model": "qwen38-27b-e0.qv", "kv": "int4", "max_ctx_fit": 140288, "resolution": 1024}
+{"engine": "qv", "model": "qwen38-27b-e0.qv", "kv": "fp16", "max_ctx_fit": 38912, "resolution": 1024}
