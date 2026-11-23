@@ -133,3 +133,16 @@ driver: draft + 8-row verify is about 3.7 plain steps, so the gain is 1.25x, not
 
 Not done: the ctx 512/4K/32K x code/prose matrix (the GPU lock was held by another agent for the rest of the session), verify cost at 2/4/9 rows in isolation,
 adaptive depth, acceptance versus sidecar bits (only 5/6-bit was built), CPU engine, `qv_server --mtp`.
+
+## 9. Per-stage GPU time (QV_MTP_PROF=1, each stage as its own CUDA graph, ctx ~512, code, V100)
+
+| stage | ms |
+|---|---|
+| plain 1-token step | 8.62 |
+| drafter block (8 rows + 7 Markov steps) | 3.21 |
+| verify R=2 / 3 / 4 / 8 rows | 13.26 / 15.66 / 18.31 / 28.38 |
+| accept + commit + ingest (R=8) | 0.11 (measured on dummy state, so a lower bound) |
+
+Verify adds about 2.5 ms per extra row and a 2-row verify already costs 1.54 plain steps, so the verify pass, not the drafter or rollback, is the cost driver
+(drafter 3.2 ms + verify 28.4 ms = 31.6 ms, matching the 31 ms measured cycle). Consistent with the MoE expert weights being read per row: rows rarely share experts.
+Open optimisation targets: expert-weight traffic in the row path, adaptive depth (depth 3 = 3.21+15.7 ms for 3.2 tokens).
