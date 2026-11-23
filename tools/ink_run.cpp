@@ -31,7 +31,8 @@ int main(int argc, char** argv) {
     std::string model, ids_path, out;
     int gen = 32, max_ctx = 8192, n = 128, synth = 0, chunk = 2048;
     bool bench = false, use_prefill = false, no_graph = false, pfgen = false;
-    std::string kv = "fp16";
+    std::string kv = "fp16", mtp_file;
+    int mtp_depth = 0;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { if (i + 1 >= argc) throw std::runtime_error("missing value for " + a); return argv[++i]; };
@@ -49,6 +50,8 @@ int main(int argc, char** argv) {
         else if (a == "--chunk") chunk = std::stoi(next());
         else if (a == "--prefill-chunk") chunk = std::stoi(next());
         else if (a == "--kv") kv = next();
+        else if (a == "--mtp-file") mtp_file = next();
+        else if (a == "--mtp-depth") mtp_depth = std::stoi(next());
         else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
     }
     qv::ModelFile mf = qv::ModelFile::open(model);
@@ -56,6 +59,9 @@ int main(int argc, char** argv) {
     opt.max_ctx = max_ctx;
     opt.prefill_chunk = chunk;
     opt.kv_mode = kv == "int4" ? 1 : kv == "fp16" ? 2 : 0;
+    opt.mtp = mtp_depth > 0;
+    opt.mtp_depth = mtp_depth;
+    opt.mtp_file = mtp_file;
     opt.dump_hidden = !bench && !pfgen && !out.empty();
     auto t0 = std::chrono::steady_clock::now();
     auto eng = qv::make_cuda_engine(mf, opt);

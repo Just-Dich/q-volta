@@ -116,7 +116,7 @@ class Inkling:
         self.ecache_bytes += sum(t.numel() * 2 for t in out)
         if self.ecache_bytes > self.ecache_limit:  # evict oldest non-loop entries
             for k in list(self.ecache.keys()):
-                if not (C.LS <= k[0] < C.LE):
+                if k != key and not (C.LS <= k[0] < C.LE):
                     t = self.ecache.pop(k)
                     self.ecache_bytes -= sum(x.numel() * 2 for x in t)
                     if self.ecache_bytes < 0.9 * self.ecache_limit:

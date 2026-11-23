@@ -15,6 +15,7 @@ struct EngineOptions {
     int prefill_chunk = 2048;  // tokens per batched prefill chunk
     int threads = 32;          // CPU backend: worker threads incl. the caller (RAM bandwidth saturates near 32 here)
     bool mtp = false;          // load the MTP head and use it for exact speculative greedy decoding (CPU and CUDA backends)
+    std::string mtp_file;      // Inkling CUDA backend: sidecar container with the MTP (DSpark) drafter (tools/convert_inkling_mtp.py); mtp_depth 1..7 drafts
     int mtp_depth = 1;         // CUDA backend: drafts per verify cycle (1..3); verify processes depth+1 tokens
     int kv_mode = 0;           // CUDA backend KV cache: 0 = fp32 (default), 1 = int4 (64-token blocks + fp16 window, attention/kv4.h), 2 = fp16
     int kv4_kmode = 0;         // int4 K quantization: 0 = per-channel (KIVI), 1 = per-token groups of 64 channels
