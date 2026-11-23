@@ -1,0 +1,3 @@
+{"engine": "llama", "model": "Q3_K_M.gguf", "kv": "f16", "max_ctx_fit": 39936, "resolution": 1024}
+{"engine": "llama", "model": "Q3_K_M.gguf", "kv": "q8_0", "max_ctx_fit": 74752, "resolution": 1024}
+{"engine": "llama", "model": "Q3_K_M.gguf", "kv": "q4_0", "max_ctx_fit": 132096, "resolution": 1024}

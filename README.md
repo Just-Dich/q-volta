@@ -1,9 +1,68 @@
-# Q-Volta
+<div align="center">
+  <img src="docs/img/banner.svg" alt="Q-Volta: fast LLM inference on one Tesla V100 and on CPUs" width="100%">
+  <br><br>
+  <img src="docs/img/Q_Logo.svg" width="56" alt="Q Project logo">
+  <p>
+    <img src="https://img.shields.io/badge/GPU-Tesla%20V100%20(sm__70)-76B900?style=for-the-badge&logo=nvidia&logoColor=white" alt="GPU">
+    <img src="https://img.shields.io/badge/CPU-x86%20AVX2-0071C5?style=for-the-badge" alt="CPU">
+    <img src="https://img.shields.io/badge/C%2B%2B-20-blueviolet?style=for-the-badge" alt="C++20">
+    <img src="https://img.shields.io/badge/API-OpenAI%20%2F%20llama--server-1596CF?style=for-the-badge" alt="API">
+    <img src="https://img.shields.io/badge/Status-research%20code-orange?style=for-the-badge" alt="Status">
+  </p>
+  <p>
+    <a href="https://huggingface.co/q-project/Qwen3.8-27B-QVolta"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Qwen3.8--27B--QVolta-weights-yellow?style=for-the-badge" alt="Qwen weights"></a>
+    <a href="https://huggingface.co/q-project/Inkling-2-Mini-QVolta"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Inkling--2--Mini--QVolta-weights-yellow?style=for-the-badge" alt="Inkling weights"></a>
+  </p>
+  <p>
+    <a href="https://q-project-lm.github.io/q-volta/"><img src="https://img.shields.io/badge/Website-q--project--lm.github.io%2Fq--volta-22d3ee?style=for-the-badge" alt="Website"></a>
+  </p>
+  <p>
+    <a href="#at-a-glance">At a glance</a> &middot;
+    <a href="#quick-start">Quick start</a> &middot;
+    <a href="#headline-results">Results</a> &middot;
+    <a href="#comparison-with-llamacpp-on-the-same-v100-measured-2026-11-2123-not-a-claim-of-best">vs llama.cpp</a> &middot;
+    <a href="#honest-caveats-read-before-comparing">Caveats</a> &middot;
+    <a href="#what-works">Features</a> &middot;
+    <a href="#docker">Docker</a> &middot;
+    <a href="#documentation">Docs</a>
+  </p>
+</div>
 
-An original C++20/CUDA inference engine for **Qwen3.8-27B**: one fast engine for a single **Tesla V100-16GB** (sm_70) and a native **CPU backend** (x86 AVX2 today; ARM/NEON is a design constraint, not yet ported), with **exact** MTP speculative decoding, a single-file model format and an OpenAI-compatible server.
+> [!IMPORTANT]
+> **Status: research code, not a release.** Every number was measured on one machine, on the date shown, with raw results in
+> [`benchmarks/results/`](benchmarks/results). Caveats sit next to the numbers and in [docs/PERFORMANCE.md](docs/PERFORMANCE.md). We do not claim to be "the best":
+> at equal file size we are faster, but llama.cpp's quants are better in quality (see the [comparison](#comparison-with-llamacpp-on-the-same-v100-measured-2026-11-2123-not-a-claim-of-best)).
 
-**Status: research code, not a release.** Every number below was measured on one machine, on the date shown, with the raw results in
-[`benchmarks/results/`](benchmarks/results). Caveats are listed next to the numbers and in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+## At a glance
+
+| | |
+|---|---|
+| **Fast decode** | Qwen3.8-27B on one V100-16GB: **52-58 tok/s** plain, up to **130-138 tok/s** with exact MTP speculative decoding (output identical to plain greedy) |
+| **Small file** | one `.qv` file, **10.4 - 12.6 GiB**, 2-8 bit bit-plane quantization (GPTQ-style) |
+| **Long context** | **256K tokens on a 16 GB card** (10.4 GiB weights + int4 KV cache), tensor-core flash prefill |
+| **CPU too** | native AVX2 backend with exact MTP: 3.8-4.5 tok/s for the 27B on one old Xeon (1.4-1.6x over plain) |
+| **Drop-in server** | `qv_server`: llama-server flags, OpenAI chat/completions, tools, grammars, jinja templates |
+| **Second model** | [Inkling-2-Mini](docs/INKLING_RUN.md) (26B MoE, looped): ~120 tok/s on the V100 |
+| **Honest** | every claim has raw data; losses are listed ([caveats](#honest-caveats-read-before-comparing)) |
+
+## Quick start
+
+```bash
+# 1. build (CUDA 12+, CMake 3.24+, Ninja; add -DQV_CUDA=OFF for a CPU-only build)
+cmake -S . -B build -G Ninja -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc && ninja -C build
+
+# 2. get a model (one file + tokenizer)
+hf download q-project/Qwen3.8-27B-QVolta qwen38-27b-e1.qv tokenizer.json --local-dir models
+
+# 3. serve (OpenAI / llama-server compatible API on :8080)
+./build/qv_server --model models/qwen38-27b-e1.qv --tokenizer models/tokenizer.json \
+    --backend cuda --kv int4 --max-ctx 131072 --mtp --mtp-depth 2
+
+curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":64}'
+```
+Docker: `docker build -t q-volta . && docker run --gpus all -p 8080:8080 -v $PWD/models:/models:ro q-volta` (see [Docker](#docker); not yet built by the authors).
+Check [docs/SERVER.md](docs/SERVER.md) for which flags are wired (MTP in the server is documented there).
 
 ## Headline results
 
@@ -45,13 +104,25 @@ An original C++20/CUDA inference engine for **Qwen3.8-27B**: one fast engine for
 
 CPU decode is bound by DRAM bandwidth (about 54 GB/s here, 13.6 GB read per token). MTP reads the weights once for two tokens, which is the main lever.
 
+## Comparison with llama.cpp on the same V100 (measured 2026-11-21..23, not a claim of "best")
+Full protocol, commands, caveats and raw data: [benchmarks/compare/README.md](benchmarks/compare/README.md). llama.cpp 9d6f04f CUDA build (sm_70), same prompts, 3 interleaved rounds under the GPU lock; quality is measured against one common reference (llama.cpp Q8_0, a near-lossless proxy, not BF16).
+
+| | file GiB | ppl 8x512 (BF16 8.468) | KL to Q8_0 | plain decode tok/s | MTP best (code) | prefill 2048 / 4088 tok/s | max ctx (best KV) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| llama.cpp Q3_K_M | 12.77 | 8.905 | 0.054 | 42.3 | 74.8 | 931 / 920 | 132K (q4_0) |
+| Q-Volta e0 | 12.63 | 9.511 | 0.102 | 52.2 | 131.7 | 1250 / 1223 | 140K (int4) |
+| llama.cpp IQ3_XXS + imatrix | 10.89 | 8.992 | 0.075 | 38.7 | 68.8 | 779 / 775 | 219K (q4_0) |
+| Q-Volta e1 | 10.44 | 9.278 | 0.092 | 57.6 | 135.9 | 1250 / 1220 | 267K (int4) |
+
+Reading: at about equal bytes Q-Volta decodes and prefills faster and fits a longer int4 KV cache, while llama.cpp's K-/I-quants are clearly better in quality. Not comparable: KL reference (Q8_0), llama.cpp output of its MTP was not checked for exactness, file sizes differ by 1-4%. ExLlamaV2/V3, vLLM, SGLang: not run on this V100 (reasons in the compare README).
+
 ## Honest caveats (read before comparing)
 - **Smaller file `e1`**: GPTQ (group 128, compact 8-bit metadata) gives 10.44 GiB with wikitext ppl +9.6% (E0: 12.63 GiB, +12.3%); GPTQ at E0 size reaches +6.1%. It is weaker than E0 on an agentic/tool-calling check (KL 1.34 vs 1.13), see [docs/QUANTIZATION.md](docs/QUANTIZATION.md).
 - **Quality is behind the strongest baseline.** Our E0 weights are plain round-to-nearest (3-bit MLP, 4-bit attention/GDN): wikitext perplexity +12% vs BF16 (8.468 -> 9.508, top-1 agreement 84.6%). NInfer's mixed-precision file is +0.3%. Part of our decode lead is simply fewer bytes read (12.6 vs 14.0 GiB). Better quantization (GPTQ-style, bit allocation) is the next big item; speed gained at worse quality is not a clean win.
 - The CPU comparison is **not** load-matched: the host was shared (load average 0.1-33), runs are single, and the llama.cpp quants were produced from a Q8_0 intermediate without an importance matrix. Plain-vs-MTP ratios come from back-to-back runs and are the more reliable numbers. Quality (KL) was not compared on CPU.
 - Today's plain CPU decode (2.6-2.8) is below an earlier 3.93 run; the cause (DRAM contention from other tenants) is suspected, not confirmed.
 - **Context length**: with the int4 KV cache (`--kv int4`: 4.5 bit/element, 18 KiB/token; passkey 6/6 up to 32K, wikitext ppl within 0.1% of fp32 KV at 4K/8K) the largest context that fits on the V100 is about 139K tokens (measured by allocation; 64K and 128K prefill + passkey ran end to end, 2/2 each, which bounds nothing about quality). Prefill: 1131 / 1048 / 902 / 686 tok/s at 4K / 8K / 16K / 32K, about 450 tok/s at 64K and 248 tok/s at 128K (9 minutes). **256K now fits** with the smaller `e1` weights (10.44 GiB, see below) plus int4 KV: 15.2-15.4 of 15.77 GiB used, decode at position 262,001 runs 22.9 tok/s (synthetic KV, speed/VRAM only). A real 250,000-token prefill took 1,701 s (28 min, 147 tok/s) and a passkey hidden at 50% depth was retrieved correctly (1 prompt only: this proves the pipeline works end to end, not retrieval quality; decode speed after a real 250K prefill and MTP at this length are not measured). A host-RAM tier was studied and rejected as the main route (sparse block retrieval loses too much attention mass at 32K+, exact CPU attention costs ~185 ms/token), see [docs/LONG_CONTEXT.md](docs/LONG_CONTEXT.md).
-- MTP only speculates exact greedy decoding; no sampling, no adaptive depth, and it is not yet wired into the server. MTP with the pi-merged model was not measured.
+- MTP only speculates exact greedy decoding; no sampling and no adaptive depth; in the server it applies to temperature-0 requests only. MTP with the pi-merged model was not measured.
 - Prefill attention uses tensor cores (3.0-3.9x faster than the fp32 kernel; 4K/8K/16K end-to-end +9% / +15% / +28%), but only ~23% of tensor-core peak; prompts above 16K are not benchmarked against NInfer.
 
 ## What works
@@ -59,7 +130,7 @@ CPU decode is bound by DRAM bandwidth (about 54 GB/s here, 13.6 GB read per toke
 - **Converter** `tools/convert.py` (streams BF16 -> Q-Volta, optional PEFT LoRA merge, so the pi adapter works as a merged model; runtime LoRA is planned).
 - **CUDA backend**: int8-activation dp4a GEMV decode at 81-99% of HBM peak with CUDA graphs; batched prefill (dequant slab + cuBLAS HGEMM, in-kernel GDN recurrence); split-K decode attention; exact multi-token verify for MTP.
 - **CPU backend**: AVX2 int8 kernels, pinned spin-barrier thread pool, huge-page weights, batched prefill, exact MTP.
-- **llama-server compatible server** `qv_server` (llama flags and `LLAMA_ARG_*` env, `/completion`, `/infill`, OpenAI chat/completions, `/slots`, `/metrics`, `/props`, `/tokenize`; structural diff-tested against llama-server): see [docs/SERVER.md](docs/SERVER.md) and [docs/SERVER_COMPAT.md](docs/SERVER_COMPAT.md). Tool calling, JSON mode and GBNF grammars via src/jinja + src/grammar; no vision or embeddings, one decoding sequence (requests queue). The CPU path is tested; the CUDA server path compiles but was not run in the server tests.
+- **llama-server compatible server** `qv_server` (llama flags and `LLAMA_ARG_*` env, `/completion`, `/infill`, OpenAI chat/completions, `/slots`, `/metrics`, `/props`, `/tokenize`; structural diff-tested against llama-server): see [docs/SERVER.md](docs/SERVER.md) and [docs/SERVER_COMPAT.md](docs/SERVER_COMPAT.md). Tool calling, JSON mode and GBNF grammars via src/jinja + src/grammar; no vision yet (in progress for Inkling) and no embeddings, one decoding sequence (requests queue). The CPU path is tested; the CUDA server path compiles but was not run in the server tests.
 - Tokenizer matches the `tokenizers` library on 509/509 test strings (498/509 vs transformers `AutoTokenizer`; combining-mark cases differ, documented). Chat template matches 31/31 conversations.
 - Tests: 12/12 ctest on the GPU build; full-model golden test passes (KL 6.5e-4 vs the simulated-quantization reference).
 
@@ -79,6 +150,19 @@ cmake -S . -B build -G Ninja -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc && n
 python3 -I tests/gen_gemv_cases.py build/gemv_cases && ./build/test_gemv build/gemv_cases q8
 ```
 Full-model golden and benchmarks need the converted model (not included): see `CLAUDE.md`.
+
+## Documentation
+| topic | where |
+|---|---|
+| performance methodology and raw numbers | [docs/PERFORMANCE.md](docs/PERFORMANCE.md), [benchmarks/](benchmarks) |
+| quantization recipes and quality | [docs/QUANTIZATION.md](docs/QUANTIZATION.md) |
+| long context (int4 KV, tiering study) | [docs/LONG_CONTEXT.md](docs/LONG_CONTEXT.md) |
+| server, llama-server compatibility, jinja, grammar | [docs/SERVER.md](docs/SERVER.md), [docs/SERVER_COMPAT.md](docs/SERVER_COMPAT.md), [docs/JINJA.md](docs/JINJA.md), [docs/GRAMMAR.md](docs/GRAMMAR.md) |
+| CPU engine | [docs/CPU_OPTIMIZATION.md](docs/CPU_OPTIMIZATION.md) |
+| Inkling-2-Mini | [docs/INKLING_RUN.md](docs/INKLING_RUN.md), [spec](docs/INKLING_SPEC.md), [format](docs/INKLING_FORMAT.md), [engine](docs/INKLING_ENGINE.md) |
+| comparison with llama.cpp | [benchmarks/compare/README.md](benchmarks/compare/README.md) |
+| Docker | [docs/DOCKER.md](docs/DOCKER.md) |
+| progress log | [docs/PROGRESS.md](docs/PROGRESS.md) |
 
 ## Third-party
 Written from scratch. Other engines (NInfer, llama.cpp) were read for design ideas and used only as black-box benchmark baselines; no code copied.

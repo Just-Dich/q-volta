@@ -1,0 +1,937 @@
+{
+ "quality": {
+  "IQ3_XXS_im": {
+   "ppl_4088": 6.1023,
+   "kl_vs_q8": 0.075106,
+   "top1_vs_q8": 0.8897,
+   "tail_mass": 0.006502,
+   "ppl_8x512": 8.99197
+  },
+  "Q3_K_M": {
+   "ppl_4088": 6.04731,
+   "kl_vs_q8": 0.053525,
+   "top1_vs_q8": 0.8972,
+   "tail_mass": 0.006502,
+   "ppl_8x512": 8.90506
+  },
+  "q8_0": {
+   "ppl_4088": 5.77419,
+   "kl_vs_q8": 0.0,
+   "top1_vs_q8": 1.0,
+   "tail_mass": 0.006502,
+   "ppl_8x512": 8.46727
+  },
+  "qv_e0": {
+   "ppl_4088": 6.25663,
+   "kl_vs_q8": 0.101773,
+   "top1_vs_q8": 0.8657,
+   "tail_mass": 0.006502,
+   "ppl_8x512": 9.5109
+  },
+  "qv_e1": {
+   "ppl_4088": 6.28072,
+   "kl_vs_q8": 0.092341,
+   "top1_vs_q8": 0.8711,
+   "tail_mass": 0.006502,
+   "ppl_8x512": 9.278
+  }
+ },
+ "speed": {
+  "IQ3_XXS_im_vs_qwen38-27b-e1": {
+   "llama-bench": {
+    "pp2048": {
+     "mean": 779.02,
+     "min": 775.02,
+     "max": 781.95,
+     "n": 3
+    },
+    "pp4096": {
+     "mean": 775.13,
+     "min": 773.73,
+     "max": 776.55,
+     "n": 3
+    },
+    "pp512": {
+     "mean": 732.8,
+     "min": 720.85,
+     "max": 741.23,
+     "n": 3
+    },
+    "tg128@d0": {
+     "mean": 38.74,
+     "min": 38.0,
+     "max": 39.13,
+     "n": 3
+    },
+    "tg128@d2048": {
+     "mean": 38.34,
+     "min": 37.94,
+     "max": 38.56,
+     "n": 3
+    },
+    "tg128@d4088": {
+     "mean": 36.66,
+     "min": 36.26,
+     "max": 37.38,
+     "n": 3
+    },
+    "tg128@d512": {
+     "mean": 38.49,
+     "min": 37.73,
+     "max": 39.0,
+     "n": 3
+    }
+   },
+   "llama_server_mtp2": {
+    "P2048.i32_accept": {
+     "mean": 0.52,
+     "min": 0.52,
+     "max": 0.52,
+     "n": 3
+    },
+    "P2048.i32_decode": {
+     "mean": 43.09,
+     "min": 41.4,
+     "max": 46.04,
+     "n": 3
+    },
+    "P4088.i32_accept": {
+     "mean": 0.73,
+     "min": 0.73,
+     "max": 0.73,
+     "n": 3
+    },
+    "P4088.i32_decode": {
+     "mean": 49.36,
+     "min": 44.96,
+     "max": 53.67,
+     "n": 3
+    },
+    "P512.i32_accept": {
+     "mean": 0.86,
+     "min": 0.86,
+     "max": 0.86,
+     "n": 3
+    },
+    "P512.i32_decode": {
+     "mean": 58.95,
+     "min": 56.76,
+     "max": 62.75,
+     "n": 3
+    },
+    "code.i32_accept": {
+     "mean": 0.91,
+     "min": 0.91,
+     "max": 0.91,
+     "n": 3
+    },
+    "code.i32_decode": {
+     "mean": 62.63,
+     "min": 58.76,
+     "max": 66.92,
+     "n": 3
+    },
+    "prose.i32_accept": {
+     "mean": 0.66,
+     "min": 0.66,
+     "max": 0.66,
+     "n": 3
+    },
+    "prose.i32_decode": {
+     "mean": 52.59,
+     "min": 50.51,
+     "max": 55.27,
+     "n": 3
+    }
+   },
+   "llama_server_mtp3": {
+    "P2048.i32_accept": {
+     "mean": 0.38,
+     "min": 0.38,
+     "max": 0.38,
+     "n": 3
+    },
+    "P2048.i32_decode": {
+     "mean": 37.15,
+     "min": 33.76,
+     "max": 39.1,
+     "n": 3
+    },
+    "P4088.i32_accept": {
+     "mean": 0.58,
+     "min": 0.58,
+     "max": 0.58,
+     "n": 3
+    },
+    "P4088.i32_decode": {
+     "mean": 46.65,
+     "min": 45.02,
+     "max": 47.65,
+     "n": 3
+    },
+    "P512.i32_accept": {
+     "mean": 0.85,
+     "min": 0.85,
+     "max": 0.85,
+     "n": 3
+    },
+    "P512.i32_decode": {
+     "mean": 61.86,
+     "min": 59.78,
+     "max": 64.37,
+     "n": 3
+    },
+    "code.i32_accept": {
+     "mean": 0.88,
+     "min": 0.88,
+     "max": 0.88,
+     "n": 3
+    },
+    "code.i32_decode": {
+     "mean": 68.78,
+     "min": 68.12,
+     "max": 69.16,
+     "n": 3
+    },
+    "prose.i32_accept": {
+     "mean": 0.55,
+     "min": 0.55,
+     "max": 0.55,
+     "n": 3
+    },
+    "prose.i32_decode": {
+     "mean": 49.75,
+     "min": 47.66,
+     "max": 52.0,
+     "n": 3
+    }
+   },
+   "llama_server_plain": {
+    "P2048.i32_decode": {
+     "mean": 32.1,
+     "min": 31.87,
+     "max": 32.48,
+     "n": 3
+    },
+    "P4088.i32_decode": {
+     "mean": 32.63,
+     "min": 32.43,
+     "max": 32.85,
+     "n": 3
+    },
+    "P512.i32_decode": {
+     "mean": 33.84,
+     "min": 32.19,
+     "max": 35.03,
+     "n": 3
+    },
+    "code.i32_decode": {
+     "mean": 35.54,
+     "min": 34.85,
+     "max": 35.93,
+     "n": 3
+    },
+    "prose.i32_decode": {
+     "mean": 34.43,
+     "min": 33.76,
+     "max": 35.46,
+     "n": 3
+    }
+   },
+   "qv_mtp2": {
+    "code_accept": {
+     "mean": 0.98,
+     "min": 0.98,
+     "max": 0.98,
+     "n": 3
+    },
+    "code_decode": {
+     "mean": 125.87,
+     "min": 125.35,
+     "max": 126.36,
+     "n": 3
+    },
+    "code_prefill": {
+     "mean": 164.07,
+     "min": 163.93,
+     "max": 164.27,
+     "n": 3
+    },
+    "prose_accept": {
+     "mean": 0.61,
+     "min": 0.61,
+     "max": 0.61,
+     "n": 3
+    },
+    "prose_decode": {
+     "mean": 93.78,
+     "min": 93.0,
+     "max": 95.02,
+     "n": 3
+    },
+    "prose_prefill": {
+     "mean": 207.21,
+     "min": 206.62,
+     "max": 207.56,
+     "n": 3
+    },
+    "wiki2048_accept": {
+     "mean": 0.54,
+     "min": 0.54,
+     "max": 0.54,
+     "n": 3
+    },
+    "wiki2048_decode": {
+     "mean": 82.42,
+     "min": 82.22,
+     "max": 82.68,
+     "n": 3
+    },
+    "wiki2048_prefill": {
+     "mean": 1230.05,
+     "min": 1227.97,
+     "max": 1232.86,
+     "n": 3
+    },
+    "wiki4088_accept": {
+     "mean": 0.73,
+     "min": 0.73,
+     "max": 0.73,
+     "n": 3
+    },
+    "wiki4088_decode": {
+     "mean": 93.89,
+     "min": 93.3,
+     "max": 94.33,
+     "n": 3
+    },
+    "wiki4088_prefill": {
+     "mean": 1201.43,
+     "min": 1200.36,
+     "max": 1202.1,
+     "n": 3
+    },
+    "wiki512_accept": {
+     "mean": 0.92,
+     "min": 0.92,
+     "max": 0.92,
+     "n": 3
+    },
+    "wiki512_decode": {
+     "mean": 120.89,
+     "min": 120.54,
+     "max": 121.43,
+     "n": 3
+    },
+    "wiki512_prefill": {
+     "mean": 998.34,
+     "min": 995.29,
+     "max": 1001.21,
+     "n": 3
+    }
+   },
+   "qv_mtp3": {
+    "code_accept": {
+     "mean": 0.94,
+     "min": 0.94,
+     "max": 0.94,
+     "n": 3
+    },
+    "code_decode": {
+     "mean": 135.85,
+     "min": 135.32,
+     "max": 136.32,
+     "n": 3
+    },
+    "code_prefill": {
+     "mean": 164.82,
+     "min": 164.58,
+     "max": 164.97,
+     "n": 3
+    },
+    "prose_accept": {
+     "mean": 0.48,
+     "min": 0.48,
+     "max": 0.48,
+     "n": 3
+    },
+    "prose_decode": {
+     "mean": 87.25,
+     "min": 86.53,
+     "max": 87.69,
+     "n": 3
+    },
+    "prose_prefill": {
+     "mean": 207.59,
+     "min": 207.25,
+     "max": 207.82,
+     "n": 3
+    },
+    "wiki2048_accept": {
+     "mean": 0.42,
+     "min": 0.42,
+     "max": 0.42,
+     "n": 3
+    },
+    "wiki2048_decode": {
+     "mean": 75.12,
+     "min": 74.13,
+     "max": 75.81,
+     "n": 3
+    },
+    "wiki2048_prefill": {
+     "mean": 1230.2,
+     "min": 1226.48,
+     "max": 1236.06,
+     "n": 3
+    },
+    "wiki4088_accept": {
+     "mean": 0.53,
+     "min": 0.53,
+     "max": 0.53,
+     "n": 3
+    },
+    "wiki4088_decode": {
+     "mean": 81.25,
+     "min": 78.55,
+     "max": 82.64,
+     "n": 3
+    },
+    "wiki4088_prefill": {
+     "mean": 1202.57,
+     "min": 1200.61,
+     "max": 1205.04,
+     "n": 3
+    },
+    "wiki512_accept": {
+     "mean": 0.89,
+     "min": 0.89,
+     "max": 0.89,
+     "n": 3
+    },
+    "wiki512_decode": {
+     "mean": 130.47,
+     "min": 129.88,
+     "max": 130.94,
+     "n": 3
+    },
+    "wiki512_prefill": {
+     "mean": 997.24,
+     "min": 996.11,
+     "max": 998.87,
+     "n": 3
+    }
+   },
+   "qv_plain": {
+    "code_decode": {
+     "mean": 57.56,
+     "min": 57.56,
+     "max": 57.56,
+     "n": 3
+    },
+    "code_prefill": {
+     "mean": 167.37,
+     "min": 166.74,
+     "max": 167.7,
+     "n": 3
+    },
+    "prose_decode": {
+     "mean": 57.57,
+     "min": 57.56,
+     "max": 57.57,
+     "n": 3
+    },
+    "prose_prefill": {
+     "mean": 210.53,
+     "min": 210.22,
+     "max": 210.71,
+     "n": 3
+    },
+    "wiki2048_decode": {
+     "mean": 55.73,
+     "min": 55.7,
+     "max": 55.75,
+     "n": 3
+    },
+    "wiki2048_prefill": {
+     "mean": 1249.52,
+     "min": 1247.74,
+     "max": 1250.55,
+     "n": 3
+    },
+    "wiki4088_decode": {
+     "mean": 54.73,
+     "min": 54.71,
+     "max": 54.75,
+     "n": 3
+    },
+    "wiki4088_prefill": {
+     "mean": 1220.4,
+     "min": 1218.33,
+     "max": 1222.19,
+     "n": 3
+    },
+    "wiki512_decode": {
+     "mean": 57.29,
+     "min": 57.28,
+     "max": 57.3,
+     "n": 3
+    },
+    "wiki512_prefill": {
+     "mean": 1010.53,
+     "min": 1003.1,
+     "max": 1014.95,
+     "n": 3
+    }
+   }
+  },
+  "Q3KM_vs_e0": {
+   "llama-bench": {
+    "pp2048": {
+     "mean": 931.46,
+     "min": 924.03,
+     "max": 942.87,
+     "n": 3
+    },
+    "pp4096": {
+     "mean": 919.51,
+     "min": 913.46,
+     "max": 931.37,
+     "n": 3
+    },
+    "pp512": {
+     "mean": 929.54,
+     "min": 917.93,
+     "max": 943.85,
+     "n": 3
+    },
+    "tg128@d0": {
+     "mean": 42.34,
+     "min": 42.22,
+     "max": 42.5,
+     "n": 3
+    },
+    "tg128@d2048": {
+     "mean": 41.76,
+     "min": 41.65,
+     "max": 41.94,
+     "n": 3
+    },
+    "tg128@d4088": {
+     "mean": 40.65,
+     "min": 40.19,
+     "max": 41.12,
+     "n": 3
+    },
+    "tg128@d512": {
+     "mean": 42.32,
+     "min": 42.22,
+     "max": 42.39,
+     "n": 3
+    }
+   },
+   "llama_server_mtp2": {
+    "P2048.i32_accept": {
+     "mean": 0.59,
+     "min": 0.59,
+     "max": 0.59,
+     "n": 3
+    },
+    "P2048.i32_decode": {
+     "mean": 50.48,
+     "min": 49.75,
+     "max": 51.94,
+     "n": 3
+    },
+    "P4088.i32_accept": {
+     "mean": 0.65,
+     "min": 0.65,
+     "max": 0.65,
+     "n": 3
+    },
+    "P4088.i32_decode": {
+     "mean": 51.57,
+     "min": 50.84,
+     "max": 52.41,
+     "n": 3
+    },
+    "P512.i32_accept": {
+     "mean": 0.74,
+     "min": 0.74,
+     "max": 0.74,
+     "n": 3
+    },
+    "P512.i32_decode": {
+     "mean": 58.33,
+     "min": 57.8,
+     "max": 59.07,
+     "n": 3
+    },
+    "code.i32_accept": {
+     "mean": 0.98,
+     "min": 0.98,
+     "max": 0.98,
+     "n": 3
+    },
+    "code.i32_decode": {
+     "mean": 70.85,
+     "min": 70.72,
+     "max": 71.1,
+     "n": 3
+    },
+    "prose.i32_accept": {
+     "mean": 0.68,
+     "min": 0.68,
+     "max": 0.68,
+     "n": 3
+    },
+    "prose.i32_decode": {
+     "mean": 56.89,
+     "min": 56.73,
+     "max": 57.07,
+     "n": 3
+    }
+   },
+   "llama_server_mtp3": {
+    "P2048.i32_accept": {
+     "mean": 0.43,
+     "min": 0.43,
+     "max": 0.43,
+     "n": 3
+    },
+    "P2048.i32_decode": {
+     "mean": 43.6,
+     "min": 43.22,
+     "max": 44.11,
+     "n": 3
+    },
+    "P4088.i32_accept": {
+     "mean": 0.55,
+     "min": 0.55,
+     "max": 0.55,
+     "n": 3
+    },
+    "P4088.i32_decode": {
+     "mean": 49.31,
+     "min": 48.75,
+     "max": 49.61,
+     "n": 3
+    },
+    "P512.i32_accept": {
+     "mean": 0.65,
+     "min": 0.65,
+     "max": 0.65,
+     "n": 3
+    },
+    "P512.i32_decode": {
+     "mean": 57.93,
+     "min": 56.96,
+     "max": 59.09,
+     "n": 3
+    },
+    "code.i32_accept": {
+     "mean": 0.93,
+     "min": 0.93,
+     "max": 0.93,
+     "n": 3
+    },
+    "code.i32_decode": {
+     "mean": 74.77,
+     "min": 74.22,
+     "max": 75.08,
+     "n": 3
+    },
+    "prose.i32_accept": {
+     "mean": 0.58,
+     "min": 0.58,
+     "max": 0.58,
+     "n": 3
+    },
+    "prose.i32_decode": {
+     "mean": 54.25,
+     "min": 53.81,
+     "max": 55.07,
+     "n": 3
+    }
+   },
+   "llama_server_plain": {
+    "P2048.i32_decode": {
+     "mean": 38.76,
+     "min": 37.91,
+     "max": 39.9,
+     "n": 3
+    },
+    "P4088.i32_decode": {
+     "mean": 37.73,
+     "min": 36.5,
+     "max": 39.79,
+     "n": 3
+    },
+    "P512.i32_decode": {
+     "mean": 39.54,
+     "min": 39.09,
+     "max": 40.0,
+     "n": 3
+    },
+    "code.i32_decode": {
+     "mean": 40.99,
+     "min": 40.85,
+     "max": 41.21,
+     "n": 3
+    },
+    "prose.i32_decode": {
+     "mean": 39.83,
+     "min": 38.73,
+     "max": 40.84,
+     "n": 3
+    }
+   },
+   "qv_mtp2": {
+    "code_accept": {
+     "mean": 0.94,
+     "min": 0.94,
+     "max": 0.94,
+     "n": 3
+    },
+    "code_decode": {
+     "mean": 114.64,
+     "min": 114.57,
+     "max": 114.72,
+     "n": 3
+    },
+    "code_prefill": {
+     "mean": 162.92,
+     "min": 162.76,
+     "max": 163.08,
+     "n": 3
+    },
+    "prose_accept": {
+     "mean": 0.58,
+     "min": 0.58,
+     "max": 0.58,
+     "n": 3
+    },
+    "prose_decode": {
+     "mean": 86.54,
+     "min": 86.49,
+     "max": 86.58,
+     "n": 3
+    },
+    "prose_prefill": {
+     "mean": 205.24,
+     "min": 205.07,
+     "max": 205.52,
+     "n": 3
+    },
+    "wiki2048_accept": {
+     "mean": 0.52,
+     "min": 0.52,
+     "max": 0.52,
+     "n": 3
+    },
+    "wiki2048_decode": {
+     "mean": 76.26,
+     "min": 75.99,
+     "max": 76.42,
+     "n": 3
+    },
+    "wiki2048_prefill": {
+     "mean": 1230.13,
+     "min": 1229.37,
+     "max": 1230.52,
+     "n": 3
+    },
+    "wiki4088_accept": {
+     "mean": 0.59,
+     "min": 0.59,
+     "max": 0.59,
+     "n": 3
+    },
+    "wiki4088_decode": {
+     "mean": 78.8,
+     "min": 78.75,
+     "max": 78.9,
+     "n": 3
+    },
+    "wiki4088_prefill": {
+     "mean": 1201.51,
+     "min": 1200.19,
+     "max": 1202.38,
+     "n": 3
+    },
+    "wiki512_accept": {
+     "mean": 0.95,
+     "min": 0.95,
+     "max": 0.95,
+     "n": 3
+    },
+    "wiki512_decode": {
+     "mean": 115.05,
+     "min": 114.99,
+     "max": 115.11,
+     "n": 3
+    },
+    "wiki512_prefill": {
+     "mean": 994.2,
+     "min": 993.37,
+     "max": 995.28,
+     "n": 3
+    }
+   },
+   "qv_mtp3": {
+    "code_accept": {
+     "mean": 0.94,
+     "min": 0.94,
+     "max": 0.94,
+     "n": 3
+    },
+    "code_decode": {
+     "mean": 131.68,
+     "min": 130.96,
+     "max": 132.06,
+     "n": 3
+    },
+    "code_prefill": {
+     "mean": 163.09,
+     "min": 162.94,
+     "max": 163.32,
+     "n": 3
+    },
+    "prose_accept": {
+     "mean": 0.47,
+     "min": 0.47,
+     "max": 0.47,
+     "n": 3
+    },
+    "prose_decode": {
+     "mean": 84.17,
+     "min": 84.11,
+     "max": 84.22,
+     "n": 3
+    },
+    "prose_prefill": {
+     "mean": 205.51,
+     "min": 205.27,
+     "max": 205.76,
+     "n": 3
+    },
+    "wiki2048_accept": {
+     "mean": 0.4,
+     "min": 0.4,
+     "max": 0.4,
+     "n": 3
+    },
+    "wiki2048_decode": {
+     "mean": 71.96,
+     "min": 71.82,
+     "max": 72.1,
+     "n": 3
+    },
+    "wiki2048_prefill": {
+     "mean": 1232.79,
+     "min": 1230.86,
+     "max": 1234.5,
+     "n": 3
+    },
+    "wiki4088_accept": {
+     "mean": 0.44,
+     "min": 0.44,
+     "max": 0.44,
+     "n": 3
+    },
+    "wiki4088_decode": {
+     "mean": 72.56,
+     "min": 72.49,
+     "max": 72.64,
+     "n": 3
+    },
+    "wiki4088_prefill": {
+     "mean": 1203.88,
+     "min": 1203.61,
+     "max": 1204.15,
+     "n": 3
+    },
+    "wiki512_accept": {
+     "mean": 0.96,
+     "min": 0.96,
+     "max": 0.96,
+     "n": 3
+    },
+    "wiki512_decode": {
+     "mean": 134.39,
+     "min": 134.25,
+     "max": 134.59,
+     "n": 3
+    },
+    "wiki512_prefill": {
+     "mean": 994.65,
+     "min": 993.05,
+     "max": 997.37,
+     "n": 3
+    }
+   },
+   "qv_plain": {
+    "code_decode": {
+     "mean": 52.21,
+     "min": 52.2,
+     "max": 52.22,
+     "n": 3
+    },
+    "code_prefill": {
+     "mean": 165.78,
+     "min": 165.76,
+     "max": 165.81,
+     "n": 3
+    },
+    "prose_decode": {
+     "mean": 52.18,
+     "min": 52.17,
+     "max": 52.18,
+     "n": 3
+    },
+    "prose_prefill": {
+     "mean": 208.74,
+     "min": 208.45,
+     "max": 209.17,
+     "n": 3
+    },
+    "wiki2048_decode": {
+     "mean": 50.74,
+     "min": 50.73,
+     "max": 50.74,
+     "n": 3
+    },
+    "wiki2048_prefill": {
+     "mean": 1249.96,
+     "min": 1245.18,
+     "max": 1256.71,
+     "n": 3
+    },
+    "wiki4088_decode": {
+     "mean": 49.94,
+     "min": 49.92,
+     "max": 49.95,
+     "n": 3
+    },
+    "wiki4088_prefill": {
+     "mean": 1223.24,
+     "min": 1222.32,
+     "max": 1224.52,
+     "n": 3
+    },
+    "wiki512_decode": {
+     "mean": 51.98,
+     "min": 51.96,
+     "max": 52.02,
+     "n": 3
+    },
+    "wiki512_prefill": {
+     "mean": 1008.27,
+     "min": 1006.45,
+     "max": 1010.76,
+     "n": 3
+    }
+   }
+  }
+ }
+}

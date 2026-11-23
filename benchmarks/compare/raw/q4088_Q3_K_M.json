@@ -1,0 +1,1 @@
+{"engine": "llama.cpp", "tag": "Q3_K_M", "mode": "compare", "tokens": 4088, "window": 4088, "scored": 4087, "ppl": 6.04731, "mean_nll": 1.799613, "ref_ppl": 5.77419, "kl_topk_mean": 0.053525, "top1_agree": 0.8972, "ref_tail_mass_mean": 0.006502}
