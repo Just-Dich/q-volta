@@ -13,7 +13,7 @@ def main():
     names = a[a.index("--names") + 1].split(",") if "--names" in a else None
     res = {}
     for f in sorted(os.listdir(G)):
-        if not f.endswith(".npz"): continue
+        if not f.endswith(".npz") or f.startswith("e2e_"): continue
         n = f[:-4]
         if names and n not in names: continue
         img = next(os.path.join(G, n + e) for e in (".png", ".jpg") if os.path.exists(os.path.join(G, n + e)))

@@ -13,6 +13,12 @@ curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":64}'
 ```
 
+## Image input
+`inkling2-mini-vision.qv` (0.64 GB fp16, `python3 -I tools/convert_inkling_vision.py Inkling-2-Mini inkling2-mini-vision.qv`) next to the model is picked up automatically (`--vision-file PATH` to point elsewhere). Then
+`{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}` parts work in `/v1/chat/completions` (streaming too); see docs/INKLING_VISION.md for sources, limits and the security flags. Measured
+through the server on the V100 (Q3A5, int4 KV): time to first token with a 224x224 image (59 prompt tokens) 0.22 s, 512x512 (192 tokens) 0.32 s, 1024x1024 (699 tokens) 0.71 s, text-only 18 tokens 0.15 s;
+decode speed is unchanged (about 120 tok/s). VRAM: +0.64 GB for the vision weights, plus transient encoder buffers while an image is encoded.
+
 ## Measured through the server (Tesla V100, int4 KV, 2026-11-22, single requests, one run each)
 | request | result |
 |---|---|

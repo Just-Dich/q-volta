@@ -24,6 +24,8 @@ Defaults are llama-server's: port **9931**, temperature 0.8, top_k 40, top_p 0.9
 
 Q-Volta flags: `--backend cuda|cpu|auto|mock` (`-ngl 0` also selects CPU), `--kv fp32|fp16|int4`, `--mtp` / `--mtp-depth N` (exact greedy MTP lookahead for temperature-0 requests),
 `--prefill-chunk N`, `--tokenizer PATH`, `--max-queue N` (503 beyond N waiting; default unbounded like llama), legacy `--max-ctx`, `--model-name`, `--http-threads`, `--quiet`.
+Vision (Inkling image input, docs/INKLING_VISION.md): `--vision-file PATH|none` (default: `<model>-vision.qv` / `<family>-vision.qv` next to the model), `--image-root DIR` (local image files, default the working directory, `""` = off),
+`--allow-remote-images` (http(s) `image_url`, SSRF-guarded, needs `curl`; off by default), `--image-max-side N` (4096), `--image-token STR`. `/props` reports `modalities.vision`.
 The `mock` backend (scripted tokens, `--mock-text`) is for tests and needs no weights.
 
 Thinking: the Qwen3.8 template opens `<think>`; with `--reasoning-format auto` (= deepseek) the thinking text is returned as `reasoning_content`.

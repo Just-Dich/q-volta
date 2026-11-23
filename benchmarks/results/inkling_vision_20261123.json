@@ -1,0 +1,542 @@
+{
+ "date": "2026-11-23",
+ "branch": "p19/ink-vision",
+ "gpu": "Tesla V100-SXM2-16GB (device 0)",
+ "cpu": "Xeon E5-2683 v4, AVX2, OMP 32 threads, shared host (load avg 25-55 during runs)",
+ "model": "Inkling-2-Mini Q3A5 text + inkling2-mini-vision.qv (fp16)",
+ "embedding_parity_vs_hf_fp32_tower": {
+  "cuda_fp16": {
+   "gradient_200x120": {
+    "tokens": 15,
+    "pix_max_abs": 1.1920928955078125e-07,
+    "pix_mean_abs": 5.884241005560398e-08,
+    "pix_exact_frac": 0.10031944444444445,
+    "emb_rel_l2": 0.003703886875882745,
+    "emb_max_abs": 0.0036971569061279297,
+    "emb_cos": 0.9999930262565613,
+    "hf_bf16_rel_l2": 0.032174739986658096,
+    "emb_vs_bf16_rel_l2": 0.03188280388712883,
+    "ref_max_abs": 1.931740403175354
+   },
+   "hello_320x120": {
+    "tokens": 24,
+    "pix_max_abs": 1.1920928955078125e-07,
+    "pix_mean_abs": 9.14147406660959e-08,
+    "pix_exact_frac": 0.22390625,
+    "emb_rel_l2": 0.0008772299624979496,
+    "emb_max_abs": 0.0006702467799186707,
+    "emb_cos": 0.9999996423721313,
+    "hf_bf16_rel_l2": 0.013353549875319004,
+    "emb_vs_bf16_rel_l2": 0.013451976701617241,
+    "ref_max_abs": 1.6614958047866821
+   },
+   "noise_33x47": {
+    "tokens": 2,
+    "pix_max_abs": 1.1920928955078125e-07,
+    "pix_mean_abs": 2.8567058052431094e-08,
+    "pix_exact_frac": 0.5784375,
+    "emb_rel_l2": 0.000562076224014163,
+    "emb_max_abs": 0.0006754100322723389,
+    "emb_cos": 0.9999998211860657,
+    "hf_bf16_rel_l2": 0.01316234190016985,
+    "emb_vs_bf16_rel_l2": 0.01314378622919321,
+    "ref_max_abs": 2.2524235248565674
+   },
+   "photo_240x160": {
+    "tokens": 24,
+    "pix_max_abs": 0.007843255996704102,
+    "pix_mean_abs": 4.708640699391253e-05,
+    "pix_exact_frac": 0.011276041666666667,
+    "emb_rel_l2": 0.004090935457497835,
+    "emb_max_abs": 0.002992449328303337,
+    "emb_cos": 0.9999917149543762,
+    "hf_bf16_rel_l2": 0.03133033961057663,
+    "emb_vs_bf16_rel_l2": 0.031843338161706924,
+    "ref_max_abs": 1.8323719501495361
+   },
+   "redsquare_224x224": {
+    "tokens": 36,
+    "pix_max_abs": 1.1920928955078125e-07,
+    "pix_mean_abs": 3.4614846100566865e-08,
+    "pix_exact_frac": 0.5140740740740741,
+    "emb_rel_l2": 0.0015717392088845372,
+    "emb_max_abs": 0.001783132553100586,
+    "emb_cos": 0.9999988675117493,
+    "hf_bf16_rel_l2": 0.05030163377523422,
+    "emb_vs_bf16_rel_l2": 0.04988614469766617,
+    "ref_max_abs": 1.7847073078155518
+   },
+   "rgba_120x80": {
+    "tokens": 6,
+    "pix_max_abs": 8.940696716308594e-08,
+    "pix_mean_abs": 5.1119261712528896e-08,
+    "pix_exact_frac": 0.19444444444444445,
+    "emb_rel_l2": 0.001233882736414671,
+    "emb_max_abs": 0.0008695125579833984,
+    "emb_cos": 0.9999992847442627,
+    "hf_bf16_rel_l2": 0.023078957572579384,
+    "emb_vs_bf16_rel_l2": 0.023050012066960335,
+    "ref_max_abs": 1.3029500246047974
+   }
+  },
+  "cpu_fp32": {
+   "gradient_200x120": {
+    "tokens": 15,
+    "pix_max_abs": 1.1920928955078125e-07,
+    "pix_mean_abs": 5.884241005560398e-08,
+    "pix_exact_frac": 0.10031944444444445,
+    "emb_rel_l2": 5.590104137809249e-06,
+    "emb_max_abs": 6.198883056640625e-06,
+    "emb_cos": 1.0,
+    "hf_bf16_rel_l2": 0.032174739986658096,
+    "emb_vs_bf16_rel_l2": 0.03225308284163475,
+    "ref_max_abs": 1.931740403175354
+   },
+   "hello_320x120": {
+    "tokens": 24,
+    "pix_max_abs": 1.1920928955078125e-07,
+    "pix_mean_abs": 9.14147406660959e-08,
+    "pix_exact_frac": 0.22390625,
+    "emb_rel_l2": 2.4077671696431935e-06,
+    "emb_max_abs": 2.0563602447509766e-06,
+    "emb_cos": 1.0,
+    "hf_bf16_rel_l2": 0.013353549875319004,
+    "emb_vs_bf16_rel_l2": 0.013353435322642326,
+    "ref_max_abs": 1.6614958047866821
+   },
+   "noise_33x47": {
+    "tokens": 2,
+    "pix_max_abs": 1.1920928955078125e-07,
+    "pix_mean_abs": 2.8567058052431094e-08,
+    "pix_exact_frac": 0.5784375,
+    "emb_rel_l2": 2.099790663123713e-06,
+    "emb_max_abs": 4.291534423828125e-06,
+    "emb_cos": 0.9999998807907104,
+    "hf_bf16_rel_l2": 0.01316234190016985,
+    "emb_vs_bf16_rel_l2": 0.013137956149876118,
+    "ref_max_abs": 2.2524235248565674
+   },
+   "photo_240x160": {
+    "tokens": 24,
+    "pix_max_abs": 0.007843255996704102,
+    "pix_mean_abs": 4.708640699391253e-05,
+    "pix_exact_frac": 0.011276041666666667,
+    "emb_rel_l2": 0.003879718715324998,
+    "emb_max_abs": 0.002847852185368538,
+    "emb_cos": 0.9999925494194031,
+    "hf_bf16_rel_l2": 0.03133033961057663,
+    "emb_vs_bf16_rel_l2": 0.03225509449839592,
+    "ref_max_abs": 1.8323719501495361
+   },
+   "redsquare_224x224": {
+    "tokens": 36,
+    "pix_max_abs": 1.1920928955078125e-07,
+    "pix_mean_abs": 3.4614846100566865e-08,
+    "pix_exact_frac": 0.5140740740740741,
+    "emb_rel_l2": 1.0047962859971449e-05,
+    "emb_max_abs": 2.1383166313171387e-05,
+    "emb_cos": 1.000000238418579,
+    "hf_bf16_rel_l2": 0.05030163377523422,
+    "emb_vs_bf16_rel_l2": 0.050337426364421844,
+    "ref_max_abs": 1.7847073078155518
+   },
+   "rgba_120x80": {
+    "tokens": 6,
+    "pix_max_abs": 8.940696716308594e-08,
+    "pix_mean_abs": 5.1119261712528896e-08,
+    "pix_exact_frac": 0.19444444444444445,
+    "emb_rel_l2": 3.544145329215098e-06,
+    "emb_max_abs": 2.4437904357910156e-06,
+    "emb_cos": 1.0,
+    "hf_bf16_rel_l2": 0.023078957572579384,
+    "emb_vs_bf16_rel_l2": 0.023164300248026848,
+    "ref_max_abs": 1.3029500246047974
+   }
+  },
+  "cuda_int8_sidecar": {
+   "gradient_200x120": {
+    "tokens": 15,
+    "pix_max_abs": 1.1920928955078125e-07,
+    "pix_mean_abs": 5.884241005560398e-08,
+    "pix_exact_frac": 0.10031944444444445,
+    "emb_rel_l2": 0.04029626399278641,
+    "emb_max_abs": 0.039142414927482605,
+    "emb_cos": 0.9991877675056458,
+    "hf_bf16_rel_l2": 0.032174739986658096,
+    "emb_vs_bf16_rel_l2": 0.05157105252146721,
+    "ref_max_abs": 1.931740403175354
+   },
+   "hello_320x120": {
+    "tokens": 24,
+    "pix_max_abs": 1.1920928955078125e-07,
+    "pix_mean_abs": 9.14147406660959e-08,
+    "pix_exact_frac": 0.22390625,
+    "emb_rel_l2": 0.02374347485601902,
+    "emb_max_abs": 0.022527530789375305,
+    "emb_cos": 0.9997198581695557,
+    "hf_bf16_rel_l2": 0.013353549875319004,
+    "emb_vs_bf16_rel_l2": 0.026419928297400475,
+    "ref_max_abs": 1.6614958047866821
+   },
+   "noise_33x47": {
+    "tokens": 2,
+    "pix_max_abs": 1.1920928955078125e-07,
+    "pix_mean_abs": 2.8567058052431094e-08,
+    "pix_exact_frac": 0.5784375,
+    "emb_rel_l2": 0.01716148667037487,
+    "emb_max_abs": 0.027245700359344482,
+    "emb_cos": 0.9998527765274048,
+    "hf_bf16_rel_l2": 0.01316234190016985,
+    "emb_vs_bf16_rel_l2": 0.021909579634666443,
+    "ref_max_abs": 2.2524235248565674
+   },
+   "photo_240x160": {
+    "tokens": 24,
+    "pix_max_abs": 0.007843255996704102,
+    "pix_mean_abs": 4.708640699391253e-05,
+    "pix_exact_frac": 0.011276041666666667,
+    "emb_rel_l2": 0.03873500972986221,
+    "emb_max_abs": 0.027665555477142334,
+    "emb_cos": 0.9992497563362122,
+    "hf_bf16_rel_l2": 0.03133033961057663,
+    "emb_vs_bf16_rel_l2": 0.04929007962346077,
+    "ref_max_abs": 1.8323719501495361
+   },
+   "redsquare_224x224": {
+    "tokens": 36,
+    "pix_max_abs": 1.1920928955078125e-07,
+    "pix_mean_abs": 3.4614846100566865e-08,
+    "pix_exact_frac": 0.5140740740740741,
+    "emb_rel_l2": 0.032691869884729385,
+    "emb_max_abs": 0.035721637308597565,
+    "emb_cos": 0.9994680881500244,
+    "hf_bf16_rel_l2": 0.05030163377523422,
+    "emb_vs_bf16_rel_l2": 0.0647125095129013,
+    "ref_max_abs": 1.7847073078155518
+   },
+   "rgba_120x80": {
+    "tokens": 6,
+    "pix_max_abs": 8.940696716308594e-08,
+    "pix_mean_abs": 5.1119261712528896e-08,
+    "pix_exact_frac": 0.19444444444444445,
+    "emb_rel_l2": 0.029655398800969124,
+    "emb_max_abs": 0.021503731608390808,
+    "emb_cos": 0.9995607733726501,
+    "hf_bf16_rel_l2": 0.023078957572579384,
+    "emb_vs_bf16_rel_l2": 0.03931770846247673,
+    "ref_max_abs": 1.3029500246047974
+   }
+  }
+ },
+ "encoder_latency_ms": {
+  "cuda": {
+   "224x224": {
+    "tokens": 36,
+    "median_ms": 5.5,
+    "min_ms": 5.5,
+    "max_ms": 5.7
+   },
+   "512x512": {
+    "tokens": 169,
+    "median_ms": 22.9,
+    "min_ms": 22.8,
+    "max_ms": 23.1
+   },
+   "1024x1024": {
+    "tokens": 676,
+    "median_ms": 186.1,
+    "min_ms": 185.5,
+    "max_ms": 186.2
+   },
+   "2048x2048": {
+    "tokens": 2704,
+    "median_ms": 2144.3,
+    "min_ms": 2144.1,
+    "max_ms": 2144.3
+   }
+  },
+  "cpu": {
+   "224x224": {
+    "tokens": 36,
+    "median_ms": 143.3,
+    "min_ms": 141.3,
+    "max_ms": 149.5
+   },
+   "512x512": {
+    "tokens": 169,
+    "median_ms": 748.6,
+    "min_ms": 742.3,
+    "max_ms": 765.0
+   },
+   "1024x1024": {
+    "tokens": 676,
+    "median_ms": 7765.4,
+    "min_ms": 7715.5,
+    "max_ms": 7814.6
+   }
+  }
+ },
+ "e2e_engine_vs_fp32_reference_with_HF_embeddings": {
+  "cuda_q3a5": {
+   "prompt_tokens": 68,
+   "prefill_ms": 616.6,
+   "top1_last": true,
+   "kl_last": 2.0347391894479186e-10,
+   "top20_max_abs": 3.3821163177490234,
+   "gen_match_prefix": 9,
+   "gen_match_total": 9,
+   "gen_n": 32,
+   "gen_ids": [
+    200001,
+    200008,
+    371,
+    150409,
+    159306,
+    149878,
+    156834,
+    150893,
+    150081,
+    152825,
+    149880,
+    160200,
+    149881,
+    150641,
+    13,
+    170289,
+    159942,
+    150641,
+    25,
+    152778,
+    153064,
+    149899,
+    150682,
+    152397,
+    186463,
+    13,
+    154710,
+    149911,
+    4123,
+    13,
+    174520,
+    149923
+   ]
+  },
+  "cpu_q3a5": {
+   "prompt_tokens": 68,
+   "prefill_ms": 1017.6,
+   "top1_last": true,
+   "kl_last": 2.396308040306431e-10,
+   "top20_max_abs": 3.3320889472961426,
+   "gen_match_prefix": 31,
+   "gen_match_total": 31,
+   "gen_n": 32,
+   "gen_ids": [
+    200001,
+    200008,
+    371,
+    150409,
+    159306,
+    149878,
+    156834,
+    150893,
+    150081,
+    149876,
+    150641,
+    13,
+    149904,
+    149951,
+    150294,
+    149878,
+    152778,
+    153064,
+    149899,
+    149878,
+    150682,
+    152397,
+    186463,
+    13,
+    170289,
+    150893,
+    149911,
+    4123,
+    13,
+    174520,
+    149923,
+    151469
+   ]
+  },
+  "note": "prompt = chat template + red-square image (36 rows) + question, 68 tokens; reference = tools/inkling_ref.py fp32 with the HF-tower embeddings injected; the engines run Q3A5 weights. Text-only control: CUDA engine matches the fp32 goldens 32/32 on p1_en, p2_code, p3_multi."
+ },
+ "server_cuda": {
+  "backend": "cuda",
+  "props_vision": true,
+  "answers": [
+   {
+    "image": "redsquare_224x224.png",
+    "question": "What shape and colors do you see in this image? Answer briefly.",
+    "status": 200,
+    "content": "The user wants a brief answer about the image. I can see a blue background with a red square in the center. Need answer concise. Ensure no extra detail. The image shows a red square centered on a blue background. Respond: A red square on a blue background.A red square centered on a blue background.",
+    "reasoning": null,
+    "usage": {
+     "completion_tokens": 320,
+     "prompt_tokens": 68,
+     "total_tokens": 388,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     }
+    },
+    "timings": {
+     "cache_n": 0,
+     "prompt_n": 68,
+     "prompt_ms": 251.874835,
+     "prompt_per_token_ms": 3.7040416911764704,
+     "prompt_per_second": 269.9753629615281,
+     "predicted_n": 320,
+     "predicted_ms": 2677.543246,
+     "predicted_per_token_ms": 8.36732264375,
+     "predicted_per_second": 119.51254213281155
+    },
+    "wall_s": 2.93
+   },
+   {
+    "image": "hello_320x120.png",
+    "question": "What text is written in this image?",
+    "status": 200,
+    "content": "The user is asking what text is written in the image. The image shows the word \"HELLO\" in large black capital letters on a white background. I should answer directly.The text in the image is **HELLO**.",
+    "reasoning": null,
+    "usage": {
+     "completion_tokens": 320,
+     "prompt_tokens": 50,
+     "total_tokens": 370,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     }
+    },
+    "timings": {
+     "cache_n": 0,
+     "prompt_n": 50,
+     "prompt_ms": 217.224053,
+     "prompt_per_token_ms": 4.34448106,
+     "prompt_per_second": 230.17708816988144,
+     "predicted_n": 320,
+     "predicted_ms": 2672.996282,
+     "predicted_per_token_ms": 8.353113381250001,
+     "predicted_per_second": 119.7158417895622
+    },
+    "wall_s": 2.9
+   },
+   {
+    "image": "gradient_200x120.png",
+    "question": "Describe this image.",
+    "status": 200,
+    "content": "The user wants a description of the image. Need inspect image visually. It appears a smooth gradient with black/dark purple at top left transitioning to magenta/pink at top right, green at bottom left, fading to light gray/white at bottom right. No distinct objects. Need answer concise. Ensure no claim beyond image. Could mention abstract gradient. Let's craft description.The image is a smooth abstract gradient with no distinct objects. The top-left is dark black/purple, blending into bright magenta/pink toward the top-right. The bottom-left is vivid green, fading toward a pale gray/white at the bottom-right, creating a diagonal color transition across the frame.The image is a smooth abstract gradient with no distinct objects. The top-left is dark black/purple, blending into bright magenta/pink toward the top-right. The bottom-left is vivid green, fading toward a pale gray/white at the bottom-right, creating a diagonal color transition across the frame.The image is a smooth abstract gradient with no distinct objects. The top-left is dark black/purple, blending into bright magenta/pink toward the top-right. The bottom-left is vivid green, fading toward a pale gray/white at the bottom-right, creating a diagonal color transition across the frame.The image is a smooth abstract gradient with",
+    "reasoning": null,
+    "usage": {
+     "completion_tokens": 320,
+     "prompt_tokens": 38,
+     "total_tokens": 358,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     }
+    },
+    "timings": {
+     "cache_n": 0,
+     "prompt_n": 38,
+     "prompt_ms": 197.634475,
+     "prompt_per_token_ms": 5.200907236842106,
+     "prompt_per_second": 192.27414650202095,
+     "predicted_n": 320,
+     "predicted_ms": 2664.206082,
+     "predicted_per_token_ms": 8.32564400625,
+     "predicted_per_second": 120.11082857365835
+    },
+    "wall_s": 2.87
+   },
+   {
+    "image": "redsquare_224x224.png",
+    "question": "Describe this image in one sentence.",
+    "status": 200,
+    "content": "The user wants a one-sentence description of the image. The image shows a red square centered on a blue background. Need answer concise. Ensure no extra details. Could say: \"A red square is centered on a solid blue background.\" That's one sentence.A red square is centered on a solid blue background.A red square is centered on a solid blue background.A red square is centered on a solid blue background.A red square is centered on a solid blue background.A red square is centered on a solid blue background.A red square is centered on a solid blue background.A red square is centered on a solid blue background.A red square is centered on a solid blue background.A red square is centered on a solid blue background.A red square is centered on a solid blue background.A red square is centered on a solid blue background.A red square is centered on a solid blue background.A red square is centered on a solid blue background.A red square is centered on a solid blue background.A red square is centered on a solid blue background.A red square is centered on a solid blue background.A red",
+    "reasoning": null,
+    "usage": {
+     "completion_tokens": 320,
+     "prompt_tokens": 62,
+     "total_tokens": 382,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     }
+    },
+    "timings": {
+     "cache_n": 0,
+     "prompt_n": 62,
+     "prompt_ms": 233.705886,
+     "prompt_per_token_ms": 3.769449774193548,
+     "prompt_per_second": 265.2907081681289,
+     "predicted_n": 320,
+     "predicted_ms": 2669.842517,
+     "predicted_per_token_ms": 8.343257865625,
+     "predicted_per_second": 119.85725673421808
+    },
+    "wall_s": 2.91
+   }
+  ],
+  "ttft": {
+   "224x224": [
+    {
+     "wall_s": 0.224,
+     "prompt_tokens": 59,
+     "prompt_ms": 220.284553
+    },
+    {
+     "wall_s": 0.224,
+     "prompt_tokens": 59,
+     "prompt_ms": 220.197716
+    },
+    {
+     "wall_s": 0.223,
+     "prompt_tokens": 59,
+     "prompt_ms": 219.691646
+    }
+   ],
+   "512x512": [
+    {
+     "wall_s": 0.324,
+     "prompt_tokens": 192,
+     "prompt_ms": 308.361626
+    },
+    {
+     "wall_s": 0.318,
+     "prompt_tokens": 192,
+     "prompt_ms": 305.635332
+    },
+    {
+     "wall_s": 0.318,
+     "prompt_tokens": 192,
+     "prompt_ms": 305.13925
+    }
+   ],
+   "1024x1024": [
+    {
+     "wall_s": 0.719,
+     "prompt_tokens": 699,
+     "prompt_ms": 664.926039
+    },
+    {
+     "wall_s": 0.704,
+     "prompt_tokens": 699,
+     "prompt_ms": 656.706613
+    },
+    {
+     "wall_s": 0.707,
+     "prompt_tokens": 699,
+     "prompt_ms": 655.321783
+    }
+   ]
+  },
+  "text_only_ttft": {
+   "wall_s": 0.153,
+   "prompt_tokens": 18,
+   "prompt_ms": 149.496691
+  }
+ }
+}

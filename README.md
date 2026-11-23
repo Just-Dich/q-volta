@@ -140,6 +140,12 @@ Better quantization (smaller file at equal quality), runtime LoRA inside the mod
 ## Inkling-2-Mini
 The engine also runs thinkingmachines/Inkling-2-Mini (MoE, looped layers) on the V100 and the CPU backend: ~120 tok/s decode on the V100 through the server, no MTP yet. How to run it and what was measured: [docs/INKLING_RUN.md](docs/INKLING_RUN.md); design and parity with the Hugging Face implementation: [docs/INKLING_SPEC.md](docs/INKLING_SPEC.md), [docs/INKLING_ENGINE.md](docs/INKLING_ENGINE.md).
 
+### Inkling vision (image input)
+`qv_server` accepts OpenAI `image_url` content parts for Inkling-2-Mini when the vision sidecar `inkling2-mini-vision.qv` (0.64 GB, made by `tools/convert_inkling_vision.py`) sits next to the model (or `--vision-file PATH`).
+Preprocessing, the ViT (23 layers, 2-D RoPE), the projector and the CUDA / CPU encoders follow the Hugging Face PR #51050 tower: embedding error vs the fp32 HF tower 0.06-0.4 % relative L2 on CUDA (HF's own bf16 run differs by 1.3-5 %), 1e-5 on the CPU path.
+`data:` URLs and files below `--image-root` work by default; http(s) only with `--allow-remote-images` (SSRF-guarded). One image costs `ceil(h/40)*ceil(w/40)` tokens (224x224 = 36, 1024x1024 = 676). Encoder time on the V100: 5.5 ms (224x224), 23 ms (512x512), 185 ms (1024x1024).
+Spec, validation and limits: [docs/INKLING_VISION.md](docs/INKLING_VISION.md).
+
 ## Docker
 A `Dockerfile` (GPU and CPU-only targets) and `docker-compose.yml` are provided, see [docs/DOCKER.md](docs/DOCKER.md) (written without a container runtime on hand: not yet built by the authors).
 
@@ -165,5 +171,5 @@ Full-model golden and benchmarks need the converted model (not included): see `C
 | progress log | [docs/PROGRESS.md](docs/PROGRESS.md) |
 
 ## Third-party
-Written from scratch. Other engines (NInfer, llama.cpp) were read for design ideas and used only as black-box benchmark baselines; no code copied.
+Written from scratch (one vendored public-domain header, `stb_image.h`, for image decoding: see [THIRD_PARTY.md](THIRD_PARTY.md)). Other engines (NInfer, llama.cpp) were read for design ideas and used only as black-box benchmark baselines; no code copied.
 Model weights are not part of this repository and carry their own licences. License for this code: to be chosen by the maintainers.

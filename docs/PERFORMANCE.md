@@ -194,3 +194,17 @@ Protocol, commands, caveats and the full table: benchmarks/compare/README.md; da
 | llama.cpp IQ3_XXS + imatrix | 10.89 | 8.992 | 6.102 | 0.0751 | 38.7 | 779 | 70.7K / 129.0K / 219.1K |
 | Q-Volta e1 | 10.44 | 9.278 | 6.281 | 0.0923 | 57.6 | 1250 | 74.8K fp16 / 267.3K int4 |
 MTP (llama.cpp `--spec-type draft-mtp`, supported for qwen35): code 74.8 (Q3_K_M) / 68.8 (IQ3_XXS) vs Q-Volta 131.7 (e0) / 135.9 (e1); prose 56.9 / 52.6 vs 86.5 / 93.8. Verdict: Q-Volta is faster (decode +23%/+49%, prefill +34%/+57% at 2048) and fits more int4 KV; llama.cpp is better in quality at equal bytes. llama.cpp's MTP output equality with plain greedy was not checked.
+
+## Inkling vision (2026-11-23, p19/ink-vision)
+Encoder latency (median of 5, V100 device 0 / E5-2683 v4 with 32 OpenMP threads on a loaded shared host; `qv_vision_run --synthetic WxH --bench N`, includes H2D, kernels, D2H, excludes decode/preprocess):
+
+| image | tokens | CUDA fp16 | CPU fp32 |
+|---|---:|---:|---:|
+| 224x224 | 36 | 5.5 ms | 143 ms |
+| 512x512 | 169 | 22.9 ms | 749 ms |
+| 1024x1024 | 676 | 186 ms | 7.77 s |
+| 2048x2048 | 2704 | 2.14 s | not run |
+
+Attention is quadratic and not tuned (two-pass WMMA); the CPU attention is a simple blocked dot-product kernel (the 512 -> 1024 jump is attention). Preprocess (CPU, single thread): 0.7 / 3.6 / 14.8 ms for 224 / 512 / 1024.
+Through `qv_server` (CUDA, Q3A5, int4 KV, `cache_prompt` off, max_tokens 1, 3 requests each, includes PNG decode + encode + prefill): TTFT 0.22 s for 224x224 (59 prompt tokens), 0.32 s for 512x512 (192), 0.71 s for 1024x1024 (699); text-only 18-token prompt 0.15 s. Decode with image context 119.5-119.9 tok/s (text-only 120). Parity numbers: docs/INKLING_VISION.md section 9; raw data `benchmarks/results/inkling_vision_20261123.json`.
+Sanity answers (temperature 0, Q3A5): red square on blue -> "A red square on a blue background." ; rendered "HELLO" -> "The text in the image is **HELLO**." ; gradient -> "smooth abstract gradient ... top-left dark black/purple, magenta/pink top-right, vivid green bottom-left, pale gray/white bottom-right" (the true image: R grows with x, G with y, B with x+y, so top-left is black, top-right red-magenta, bottom-left green, bottom-right light: correct up to the colour names). The model emits its reasoning in `content` and, at temperature 0, falls into repeating its final sentence (greedy repetition, also seen on text prompts; not an image-path effect).
