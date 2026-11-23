@@ -178,16 +178,20 @@ def store_dense(W, name, t, bits, dev):
     return v.to(dev), nb
 
 
-def quant_rows(t, bits, group, dev, method, Hu=None, clip=False, colw=None, rows=4096, meta8=False):
+def quant_rows(t, bits, group, dev, method, Hu=None, clip=False, colw=None, rows=4096, meta8=False, H=None, opt=None, damp=None):
     """t [N,K] bf16 (cpu or dev) -> (packed int32, sm, rs) quantized in row chunks (GPTQ chunks share Hu).
     sm = fp16 [N,K/g,2] (scale,min) or, with meta8, uint16 [N,K/g] (+ rs fp16 [N] row scales)."""
     packed, sm, rss = [], [], []
     for r0 in range(0, t.shape[0], rows):
         Wd = t[r0:r0 + rows].to(dev).float()
-        if method == "gptq" and Hu is not None:
+        if method == "gptq" and H is not None and opt is not None and opt.gptq_mode != "orig":
+            q, s, m, rs = Q.gptq_static(Wd, H, bits, group, clip, damp if damp is not None else opt.percdamp, actorder=opt.gptq_mode == "ao", meta8=meta8)
+        elif method == "gptq" and Hu is not None:
             q, s, m, rs = Q.gptq(Wd, Hu, bits, group, clip=clip, colw=colw, meta8=meta8)
         else:
             q, s, m, rs = Q.rtn(Wd, bits, group, clip=clip, colw=colw, meta8=meta8)
+        if method == "gptq" and H is not None and opt is not None and opt.refit:
+            s, m = Q.refit_full(Wd, q, s, m, rs, H, bits, group, passes=opt.refit)
         packed.append(F.pack(q, bits))
         sm.append(Q.pack_meta(s, m, rs))
         rss.append(rs)
@@ -267,9 +271,17 @@ def main():
     ap.add_argument("--sens-bits", default="2,3,4,5,6")
     ap.add_argument("--sens-groups", default="128")
     ap.add_argument("--sens-method", default="rtn", choices=["rtn", "gptq"], help="quantizer used for the sensitivity table (rtn = RTN + clip search, ~10x cheaper)")
+    ap.add_argument("--percdamp", type=float, default=0.01, help="GPTQ Hessian damping (fraction of mean diag)")
+    ap.add_argument("--damp-map", default="", help="per Hessian-key damping, e.g. a=0.01,o=0.1,m=0.1,d=0.3 (keys: a qkv/z/q/k/v, o out/o_proj, m gate/up, d down); default --percdamp")
+    ap.add_argument("--gptq-mode", default="orig", choices=["orig", "static", "ao"],
+                    help="orig: group params from error-compensated weights (original sweep order); static: params from original weights; ao: static + act-order")
+    ap.add_argument("--refit", type=int, default=0, help="passes of full-Hessian least-squares refit of (scale, min) after GPTQ")
+    ap.add_argument("--gptaq", type=int, default=0, help="asymmetric calibration (GPTQv2/GPTAQ style): quantize W_eff = W Cxy H^-1, Cxy = E[x_fp x_q^T]")
+    ap.add_argument("--calib-bf16", type=int, default=0, help="store the calibration residual streams in bf16 (2x less memory; allows 256 sequences)")
     ap.add_argument("--device", default="cuda:0")
     args = ap.parse_args()
     bp = {k: int(v) for k, v in (kv.split("=") for kv in args.bits.split(","))}
+    dmap = {k: float(v) for k, v in (kv.split("=") for kv in args.damp_map.split(",") if kv)}
     plan = json.load(open(args.plan)) if args.plan else {}
     sens = args.sens is not None
     use_h = args.method == "gptq" or sens
@@ -345,10 +357,10 @@ def main():
 
     def run_layer(layer, h, pe, causal, ltype, bs):
         mask = causal if ltype == "full_attention" else None
-        outs = []
+        out = torch.empty_like(h)  # same dtype as the input stream (calibration streams may be stored in bf16)
         for b in range(0, h.shape[0], bs):
-            outs.append(layer(h[b:b + bs], position_embeddings=pe, attention_mask=mask))
-        return torch.cat(outs)
+            out[b:b + bs] = layer(h[b:b + bs].float(), position_embeddings=pe, attention_mask=mask)
+        return out
 
     if st is None:
         emb = R.fetch(LM + "embed_tokens.weight")
@@ -364,9 +376,19 @@ def main():
         h_ref = emb[flat].float().to(dev).view(nseq, S, -1)
         h_q = h_ref.clone() if sens else emb_q.rows(flat.to(dev)).view(nseq, S, -1).clone()
         h_cal = None
+        h_fp = None
         if use_h:
             cf = calib.view(-1)
-            h_cal = (emb[cf].float().to(dev) if sens else emb_q.rows(cf.to(dev))).view(len(calib), Sc, -1).clone()
+            cdt = torch.bfloat16 if args.calib_bf16 else torch.float32  # the BF16 model itself carries a bf16 residual stream
+            h_cal = torch.empty(len(calib), Sc, emb.shape[1], dtype=cdt, device=dev)
+            if args.gptaq:
+                h_fp = torch.empty_like(h_cal)
+            for c0 in range(0, len(calib), 16):  # chunked: the fp32 rows of 256 sequences would be 5 GB
+                ci = cf.view(len(calib), Sc)[c0:c0 + 16].reshape(-1)
+                x = (emb[ci].float().to(dev) if sens else emb_q.rows(ci.to(dev))).view(-1, Sc, emb.shape[1])
+                h_cal[c0:c0 + 16] = x.to(cdt)
+                if args.gptaq:
+                    h_fp[c0:c0 + 16] = emb[ci].float().to(dev).view(-1, Sc, emb.shape[1]).to(cdt)
         del emb_q, emb
         torch.cuda.empty_cache()
         dbg_ref = [h_ref[0, :dbg].cpu().clone()]
@@ -375,6 +397,7 @@ def main():
         print(f"[{time.time()-t0:6.0f}s] embed done", flush=True)
     else:
         h_ref, h_q, h_cal = st["h_ref"].to(dev), st["h_q"].to(dev), None if st["h_cal"] is None else st["h_cal"].to(dev)
+        h_fp = None if st.get("h_fp") is None else st["h_fp"].to(dev)
         dbg_ref, dbg_q, nxt = st["dbg_ref"], st["dbg_q"], st["next"]
         del st
 
@@ -401,19 +424,41 @@ def main():
         del sd_ref
         mixer = layer_ref.linear_attn if ltypes[i] == "linear_attention" else layer_ref.self_attn
         # ---- Hessians (inputs of the already-quantized stream, BF16 weights of this layer) + ref eval stream
-        Hs, hooks = {}, []
+        Hs, hooks, Cs = {}, [], {}
         resid_e = None
         with torch.no_grad():
             if use_h:
-                resid_e = float((h_cal.view(-1, h_cal.shape[-1]) ** 2).sum(-1).mean())
+                resid_e = float((h_cal.view(-1, h_cal.shape[-1]).float() ** 2).sum(-1).mean())
                 mods = {"a": mixer.in_proj_qkv if ltypes[i] == "linear_attention" else mixer.q_proj,
                         "o": mixer.out_proj if ltypes[i] == "linear_attention" else mixer.o_proj,
                         "m": layer_ref.mlp.gate_proj, "d": layer_ref.mlp.down_proj}
+                cap = {}
                 for key, m in mods.items():
                     acc = HAcc(m.in_features, dev)
                     Hs[key] = acc
-                    hooks.append(m.register_forward_pre_hook(lambda mod, a, acc=acc: acc.add(a[0])))
-                h_cal_ref_out = run_layer(layer_ref, h_cal, pe_c, causal_c, ltypes[i], args.calib_batch)
+                    if args.gptaq:
+                        Cs[key] = torch.zeros(m.in_features, m.in_features, device=dev)
+                        hooks.append(m.register_forward_pre_hook(lambda mod, a, key=key: cap.__setitem__(key, a[0].reshape(-1, a[0].shape[-1]).float())))
+                    else:
+                        hooks.append(m.register_forward_pre_hook(lambda mod, a, acc=acc: acc.add(a[0])))
+                if args.gptaq:
+                    mask_c = causal_c if ltypes[i] == "full_attention" else None
+                    qo, fo = [], []
+                    for b in range(0, h_cal.shape[0], args.calib_batch):
+                        qo.append(layer_ref(h_cal[b:b + args.calib_batch].float(), position_embeddings=pe_c, attention_mask=mask_c).to(h_cal.dtype))
+                        xq = dict(cap)
+                        fo.append(layer_ref(h_fp[b:b + args.calib_batch].float(), position_embeddings=pe_c, attention_mask=mask_c).to(h_cal.dtype))
+                        for key in mods:
+                            Hs[key].add(xq[key])
+                            Cs[key].addmm_(cap[key].T, xq[key])
+                        cap.clear()
+                    h_cal_ref_out = torch.cat(qo)
+                    h_fp = torch.cat(fo)
+                    for key in Cs:
+                        Cs[key].div_(Hs[key].n)
+                    del qo, fo
+                else:
+                    h_cal_ref_out = run_layer(layer_ref, h_cal, pe_c, causal_c, ltypes[i], args.calib_batch)
                 if not sens:
                     del h_cal_ref_out
                 for hk in hooks:
@@ -443,9 +488,11 @@ def main():
             Hu = None
             if args.method == "gptq" and Hm is not None:
                 if hk not in Hu_cache:
-                    Hu_cache[hk] = Q.hinv_chol(Hm)
+                    Hu_cache[hk] = Q.hinv_chol(Hm, dmap.get(hk, args.percdamp))
                 Hu = Hu_cache[hk]
             cat = torch.cat([tensors[n] for n in names]) if len(names) > 1 else tensors[names[0]]
+            if args.gptaq and hk in Cs and not sens:
+                cat = Q.effective_weights(cat.to(dev).float(), Hm, Cs[hk], dmap.get(hk, args.percdamp))
             if sens:
                 Wd = cat.to(dev).float()
                 if args.sens_method == "gptq" and hk not in Hu_cache:
@@ -476,7 +523,7 @@ def main():
                 torch.cuda.empty_cache()
                 continue
             pk, sm, rs_ = quant_rows(cat, bits, grp, dev, args.method, Hu, bool(args.clip), colw, rows=1 << 30,
-                                     meta8=bool(args.meta8))
+                                     meta8=bool(args.meta8), H=Hm, opt=args, damp=dmap.get(hk))
             r0 = 0
             for n in names:
                 rr = tensors[n].shape[0]
@@ -496,7 +543,7 @@ def main():
                 Hs[hk] = None
                 Hu_cache.pop(hk, None)
             torch.cuda.empty_cache()
-        del Hs, Hu_cache
+        del Hs, Hu_cache, Cs
         torch.cuda.empty_cache()
         stats.update(lstat)
         if resid_e is not None:
@@ -525,6 +572,7 @@ def main():
 
     if nxt < L:  # slice finished: save state and exit (driver relaunches with --resume)
         save_state(state_path, dict(next=nxt, h_ref=h_ref.cpu(), h_q=h_q.cpu(), h_cal=None if h_cal is None else h_cal.cpu(),
+                                    h_fp=None if h_fp is None else h_fp.cpu(),
                                     dbg_ref=dbg_ref, dbg_q=dbg_q, bytes=total["bytes"], stats=stats,
                                     w_off=None if W is None else W.flush_state()[0],
                                     w_tensors=None if W is None else W.tensors))
@@ -540,7 +588,7 @@ def main():
     with torch.no_grad():
         f_ref = norm(h_ref).view(-1, h_ref.shape[-1])
         f_q = norm(h_q).view(-1, h_q.shape[-1])
-        f_cal = norm(h_cal).view(-1, h_cal.shape[-1]) if h_cal is not None else None
+        f_cal = norm(h_cal.float()).view(-1, h_cal.shape[-1]) if h_cal is not None else None
     head = R.fetch("lm_head.weight")
     hb, hg = tensor_cfg("lm_head.weight", bp, plan, args.group)
     if sens:

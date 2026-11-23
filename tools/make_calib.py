@@ -10,7 +10,8 @@ out = sys.argv[1]
 nw, nc, nt = (int(x) for x in sys.argv[2:5]) if len(sys.argv) > 4 else (16, 8, 8)
 L = 1024
 tok = Tokenizer.from_file("/workspace/q-volta-models/Qwen3.8-27B/tokenizer.json")
-rng = random.Random(1234)
+import os
+rng = random.Random(int(os.environ.get("QV_CALIB_SEED", "1234")))
 wt = open("/workspace/q-volta-models/calib/wt_train.txt").read()
 ids = tok.encode(wt).ids
 rows = []
