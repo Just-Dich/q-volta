@@ -81,3 +81,6 @@ Not supported: `<[id]>` token elements; non-integer minimum/maximum are not enfo
 
 ## p18/compare (2026-11-23) - fair comparison stand vs llama.cpp on the V100
 benchmarks/compare/: scripts, `llama_eval.cpp` (libllama harness writing/reading the qv_run eval format), results.json, raw/, README with protocol and verdict. Measured: Q8_0 reference (ppl 8.467), Q3_K_M, IQ3_XXS+imatrix (Q-Volta GPTQ calibration text) vs e0/e1: llama.cpp better quality at equal bytes, Q-Volta faster (decode, prefill, MTP) and longer int4 KV. ExLlamaV2/V3, vLLM, SGLang not run on sm_70 (reasons in the compare README). Missing: IQ3_S, no-imatrix IQ3, BF16-based KL.
+
+## p19/ink-mtp + p22/ink-mtp2 (2026-11-23) - Inkling MTP
+DSpark drafter graph reconstructed from vLLM and validated with a torch reference (mean accepted 3.5/7 on code); CUDA implementation with bit-exact batched verify, sidecar `inkling2-mini-mtp.qv` (258 MiB), server flags. Exact; speedup 0.55-1.73x depending on text, about 1.25x typical. Verify (2.5 ms per extra row) is the bottleneck; not optimised. See docs/INKLING_MTP.md.

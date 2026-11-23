@@ -194,3 +194,6 @@ Protocol, commands, caveats and the full table: benchmarks/compare/README.md; da
 | llama.cpp IQ3_XXS + imatrix | 10.89 | 8.992 | 6.102 | 0.0751 | 38.7 | 779 | 70.7K / 129.0K / 219.1K |
 | Q-Volta e1 | 10.44 | 9.278 | 6.281 | 0.0923 | 57.6 | 1250 | 74.8K fp16 / 267.3K int4 |
 MTP (llama.cpp `--spec-type draft-mtp`, supported for qwen35): code 74.8 (Q3_K_M) / 68.8 (IQ3_XXS) vs Q-Volta 131.7 (e0) / 135.9 (e1); prose 56.9 / 52.6 vs 86.5 / 93.8. Verdict: Q-Volta is faster (decode +23%/+49%, prefill +34%/+57% at 2048) and fits more int4 KV; llama.cpp is better in quality at equal bytes. llama.cpp's MTP output equality with plain greedy was not checked.
+
+## Inkling MTP (DSpark drafter, exact greedy), V100, int4 KV, 2026-11-23
+Plain 118.6 tok/s at ctx 40. MTP depth 3/7 at ctx 40: 149-152 tok/s (1.25-1.28x) on code and prose; ctx 512 code depth 3 1.25x; ctx 4K code depth 3 1.10x (depth 7 0.96x); prose 512 depth 7 0.81x; prose 4K depth 7 1.73x; ctx 32K code depth 7 1.69x, prose depth 7 0.55x. Depth 1 is never faster than plain. Ids identical to plain in all 60+ runs. Cost per cycle (ctx 512): drafter 3.2 ms, verify 13.3/15.7/18.3/28.4 ms at 2/3/4/8 rows against 8.6 ms for a plain step, so the gain is capped near 1.25x at typical acceptance. Data: benchmarks/results/inkling_mtp_20261123.json, docs/INKLING_MTP.md.

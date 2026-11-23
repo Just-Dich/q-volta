@@ -146,3 +146,30 @@ adaptive depth, acceptance versus sidecar bits (only 5/6-bit was built), CPU eng
 Verify adds about 2.5 ms per extra row and a 2-row verify already costs 1.54 plain steps, so the verify pass, not the drafter or rollback, is the cost driver
 (drafter 3.2 ms + verify 28.4 ms = 31.6 ms, matching the 31 ms measured cycle). Consistent with the MoE expert weights being read per row: rows rarely share experts.
 Open optimisation targets: expert-weight traffic in the row path, adaptive depth (depth 3 = 3.21+15.7 ms for 3.2 tokens).
+
+## 10. Full matrix (decode tok/s, 128 timed tokens, mean of the runs shown; ids hash identical to plain in every row marked yes)
+
+| text | ctx | depth | runs | plain | MTP | speedup | tokens/cycle | ids identical |
+|---|---|---|---|---|---|---|---|---|
+| code | 40 | 7 | 3/3 | 118.6 | 148.8 | 1.25x | 4.63 | yes |
+| code | 40 | 3 | 3/3 | 118.6 | 149.0 | 1.26x | 3.21 | yes |
+| code | 40 | 1 | 3/3 | 118.6 | 114.1 | 0.96x | 1.90 | yes |
+| code | 512 | 7 | 3/3 | 115.1 | 134.4 | 1.17x | 4.32 | yes |
+| code | 512 | 3 | 3/3 | 115.2 | 144.1 | 1.25x | 3.17 | yes |
+| code | 512 | 1 | 3/3 | 115.1 | 113.2 | 0.98x | 1.92 | yes |
+| code | 4096 | 7 | 3/3 | 111.7 | 106.8 | 0.96x | 3.54 | yes |
+| code | 4096 | 3 | 3/3 | 111.7 | 123.3 | 1.10x | 2.82 | yes |
+| code | 4096 | 1 | 3/3 | 111.7 | 109.0 | 0.98x | 1.91 | yes |
+| code | 32768 | 7 | 3/3 | 99.7 | 168.1 | 1.69x | 7.12 | yes |
+| prose | 40 | 7 | 3/3 | 118.6 | 151.0 | 1.27x | 4.73 | yes |
+| prose | 40 | 3 | 3/3 | 118.6 | 152.2 | 1.28x | 3.29 | yes |
+| prose | 40 | 1 | 3/3 | 118.6 | 114.7 | 0.97x | 1.91 | yes |
+| prose | 512 | 7 | 3/3 | 115.3 | 93.1 | 0.81x | 2.93 | yes |
+| prose | 512 | 3 | 3/3 | 115.3 | 116.2 | 1.01x | 2.55 | yes |
+| prose | 512 | 1 | 3/3 | 115.4 | 103.0 | 0.89x | 1.74 | yes |
+| prose | 4096 | 7 | 3/3 | 111.7 | 193.8 | 1.73x | 6.83 | yes |
+| prose | 4096 | 3 | 3/3 | 111.8 | 164.0 | 1.47x | 3.85 | yes |
+| prose | 4096 | 1 | 3/3 | 111.8 | 111.8 | 1.00x | 1.98 | yes |
+| prose | 32768 | 7 | 3/3 | 99.7 | 55.0 | 0.55x | 2.18 | yes |
+
+Server end to end (qv_server, depth 3, temperature 0, 2 chat requests of 160 tokens, reasoning-style prose): text identical to plain; 119.0/109.8 tok/s with MTP against 118.8/119.6 plain. Engine stats: 58 cycles / 90 accepted and 123 cycles / 176 accepted, i.e. 1.4-1.55 accepted per cycle (about 2.5 tokens per cycle), so on this text the cycle cost (about 19 ms at depth 3) roughly cancels the yield. The speculative path is active (`QV_MTP_DEBUG=1` prints use_chunk and the stats); the lack of speedup is low acceptance on chat prose, not a disabled path. Chunks of 32 tokens are used so that cycles are not cut by plain tails.

@@ -325,7 +325,9 @@ dense 3.70 GiB (bf16) + experts 1.71 GiB (44 NVFP4 applications x 34.2 MiB = 1.4
 (Looped layers are read three times per token; experts selected may differ per pass.)
 Parameter count check: experts 3.06 B active per token (48 x 63.7 M) + dense 1.8 B + unembed 0.46 B = 5.3 B (README: 5.4 B).
 
-## 14. MTP head (`mtp.safetensors`, 54 tensors, all BF16) - what is and is not known
+## 14. MTP head (`mtp.safetensors`, 54 tensors, all BF16)
+
+**Resolved 2026-11-23:** the graph was reconstructed from the vLLM Inkling2 DSpark sources and validated (docs/INKLING_MTP.md); the text below is the earlier open-question analysis, kept for the tensor inventory.
 
 `[CKPT mtp_config]`: hidden 2304, 3 layers, 24 q / 8 kv heads, head_dim 128, dense SwiGLU intermediate 9216, `rope_theta` 1e6,
 `local_layer_ids [0,2]` (layers 0 and 2 sliding window 1024, layer 1 global), `block_size 8`, `markov_rank 256`,
