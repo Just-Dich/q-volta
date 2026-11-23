@@ -586,14 +586,14 @@ def main():
     with torch.no_grad():
         f_ref = norm(h_ref).view(-1, h_ref.shape[-1])
         f_q = norm(h_q).view(-1, h_q.shape[-1])
-        f_cal = norm(h_cal.float()).view(-1, h_cal.shape[-1]) if h_cal is not None else None
+        f_cal = torch.cat([norm(h_cal[c0:c0 + 16].float()).to(h_cal.dtype) for c0 in range(0, len(h_cal), 16)]).view(-1, h_cal.shape[-1]) if h_cal is not None else None
     head = R.fetch("lm_head.weight")
     hb, hg = tensor_cfg("lm_head.weight", bp, plan, args.group)
     if sens:
         # lm_head sensitivity: errors of KL-relevant logits for each candidate bits (RTN+clip, GPTQ on a row subset)
         head_dev = head.to(dev).float()
         Hh = HAcc(head.shape[1], dev)
-        Hh.add(f_cal)
+        [Hh.add(f_cal[c0:c0 + 32768].float()) for c0 in range(0, len(f_cal), 32768)]
         Hm = Hh.mean()
         sub = head_dev[:32768]
         for sb in [int(x) for x in args.sens_bits.split(",")]:
@@ -608,7 +608,7 @@ def main():
     Hu = None
     if head_method == "gptq":
         Hh = HAcc(head.shape[1], dev)
-        Hh.add(f_cal)
+        [Hh.add(f_cal[c0:c0 + 32768].float()) for c0 in range(0, len(f_cal), 32768)]
         Hm = Hh.mean()
         Hu = Q.hinv_chol(Hm)
     pk, sm, rs_ = quant_rows(head, hb, hg, dev, head_method, Hu, hclip, torch.diag(Hm).clone() if Hu is not None else None,
@@ -661,7 +661,7 @@ def main():
             hb_, hg_ = int(hb_), int(hg_)
             if hm_ == "gptq" and Hu_h is None:
                 Hh = HAcc(head_bf.shape[1], dev)
-                Hh.add(f_cal)
+                [Hh.add(f_cal[c0:c0 + 32768].float()) for c0 in range(0, len(f_cal), 32768)]
                 Hm_h = Hh.mean()
                 colw_h = torch.diag(Hm_h).clone()
                 Hu_h = Q.hinv_chol(Hm_h)

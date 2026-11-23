@@ -84,3 +84,5 @@ benchmarks/compare/: scripts, `llama_eval.cpp` (libllama harness writing/reading
 
 ## p21/quant2 (2026-11-23) - quantization quality at equal bytes (interim)
 Proxy ablation on held-out text (see docs/QUANTIZATION.md "p21/quant2"): act-order+damping per tensor class cuts held-out layer error 6-12%, 128 calibration sequences beat 32 by 12-25%, g64 costs less per unit error than 4-bit upgrades, down_proj GPTQ overfits. Tools committed; full e1b1/e0b1 runs started, no model-level number measured yet, README claims unchanged. Branch p21/quant2.
+
+Update: e1b1 (10.40 GiB) measured: ppl 8x512 9.112, KL to Q8_0 0.0750, top-1 89.3%, decode 57.5 / MTP-3 137.2 (code); see docs/QUANTIZATION.md.

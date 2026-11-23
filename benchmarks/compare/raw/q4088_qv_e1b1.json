@@ -1,0 +1,1 @@
+{"mode": "cmp", "kv": "fp32", "kmode": "channel", "tokens": 4088, "scored": 4087, "ppl": 6.10200, "mean_nll": 1.808616, "ref_ppl": 5.77419, "kl_topk_mean": 0.074984, "top1_agree": 0.8928, "ref_tail_mass_mean": 0.006502, "seconds": 19.4}

@@ -1767,5 +1767,23 @@
     }
    }
   }
+ },
+ "e1b1": {
+  "file_gib": 10.4,
+  "ppl_8x512": 9.1119,
+  "ppl_4088": 6.102,
+  "kl_to_q8_0": 0.074984,
+  "top1_vs_q8_0": 0.8928,
+  "kl_to_bf16": 0.0897,
+  "agentic_kl": 1.3701,
+  "decode_plain_code": 57.48,
+  "decode_plain_prose": 57.47,
+  "mtp3_code": 137.15,
+  "mtp3_prose": 92.22,
+  "e1_ref": {
+   "plain": 57.57,
+   "mtp3_code": 138.5,
+   "mtp3_prose": 88.37
+  }
  }
 }
