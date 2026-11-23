@@ -1,8 +1,7 @@
 <div align="center">
-  <img src="docs/img/Q_Logo.svg" width="84" alt="Q Project logo">
-  <h1>Q-Volta</h1>
-  <h3>A from-scratch C++20 / CUDA inference engine for Qwen3.8-27B and Inkling-2-Mini<br>fast on one Tesla V100 and on plain CPUs</h3>
-
+  <img src="docs/img/banner.svg" alt="Q-Volta: fast LLM inference on one Tesla V100 and on CPUs" width="100%">
+  <br><br>
+  <img src="docs/img/Q_Logo.svg" width="56" alt="Q Project logo">
   <p>
     <img src="https://img.shields.io/badge/GPU-Tesla%20V100%20(sm__70)-76B900?style=for-the-badge&logo=nvidia&logoColor=white" alt="GPU">
     <img src="https://img.shields.io/badge/CPU-x86%20AVX2-0071C5?style=for-the-badge" alt="CPU">
@@ -13,6 +12,9 @@
   <p>
     <a href="https://huggingface.co/q-project/Qwen3.8-27B-QVolta"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Qwen3.8--27B--QVolta-weights-yellow?style=for-the-badge" alt="Qwen weights"></a>
     <a href="https://huggingface.co/q-project/Inkling-2-Mini-QVolta"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Inkling--2--Mini--QVolta-weights-yellow?style=for-the-badge" alt="Inkling weights"></a>
+  </p>
+  <p>
+    <a href="https://q-project-lm.github.io/q-volta/"><img src="https://img.shields.io/badge/Website-q--project--lm.github.io%2Fq--volta-22d3ee?style=for-the-badge" alt="Website"></a>
   </p>
   <p>
     <a href="#at-a-glance">At a glance</a> &middot;
