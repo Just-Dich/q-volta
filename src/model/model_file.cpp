@@ -93,7 +93,7 @@ ModelFile ModelFile::open(const std::string& prefix_in) {
         n.w13_interleaved = k["w13_layout"].str() == "interleaved";
         n.max_position = k["max_position"].i64();
         if ((int)(n.global_layers.size() + n.local_layers.size()) != g.n_layers) throw std::runtime_error("global/local layer lists do not cover all layers");
-    } else {
+    } else if (g.arch != "inkling2_mtp") {  // the MTP sidecar (tools/convert_inkling_mtp.py) only carries tensors; the engine hardcodes + checks its shapes
         g.inter = (int)c["intermediate_size"].i64();
         const auto& rp = c["rope_parameters"];
         g.rope_theta = rp["rope_theta"].num();
