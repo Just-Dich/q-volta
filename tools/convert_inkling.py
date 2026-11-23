@@ -271,6 +271,7 @@ def main():
     ap.add_argument("--expert-batch", type=int, default=8)
     ap.add_argument("--max-seconds", type=float, default=1e9)
     ap.add_argument("--no-vocab-trim", action="store_true")
+    ap.add_argument("--no-embed", action="store_true", help="do not embed tokenizer.json / chat_template.jinja / generation_config.json from --model (default: embed what exists)")
     a = ap.parse_args()
     prof = dict(PROFILES[a.profile])
     for k in ("expert_bits", "expert_group", "method", "dense_bits", "dense_group"):
@@ -350,7 +351,16 @@ def main():
         save()
         print(f"layer {L}: {json.dumps({k: v for k, v in sts.items() if k != 'count'})} total {w.off / 2**30:.2f} GiB t={time.time() - t_start:.0f}s", flush=True)
     cfg = inkling_config(a.model, a, prof)
-    w.close(cfg)
+    blobs = meta = None
+    if not a.no_embed:  # self-contained .qv (docs/QV_FORMAT.md); appended after the tensors, no second copy of the file
+        import qv_blobs
+        blobs, meta = qv_blobs.collect_hf_dir(a.model)
+        meta.update(model_name=os.path.splitext(os.path.basename(a.out))[0], base_model=os.path.basename(os.path.normpath(a.model)),
+                    quantization=f"profile={a.profile} expert={prof.get('expert_bits', prof['expert'])}b/g{prof.get('expert_group', '-')} dense={prof['dense_bits']}b/g{prof.get('dense_group', '-')}"
+                                 + (f" attn={prof['attn_bits']}b" if prof.get("attn_bits") else "") + f" method={prof.get('method', '-')}")
+        if not blobs:
+            print(f"note: no tokenizer/template files in {a.model}; the .qv is not self-contained", flush=True)
+    w.close(cfg, blobs=blobs, meta=meta)
     json.dump(dict(stats=st["stats"], dense_stats=st["dense_stats"], dense_report=st["dense_report"]), open(a.out + ".report.json", "w"), indent=1)
     os.remove(state_path)
     print(f"FINISHED {a.out}: {os.path.getsize(a.out) / 2**30:.3f} GiB ({os.path.getsize(a.out)} B)", flush=True)

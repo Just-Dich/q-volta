@@ -2,6 +2,7 @@
 // of llama.cpp 9d6f04f; flags that have no meaning for Q-Volta are parsed (so their arguments are consumed correctly), warned about
 // and ignored. The spelling table is generated from `llama-server --help` (tools/gen_llama_flags.py -> llama_flags.inc).
 #pragma once
+#include <set>
 #include <string>
 #include <vector>
 
@@ -11,7 +12,9 @@ struct Options {
     // ---- model / engine
     std::string model;                 // Q-Volta model prefix (PREFIX.qv.json/.qv.bin) or a .qv path
     std::string backend = "auto";      // cuda | cpu | auto | mock
-    std::string tokenizer;
+    std::string tokenizer;             // "" = use the tokenizer embedded in the .qv, then sidecar search (docs/QV_FORMAT.md)
+    bool embedded_defaults = true;     // apply generation_config temperature/top_k/top_p of the .qv as default sampling (--no-embedded-defaults disables)
+    std::set<std::string> given;       // canonical names of flags given on the command line / environment
     int n_gpu_layers = -1;             // -1 = unset ("auto")
     bool ngl_given = false;
     int threads = 0;                   // 0 = min(32, cores)

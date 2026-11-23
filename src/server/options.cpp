@@ -31,7 +31,7 @@ const std::vector<FlagEntry>& table() {
 struct OwnFlag { const char* name; const char* canon; int arg; };
 const OwnFlag kOwn[] = {
     {"--backend", "backend", 1}, {"--kv", "kv", 1}, {"--kv4-kmode", "kv4-kmode", 1}, {"--mtp", "mtp", 0}, {"--no-mtp", "no-mtp", 0},
-    {"--mtp-depth", "mtp-depth", 1}, {"--prefill-chunk", "prefill-chunk", 1}, {"--tokenizer", "tokenizer", 1},
+    {"--mtp-depth", "mtp-depth", 1}, {"--prefill-chunk", "prefill-chunk", 1}, {"--tokenizer", "tokenizer", 1}, {"--no-embedded-defaults", "no-embedded-defaults", 0},
     {"--model-name", "alias", 1}, {"--max-ctx", "ctx-size", 1}, {"--http-threads", "threads-http", 1}, {"--max-queue", "max-queue", 1},
     {"--default-max-tokens", "predict", 1}, {"--quiet", "log-disable", 0}, {"--mock-text", "mock-text", 1},
     {"--mock-loop", "mock-loop", 0}, {"--vision-file", "vision-file", 1}, {"--allow-remote-images", "allow-remote-images", 0}, {"--image-root", "image-root", 1},
@@ -96,7 +96,7 @@ const std::set<std::string>& handled() {
         "dry-multiplier", "dry-base", "dry-allowed-length", "dry-penalty-last-n", "dry-sequence-breaker", "mirostat", "mirostat-lr", "mirostat-ent",
         "dynatemp-range", "dynatemp-exp", "seed", "samplers", "ignore-eos", "logit-bias", "timeout", "path", "ui", "log-disable", "verbose", "log-verbosity",
         "slot-save-path", "special", "cors-origins", "cors-methods", "cors-headers", "cors-credentials", "api-prefix", "min-keep", "grammar", "grammar-file", "json-schema", "json-schema-file", "help", "version",
-        "backend", "kv", "kv4-kmode", "mtp", "no-mtp", "mtp-depth", "prefill-chunk", "tokenizer", "max-queue", "mock-text", "mock-loop", "mock-delay-us",
+        "backend", "kv", "kv4-kmode", "mtp", "no-mtp", "mtp-depth", "prefill-chunk", "tokenizer", "no-embedded-defaults", "max-queue", "mock-text", "mock-loop", "mock-delay-us",
         "reasoning-preserve", "context-shift", "warmup", "flash-attn", "mlock", "mmap", "no-mmap", "perf", "escape", "verbosity", "log-colors", "log-timestamps",
         "log-prefix", "kv-unified", "cache-idle-slots", "lora", "lora-scaled", "ssl-key-file", "ssl-cert-file", "hf-repo", "model-url", "docker-repo",
         "hf-file", "hf-token", "offline", "no-mlock", "vision-file", "allow-remote-images", "image-root", "image-max-side", "image-token",
@@ -211,6 +211,7 @@ void apply(Options& o, const Resolved& r, const std::string& flag, const std::st
     else if (c == "mtp-depth") o.mtp_depth = to_int(val, flag);
     else if (c == "prefill-chunk") o.prefill_chunk = to_int(val, flag);
     else if (c == "tokenizer") o.tokenizer = val;
+    else if (c == "no-embedded-defaults") o.embedded_defaults = false;
     else if (c == "max-queue") o.max_queue = to_int(val, flag);
     else if (c == "vision-file") o.vision_file = val;
     else if (c == "allow-remote-images") o.allow_remote_images = true;
@@ -284,10 +285,12 @@ int parse_args(int argc, char** argv, Options& o, bool& exit_now) {
                 } else if (e.arg == 2 && val.empty()) val = "on";
                 if (!handled().count(canon)) { o.warnings.push_back("environment variable " + en + " is accepted for llama-server compatibility but has no effect in qv_server"); continue; }
                 apply(o, r, "env " + en, val);
+                given.insert(canon);
                 break;
             }
         }
         if (o.alias.empty()) o.alias.clear();
+        o.given = given;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;

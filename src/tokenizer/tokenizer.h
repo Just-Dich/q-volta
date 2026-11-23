@@ -4,6 +4,7 @@
 #pragma once
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -12,6 +13,8 @@ namespace qv {
 class Tokenizer {
    public:
     static Tokenizer load(const std::string& tokenizer_json_path);
+    // Same, from the bytes of a tokenizer.json already in memory (e.g. the blob embedded in a .qv container).
+    static Tokenizer from_memory(std::string_view tokenizer_json);
 
     // parse_special: recognise added tokens (<|im_start|>, <think>, ...) literally in the text.
     std::vector<int> encode(const std::string& text, bool parse_special = true) const;

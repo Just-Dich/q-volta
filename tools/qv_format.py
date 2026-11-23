@@ -210,10 +210,18 @@ class ContainerWriter(Writer):
         self.tensors[name] = ent
         return nb
 
-    def close(self, config: dict):
+    def close(self, config: dict, blobs=None, meta=None):
+        """blobs: optional {name: bytes} (tokenizer.json, chat_template.jinja, ...) appended after the tensors (docs/QV_FORMAT.md);
+        meta: optional dict for the index "meta" object. Without either the file is a plain format_version 1 container."""
         import json, struct
+        import qv_blobs
         config = dict(config, **self.extra_config)
-        js = json.dumps(dict(format="qvolta-v1", config=config, tensors=self.tensors), indent=None, separators=(",", ":")).encode()
+        idx = dict(format="qvolta-v1", config=config, tensors=self.tensors)
+        if blobs or meta:
+            tend = qv_blobs.tensor_end(idx)
+            self.f.truncate(self.HDR + tend)
+            idx = qv_blobs.merge_index(idx, qv_blobs.append_blobs(self.f, self.HDR, tend, blobs or {}), qv_blobs.base_meta(idx, meta))
+        js = json.dumps(idx, indent=None, separators=(",", ":")).encode()
         assert 24 + len(js) <= self.HDR, "header region too small"
         self.f.flush()
         self.f.seek(0)

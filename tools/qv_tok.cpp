@@ -1,18 +1,30 @@
 // qv_tok — tokenizer CLI.
 //   qv_tok TOKENIZER_JSON encode   : stdin lines are JSON strings -> stdout one JSON id array per line
 //   qv_tok TOKENIZER_JSON decode   : stdin lines are JSON id arrays -> stdout one JSON string per line
+//   TOKENIZER_JSON may be a .qv model file: its embedded tokenizer.json blob is used (docs/QV_FORMAT.md)
 //   (add "nospecial" as 3rd arg to disable literal special-token parsing in encode)
 #include <cstdio>
 #include <iostream>
 #include <string>
 
 #include "core/json_doc.h"
+#include "qv/model.h"
 #include "tokenizer/chat_template.h"
 #include "tokenizer/tokenizer.h"
 
 int main(int argc, char** argv) {
     if (argc < 3) { std::fprintf(stderr, "usage: qv_tok tokenizer.json encode|decode|chat [nospecial]\n"); return 2; }
-    auto tok = qv::Tokenizer::load(argv[1]);
+    std::string tpath = argv[1];
+    qv::Tokenizer tok;
+    if (tpath.size() > 3 && tpath.compare(tpath.size() - 3, 3, ".qv") == 0) {
+        try {
+            qv::ModelFile mf = qv::ModelFile::open(tpath);
+            if (!mf.has_blob("tokenizer.json")) { std::fprintf(stderr, "qv_tok: %s has no embedded tokenizer.json (tools/qv_embed.py --list)\n", tpath.c_str()); return 1; }
+            tok = qv::Tokenizer::from_memory(mf.blob("tokenizer.json"));
+        } catch (std::exception& e) { std::fprintf(stderr, "qv_tok: %s\n", e.what()); return 1; }
+    } else {
+        tok = qv::Tokenizer::load(tpath);
+    }
     std::string mode = argv[2];
     bool special = !(argc > 3 && std::string(argv[3]) == "nospecial");
     std::string line;

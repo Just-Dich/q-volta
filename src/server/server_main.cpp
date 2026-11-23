@@ -4,7 +4,10 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <filesystem>
+#include <optional>
+#include <type_traits>
 #include <fstream>
 #include <sstream>
 #include <thread>
@@ -13,6 +16,7 @@
 #include <cuda_runtime.h>
 #endif
 
+#include "core/json_doc.h"
 #include "server/app.h"
 #include "server/mock_engine.h"
 
@@ -100,7 +104,25 @@ int main(int argc, char** argv) {
     };
     std::string stem = o.model;
     if (stem.size() > 3 && stem.compare(stem.size() - 3, 3, ".qv") == 0 && !file_exists(stem)) stem.resize(stem.size() - 3);
+    // ---- self-contained .qv: tokenizer / chat template / generation defaults / metadata embedded in the container (docs/QV_FORMAT.md)
+    // Precedence: tokenizer  --tokenizer > embedded tokenizer.json > sidecar search > error
+    //             template   --chat-template[-file] > embedded chat_template.jinja > chat_template.jinja next to the tokenizer
+    std::optional<qv::ModelFile> emb;
+    if (!o.model.empty()) {
+        try { if (file_exists(stem) || file_exists(stem + ".qv") || file_exists(stem + ".qv.json")) emb = qv::ModelFile::open(stem); }
+        catch (const std::exception&) { /* a broken model is reported by the engine load below; the sidecar tokenizer search still applies */ }
+    }
+    if (emb) {
+        for (auto& [n, b] : emb->blobs) app->embedded_blobs.push_back(n);
+        app->model_meta_json = emb->meta();
+    }
     std::string tpath = o.tokenizer;
+    bool tok_embedded = false;
+    if (tpath.empty() && emb && emb->has_blob("tokenizer.json")) {
+        try { app->tok = qv::Tokenizer::from_memory(emb->blob("tokenizer.json")); } catch (const std::exception& e) { return fail(std::string("embedded tokenizer: ") + e.what()); }
+        tok_embedded = true;
+        tpath = "embedded:" + o.model;
+    }
     if (tpath.empty() && !o.model.empty()) {
         std::string base = o.model;
         if (base.size() > 3 && base.compare(base.size() - 3, 3, ".qv") == 0) base.resize(base.size() - 3);
@@ -109,21 +131,48 @@ int main(int argc, char** argv) {
         for (std::string cand : {base + ".tokenizer.json", dir + "/../Qwen3.8-27B/tokenizer.json", dir + "/tokenizer.json"})
             if (file_exists(cand)) { tpath = cand; break; }
     }
-    if (tpath.empty()) return fail("cannot find tokenizer.json; pass --tokenizer");
-    try { app->tok = qv::Tokenizer::load(tpath); } catch (const std::exception& e) { return fail(std::string("tokenizer: ") + e.what()); }
+    if (tpath.empty()) return fail("no tokenizer: the model file has no embedded tokenizer.json (embed one with tools/qv_embed.py) and none was found next to it; pass --tokenizer PATH");
+    if (!tok_embedded) { try { app->tok = qv::Tokenizer::load(tpath); } catch (const std::exception& e) { return fail(std::string("tokenizer: ") + e.what()); } }
     app->tokenizer_path = tpath;
     for (const char* s : {"<|im_end|>", "<|endoftext|>"}) { int id = app->tok.token_id(s); if (id >= 0) app->stop_ids.push_back(id); }
     app->eos_id = app->tok.token_id("<|im_end|>");
     app->bos_id = app->tok.token_id("<|endoftext|>");
+    // generation_config.json of the model: eos ids join the stop set, bos id; sampling defaults only where the flag was not given
+    if (emb && emb->has_blob("generation_config.json")) {
+        try {
+            qv::jd::Value gc = qv::jd::parse(emb->blob("generation_config.json"));
+            std::vector<int> eos;
+            if (const qv::jd::Value* e = gc.find("eos_token_id")) { if (e->is_array()) for (auto& v : e->items()) eos.push_back((int)v.as_int()); else if (e->is_number()) eos.push_back((int)e->as_int()); }
+            for (int id : eos)
+                if (id >= 0 && id < app->tok.vocab_size() && std::find(app->stop_ids.begin(), app->stop_ids.end(), id) == app->stop_ids.end()) app->stop_ids.push_back(id);
+            if (!eos.empty() && app->eos_id < 0 && eos[0] >= 0 && eos[0] < app->tok.vocab_size()) app->eos_id = eos[0];
+            if (const qv::jd::Value* b = gc.find("bos_token_id")) if (b->is_number() && app->bos_id < 0) app->bos_id = (int)b->as_int();
+            if (o.embedded_defaults) {
+                auto num = [&](const char* k, const char* flag, auto& dst) {
+                    const qv::jd::Value* v = gc.find(k);
+                    if (!v || !v->is_number() || o.given.count(flag)) return;
+                    dst = (std::decay_t<decltype(dst)>)v->as_double();
+                    app->embedded_applied += std::string(app->embedded_applied.empty() ? "" : ", ") + flag + "=" + v->dump();
+                };
+                num("temperature", "temp", app->o.temp);
+                num("top_k", "top-k", app->o.top_k);
+                num("top_p", "top-p", app->o.top_p);
+            }
+        } catch (const std::exception& e) { std::fprintf(stderr, "warning: embedded generation_config.json ignored: %s\n", e.what()); }
+    }
     app->fim_pre = app->tok.token_id("<|fim_prefix|>");
     app->fim_suf = app->tok.token_id("<|fim_suffix|>");
     app->fim_mid = app->tok.token_id("<|fim_middle|>");
     app->fim_rep = app->tok.token_id("<|repo_name|>");
     app->fim_sep = app->tok.token_id("<|file_sep|>");
-    {
+    app->template_source = "none";
+    if (emb && emb->has_blob("chat_template.jinja")) {
+        app->model_template = std::string(emb->blob("chat_template.jinja"));
+        app->template_source = "embedded";
+    } else if (!tok_embedded) {
         std::string tp = tpath.substr(0, tpath.find_last_of('/') == std::string::npos ? 0 : tpath.find_last_of('/')) + "/chat_template.jinja";
         std::ifstream f(tp, std::ios::binary);
-        if (f) { std::stringstream ss; ss << f.rdbuf(); app->model_template = ss.str(); }
+        if (f) { std::stringstream ss; ss << f.rdbuf(); app->model_template = ss.str(); app->template_source = "sidecar"; }
     }
     try {
         std::string warn, over = o.chat_template;
@@ -132,9 +181,16 @@ int main(int argc, char** argv) {
             if (!f) return fail("failed to open chat template file " + o.chat_template_file);
             std::stringstream ss; ss << f.rdbuf(); over = ss.str();
         }
+        if (!over.empty()) app->template_source = "override";
         app->tmpl = std::make_unique<ChatTemplates>(app->model_template, over, o.jinja, warn);
         if (!warn.empty()) std::fprintf(stderr, "warning: %s\n", warn.c_str());
     } catch (const std::exception& e) { return fail(e.what()); }
+    if (emb && !app->embedded_blobs.empty()) {
+        std::string names;
+        for (auto& n : app->embedded_blobs) names += (names.empty() ? "" : ", ") + n;
+        std::fprintf(stderr, "[qv_server] embedded in the model: %s; tokenizer=%s, chat template=%s%s%s\n", names.c_str(), tok_embedded ? "embedded" : "explicit/sidecar", app->template_source.c_str(),
+                     app->embedded_applied.empty() ? "" : ", sampling defaults from generation_config: ", app->embedded_applied.c_str());
+    }
 
     std::string backend = o.backend;
 #ifdef QV_HAVE_CUDA

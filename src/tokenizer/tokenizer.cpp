@@ -373,7 +373,11 @@ Tokenizer Tokenizer::load(const std::string& path) {
     if (!f) throw std::runtime_error("tokenizer: cannot open " + path);
     std::stringstream ss;
     ss << f.rdbuf();
-    jd::Value doc = jd::parse(ss.str());
+    return from_memory(ss.str());
+}
+
+Tokenizer Tokenizer::from_memory(std::string_view json_text) {
+    jd::Value doc = jd::parse(std::string(json_text));
     const jd::Value* model = doc.find("model");
     if (!model) throw std::runtime_error("tokenizer: no model section");
     const jd::Value* mtype = model->find("type");
