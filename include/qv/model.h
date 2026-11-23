@@ -2,6 +2,8 @@
 #pragma once
 #include <cstdint>
 #include <map>
+#include <memory>
+#include <string_view>
 #include <string>
 #include <vector>
 
@@ -63,8 +65,16 @@ struct TensorInfo {
     uint64_t expert_off_rs(int64_t e) const { return off_rs + e * (nbytes_rs / n_experts()); }
 };
 
+// Named byte blob stored in the data area of a .qv container (tokenizer.json, chat_template.jinja, ...; docs/QV_FORMAT.md).
+struct BlobInfo {
+    uint64_t off = 0, nbytes = 0;  // absolute file offset
+};
+
 struct ModelFile {
     Config cfg;
+    int format_version = 1;                 // JSON index "format_version" (absent = 1 = no blobs / meta)
+    std::map<std::string, BlobInfo> blobs;  // embedded blobs (empty for files written before format_version 2)
+    std::string meta_json;                  // compact JSON text of the index "meta" object ("" when absent)
     std::map<std::string, TensorInfo> tensors;
     std::string bin_path;
     uint64_t bin_size = 0;
@@ -72,6 +82,14 @@ struct ModelFile {
     const TensorInfo& at(const std::string& n) const;
     // Inkling: throws std::runtime_error naming the first missing / mis-shaped tensor (full tensor table check from cfg.ink).
     void validate_inkling() const;
+    // Embedded blobs. blob() returns a read-only view of the blob bytes (mmap of the file range; empty view when the blob is absent).
+    // The view stays valid as long as the ModelFile object it was obtained from (or a copy made after that call) lives. Not thread-safe for concurrent first calls.
+    bool has_blob(const std::string& name) const { return blobs.count(name) != 0; }
+    std::string_view blob(const std::string& name) const;
+    const std::string& meta() const { return meta_json; }
+    std::string meta_string(const std::string& key, const std::string& dflt = "") const;  // top-level string value of meta
+    struct BlobMaps;
+    mutable std::shared_ptr<BlobMaps> maps_;  // created by the first blob() call; copies made afterwards share it
 };
 
 }  // namespace qv

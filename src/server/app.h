@@ -151,6 +151,10 @@ class App {
     vision::SourceOptions vsrc;
     int image_token_id = -1;
     std::string backend_name, tokenizer_path, model_id, model_template, model_arch;
+    std::string template_source;       // "override" | "embedded" | "sidecar" | "none" (where model_template came from)
+    std::string model_meta_json;       // "meta" object of the .qv index (compact JSON, "" when absent)
+    std::vector<std::string> embedded_blobs;  // names of the blobs stored in the .qv
+    std::string embedded_applied;      // human-readable list of embedded generation defaults that were applied
     std::vector<int> stop_ids;
     int n_ctx = 4096, chunk = 256, n_slots = 4, mtp_chunk = 8;
     std::atomic<bool> ready{false};

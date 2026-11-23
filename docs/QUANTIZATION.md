@@ -28,3 +28,8 @@ Head (final hidden of the e1 run, wikitext, KL): 4-bit RTN m8 0.1252 / 5-bit 0.1
 * H4 embed: only 4-bit tested (kept). Head: see above. H5 entropy coding: not tried. H6 MTP bits / acceptance: NOT measured (qv_remtp.py written, untested; e1 quantizes MTP at 3-bit RTN clip, acceptance with it unmeasured).
 * Agentic set (17x512, secondary): ppl numbers are noisy and KL is tail-dominated (p99 > 15 for E0); e1 is worse than E0 there (KL 1.34 vs 1.13, top-1 74.9 vs 79.4) and GPTQ g128 (1.25) was not better than RTN g64+clip (0.95). Calibration has no agentic text; treat e1 with caution for tool calling.
 * Not done: pi LoRA build with e1, CPU engine run on e1 (CPU kernels unchanged, expansion at load; ctest cpu tests pass), prefill re-measure, 256K fit check (e1 weights 10.44 GiB + 0.65 scratch measured 11.4 GiB device).
+
+## Self-contained files (p23/embed)
+
+The .qv now optionally embeds tokenizer.json, chat_template.jinja, generation_config.json and a meta object (quantization summary, base model, license, eos ids, context length); see docs/QV_FORMAT.md.
+`tools/convert.py --emit-qv` and `tools/convert_inkling.py` embed the files found in the model dir by default (`--no-embed` to skip); the tensor bytes and therefore all quality numbers above are unchanged.

@@ -2,13 +2,53 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
 #include "../core/json.h"
+#include "../core/json_doc.h"
 #include "qv/model.h"
 
 namespace qv {
+
+struct ModelFile::BlobMaps {
+    struct Map { void* base = nullptr; size_t len = 0; const char* data = nullptr; size_t n = 0; ~Map() { if (base) munmap(base, len); } };
+    std::mutex mu;
+    std::map<std::string, std::unique_ptr<Map>> m;
+};
+
+std::string_view ModelFile::blob(const std::string& name) const {
+    auto it = blobs.find(name);
+    if (it == blobs.end() || it->second.nbytes == 0) return {};
+    if (!maps_) maps_ = std::make_shared<BlobMaps>();
+    std::lock_guard<std::mutex> lk(maps_->mu);
+    auto& slot = maps_->m[name];
+    if (!slot) {
+        const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE), start = it->second.off / page * page, delta = it->second.off - start;
+        int fd = ::open(bin_path.c_str(), O_RDONLY);
+        if (fd < 0) throw std::runtime_error("cannot open " + bin_path + " for blob " + name);
+        void* p = mmap(nullptr, delta + it->second.nbytes, PROT_READ, MAP_PRIVATE, fd, (off_t)start);
+        ::close(fd);
+        if (p == MAP_FAILED) throw std::runtime_error("mmap failed for blob " + name);
+        slot = std::make_unique<BlobMaps::Map>();
+        slot->base = p; slot->len = delta + it->second.nbytes; slot->data = (const char*)p + delta; slot->n = it->second.nbytes;
+    }
+    return std::string_view(slot->data, slot->n);
+}
+
+std::string ModelFile::meta_string(const std::string& key, const std::string& dflt) const {
+    if (meta_json.empty()) return dflt;
+    try {
+        jd::Value d = jd::parse(meta_json);
+        const jd::Value* v = d.find(key);
+        return v && v->is_string() ? v->as_string() : dflt;
+    } catch (...) { return dflt; }
+}
 
 const TensorInfo& ModelFile::at(const std::string& n) const {
     auto it = tensors.find(n);
@@ -147,6 +187,20 @@ ModelFile ModelFile::open(const std::string& prefix_in) {
     }
     m.bin_path = path;
     m.bin_size = std::filesystem::file_size(m.bin_path);
+    // format_version >= 2: optional named blobs (offsets relative to the data section) and a free-form "meta" object. Unknown keys are ignored.
+    if (root.has("format_version")) m.format_version = (int)root["format_version"].i64();
+    if (root.has("blobs"))
+        for (const auto& [name, v] : root["blobs"].o) {
+            BlobInfo b;
+            b.off = v["off"].i64() + rebase;
+            b.nbytes = v["nbytes"].i64();
+            if (b.off + b.nbytes > m.bin_size) throw std::runtime_error("blob extends past end of file (truncated model?): " + name);
+            m.blobs.emplace(name, b);
+        }
+    if (root.has("meta")) {
+        jd::Value d = jd::parse(text);
+        if (const jd::Value* mv = d.find("meta")) m.meta_json = mv->dump();
+    }
     for (const auto& [name, t] : m.tensors) {  // detect truncated / partially written files
         uint64_t end = t.kind == Kind::F32 || t.kind == Kind::F16 ? t.off + t.nbytes : std::max({t.off_q + t.nbytes_q, t.off_sm + t.nbytes_sm, t.off_rs + t.nbytes_rs});
         if (end > m.bin_size) throw std::runtime_error("tensor extends past end of file (truncated model?): " + name);

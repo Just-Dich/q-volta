@@ -62,12 +62,30 @@ Value App::model_json() const {
     meta.set("vocab_type", 2);
     meta.set("n_vocab", tok.vocab_size());
     meta.set("n_ctx", n_ctx);
-    meta.set("n_ctx_train", model_arch == "mock" ? n_ctx : 262144);
+    long long n_ctx_train = model_arch == "mock" ? n_ctx : 262144;
+    Value qvm = Value::object();
+    if (!model_meta_json.empty()) {
+        try {
+            qvm = jd::parse(model_meta_json);
+            if (const Value* cl = qvm.find("context_length")) if (cl->is_number() && cl->as_int() > 0) n_ctx_train = cl->as_int();
+        } catch (...) {}
+    }
+    meta.set("n_ctx_train", n_ctx_train);
     meta.set("n_embd", cached_n_embd);
     meta.set("n_params", 0);
     meta.set("size", cached_weight_bytes);
     meta.set("ftype", model_arch == "mock" ? "mock" : "Q-Volta");
     m.set("meta", std::move(meta));
+    if (!embedded_blobs.empty() || !model_meta_json.empty()) {  // Q-Volta extension (only for self-contained files, so plain models keep the llama-server schema)
+        Value q = Value::object();
+        q.set("meta", std::move(qvm));
+        Value bl = Value::array();
+        for (auto& n : embedded_blobs) bl.push(n);
+        q.set("blobs", std::move(bl));
+        q.set("tokenizer", tokenizer_path.rfind("embedded:", 0) == 0 ? "embedded" : "external");
+        q.set("chat_template", template_source);
+        m.set("qv", std::move(q));
+    }
     return m;
 }
 
@@ -139,6 +157,14 @@ void App::handle_props(http::Conn& c) {
         r.set("ui_settings", std::move(us));
     }
     r.set("chat_template", tmpl ? tmpl->source() : std::string());
+    if (!embedded_blobs.empty() || !model_meta_json.empty()) {  // Q-Volta extension: only for self-contained .qv files (docs/QV_FORMAT.md)
+        r.set("qv_chat_template_source", template_source);
+        r.set("qv_tokenizer", tokenizer_path.rfind("embedded:", 0) == 0 ? "embedded" : tokenizer_path);
+        Value a = Value::array();
+        for (auto& n : embedded_blobs) a.push(n);
+        r.set("qv_embedded_blobs", std::move(a));
+        r.set("qv_embedded_defaults", embedded_applied);
+    }
     r.set("chat_template_caps", tmpl ? tmpl->caps() : Value::object());
     r.set("bos_token", bos_id >= 0 ? tok.token_bytes(bos_id) : std::string());
     r.set("eos_token", eos_id >= 0 ? tok.token_bytes(eos_id) : std::string());

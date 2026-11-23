@@ -93,3 +93,10 @@ Validated against the HF PR tower on 6 images: pixels equal to 1.2e-7, embedding
 - Not implemented: router mode, /tools, /cors-proxy, embeddings, rerank, audio; log format differs; one decoding sequence.
 ## p19/ink-mtp + p22/ink-mtp2 (2026-11-23) - Inkling MTP
 DSpark drafter graph reconstructed from vLLM and validated with a torch reference (mean accepted 3.5/7 on code); CUDA implementation with bit-exact batched verify, sidecar `inkling2-mini-mtp.qv` (258 MiB), server flags. Exact; speedup 0.55-1.73x depending on text, about 1.25x typical. Verify (2.5 ms per extra row) is the bottleneck; not optimised. See docs/INKLING_MTP.md.
+
+## p23/embed (2026-11-23) - self-contained .qv (tokenizer, chat template, generation defaults, meta embedded)
+- Container format_version 2: optional `blobs` (64-byte aligned after the tensors) + `meta` in the JSON index; old files and old runtimes unaffected (docs/QV_FORMAT.md).
+- `tools/qv_embed.py` (embed / --list / --extract / in place, streamed, sha256-verified, disk check), hooks in convert.py --emit-qv, convert_inkling.py, qv_pack.py (`--no-embed` to skip).
+- Runtime: `ModelFile::blob()/meta()`, `Tokenizer::from_memory`, qv_server uses embedded tokenizer/template/eos ids/sampling defaults (flags win, `--no-embedded-defaults`), qv_tok takes a .qv.
+- Verified on real files: qwen38-27b-e1-st.qv and e0-st built, tensor-area sha256 identical to the originals, CPU-backend qv_server with no --tokenizer: /tokenize identical to the --tokenizer path and the same greedy chat answer. GPU was occupied by another job, so no CUDA run. Inkling-st not built (disk).
+- Overhead: +12.8 MB (tokenizer.json 12.8 MB, template 9 KB, configs < 1 KB) = 0.11 % of e1.

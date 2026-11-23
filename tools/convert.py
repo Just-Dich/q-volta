@@ -260,6 +260,7 @@ def main():
     ap.add_argument("--ncalib", type=int, default=0)
     ap.add_argument("--calib-batch", type=int, default=8)
     ap.add_argument("--emit-qv", action="store_true", help="pack into a single .qv container and delete the .json/.bin pair")
+    ap.add_argument("--no-embed", action="store_true", help="with --emit-qv: do not embed tokenizer.json / chat_template.jinja / generation_config.json from --hf-dir (default: embed what exists)")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--no-write", action="store_true", help="evaluation only: do not write the model file")
     ap.add_argument("--max-layers", type=int, default=0, help="stop after this many layers in this invocation (state saved)")
@@ -694,8 +695,18 @@ def main():
     if os.path.exists(state_path):
         os.remove(state_path)
     if args.emit_qv and not args.no_write:
-        import qv_pack
-        qv_pack.pack(args.out, args.out + ".qv", delete_src=True)
+        import qv_pack, qv_blobs
+        blobs = meta = None
+        if not args.no_embed:  # self-contained .qv: tokenizer + chat template + generation defaults + metadata (docs/QV_FORMAT.md)
+            blobs, meta = qv_blobs.collect_hf_dir(args.hf_dir)
+            if args.lora and os.path.isfile(os.path.join(args.lora, "chat_template.jinja")):  # an adapter's own template wins
+                blobs["chat_template.jinja"] = open(os.path.join(args.lora, "chat_template.jinja"), "rb").read()
+                meta["chat_template_from"] = "lora:" + os.path.basename(os.path.normpath(args.lora))
+            meta.update(model_name=os.path.basename(os.path.normpath(args.out)), base_model=os.path.basename(os.path.normpath(args.hf_dir)),
+                        quantization=f"bits={args.bits} group={args.group} method={args.method}" + (" meta8" if args.meta8 else "") + (" lora-merged" if args.lora else ""))
+            if not blobs:
+                print(f"note: no tokenizer/template files found in {args.hf_dir}; the .qv is not self-contained", flush=True)
+        qv_pack.pack(args.out, args.out + ".qv", delete_src=True, blobs=blobs, meta=meta)
     print(f"[{time.time()-t0:6.0f}s] DONE total {total['bytes']/2**30:.2f} GiB", flush=True)
 
 
