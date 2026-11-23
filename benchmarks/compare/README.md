@@ -24,6 +24,7 @@ Sizes are file sizes (GiB = 2^30). llama.cpp quants were requantized from Q8_0 (
 | **Q-Volta e0** (RTN g64) | 12.63 | no (RTN) | 9.511 (+12.3%) | 6.257 | 0.1018 | 86.6% |
 | llama.cpp IQ3_XXS (+ imatrix) | 10.89 | yes (Q-Volta GPTQ calibration text) | 8.992 (+6.2%) | 6.102 | 0.0751 | 89.0% |
 | **Q-Volta e1** (GPTQ g128) | 10.44 | GPTQ Hessian, same calibration set | 9.278 (+9.6%) | 6.281 | 0.0923 | 87.1% |
+| **Q-Volta e1b1** (p21/quant2: act-order GPTQ, per-class damping, 256 calib seqs, g64 on down/o_proj, GPTQ 4-bit head) | 10.40 | GPTQ Hessian, 256 sequences (same text families) | 9.112 (+7.6%) | 6.102 | 0.0750 | 89.3% |
 
 Pairs are not exactly equal: Q3_K_M is 1.1% larger than e0, IQ3_XXS is 4.3% larger than e1 (the nearest llama.cpp types that exist; IQ3_S was not built, see "missing"). The imatrix was computed with `llama-imatrix` on the Q8_0 model over the text decoded from `/workspace/q-volta-models/calib/calib32.npy` (the 32x1024-token set our GPTQ uses; re-tokenization shifts window boundaries slightly). For IQ3_XXS the MTP layer (blk.64, absent from the imatrix) was forced to Q4_K. Q3_K_M was built without imatrix; **without-imatrix IQ3_XXS and with-imatrix Q3_K_M were not run** (time/disk).
 
@@ -60,6 +61,9 @@ Bisection to 1 K tokens; a size "fits" if the context allocates and one 2048-tok
 | Q-Volta e1 10.44 GiB | fp16 / int4 | 74,752 / 267,264 |
 
 llama.cpp Q4_K_M (15.83 GiB) does not fit: the V100 exposes 15.77 GiB (arithmetic, not run on GPU; partial offload was not tried). Q-Volta's earlier 256K evidence (real 250K prefill, passkey 1/1) is in docs/LONG_CONTEXT.md.
+
+### p21/quant2 update (2026-11-23): e1b1 at 10.40 GiB
+e1b1 (recipe in docs/QUANTIZATION.md) measured with the same scripts (`quality_qv.sh`, qv_run 8x512 + 4088 cmp vs ref_q8_P4088.bin). Against IQ3_XXS+imatrix (10.89 GiB, 4.7% larger): KL to Q8_0 0.0750 vs 0.0751 (equal), ppl 4088 6.102 vs 6.102 (equal), top-1 89.3% vs 89.0%, but ppl 8x512 9.112 vs 8.992 (llama.cpp still 0.12 better, +7.6% vs +6.2%). Against e1: ppl 9.278 -> 9.112, KL 0.0923 -> 0.0750. Decode (qv_run --graph, 3 interleaved rounds, flock): plain 57.5 vs e1 57.6 tok/s, MTP-3 code 137.2 vs 138.5, prose 92.2 vs 88.4. Agentic set (convert.py eval, BF16 reference): KL 1.370 vs e1 1.34 (not better, slightly worse than e1; E0 RTN was 1.13). The 12.7 GiB target (e0b1) and a GPTQ-E0-bits row in this protocol were NOT run (disk, time).
 
 ## Verdict (what the numbers support)
 - **Speed, plain decode**: Q-Volta is faster at the same file size: e0 52.2 vs llama.cpp Q3_K_M 42.3 (+23%), e1 57.6 vs IQ3_XXS 38.7 (+49%, with e1 4% smaller). Part of this is bytes read; IQ-quant dequantization on Volta also costs llama.cpp (IQ3_XXS is slower than Q3_K_M despite being smaller).

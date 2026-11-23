@@ -100,3 +100,8 @@ DSpark drafter graph reconstructed from vLLM and validated with a torch referenc
 - Runtime: `ModelFile::blob()/meta()`, `Tokenizer::from_memory`, qv_server uses embedded tokenizer/template/eos ids/sampling defaults (flags win, `--no-embedded-defaults`), qv_tok takes a .qv.
 - Verified on real files: qwen38-27b-e1-st.qv and e0-st built, tensor-area sha256 identical to the originals, CPU-backend qv_server with no --tokenizer: /tokenize identical to the --tokenizer path and the same greedy chat answer. GPU was occupied by another job, so no CUDA run. Inkling-st not built (disk).
 - Overhead: +12.8 MB (tokenizer.json 12.8 MB, template 9 KB, configs < 1 KB) = 0.11 % of e1.
+
+## p21/quant2 (2026-11-23) - quantization quality at equal bytes (interim)
+Proxy ablation on held-out text (see docs/QUANTIZATION.md "p21/quant2"): act-order+damping per tensor class cuts held-out layer error 6-12%, 128 calibration sequences beat 32 by 12-25%, g64 costs less per unit error than 4-bit upgrades, down_proj GPTQ overfits. Tools committed; full e1b1/e0b1 runs started, no model-level number measured yet, README claims unchanged. Branch p21/quant2.
+
+Update: e1b1 (10.40 GiB) measured: ppl 8x512 9.112, KL to Q8_0 0.0750, top-1 89.3%, decode 57.5 / MTP-3 137.2 (code); see docs/QUANTIZATION.md.

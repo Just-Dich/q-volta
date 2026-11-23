@@ -243,3 +243,169 @@ def gptq_batched(W, Hu, bits, group=64, clip=True, colw=None, block=128, meta8=F
             Err[:, :, i] = err
         W[:, :, i2:] -= torch.bmm(Err, Hu[:, i1:i2, i2:])
     return Q, S, M, rs
+
+
+# ---------------------------------------------------------------- p21/quant2 additions
+def gptq_static(W, H, bits, group=64, clip=True, percdamp=0.01, actorder=True, block=128, meta8=False, shrink=0.0):
+    """GPTQ with STATIC group parameters (taken from the original weights by a Hessian-weighted clip search, the format keeps
+    contiguous groups) and optional act-order: columns are swept in decreasing diag(H) order, so large-activation input
+    channels are quantized first and all later columns compensate for them. H = mean x x^T [K,K] (not modified)."""
+    N, K = W.shape
+    qmax = (1 << bits) - 1
+    colw = torch.diagonal(H).clone()
+    _, S, M, rs = rtn(W, bits, group, clip=clip, colw=colw, meta8=meta8)
+    if rs is None:
+        sc, mn = S.float(), M.float()
+        sc = torch.where(sc > 0, sc, torch.ones_like(sc))
+    else:
+        sc, mn = meta8_decode(S, M, rs, bits)
+    sf = sc.repeat_interleave(group, 1)  # [N,K] decoded per-column scale / min
+    mf = mn.repeat_interleave(group, 1)
+    perm = torch.argsort(colw, descending=True) if actorder else torch.arange(K, device=W.device)
+    Hp = H[perm][:, perm]
+    if shrink > 0:  # Ledoit-Wolf style shrinkage toward diag(H): damps the poorly estimated cross-correlations
+        dg = torch.diagonal(Hp).clone()
+        Hp.mul_(1 - shrink)
+        Hp.diagonal().add_(shrink * dg)
+    Hu = hinv_chol(Hp, percdamp)
+    del Hp
+    Wp, sfp, mfp = W[:, perm].clone(), sf[:, perm], mf[:, perm]
+    Qp = torch.empty(N, K, dtype=torch.uint8, device=W.device)
+    for i1 in range(0, K, block):
+        i2 = min(i1 + block, K)
+        W1 = Wp[:, i1:i2].clone()
+        Err = torch.zeros_like(W1)
+        Hb = Hu[i1:i2, i1:i2]
+        for i in range(i2 - i1):
+            w = W1[:, i]
+            q, dq = _quant_col(w, sfp[:, i1 + i], mfp[:, i1 + i], qmax)
+            Qp[:, i1 + i] = q.to(torch.uint8)
+            err = (w - dq) / Hb[i, i]
+            W1[:, i:] -= err[:, None] * Hb[i, i:][None, :]
+            Err[:, i] = err
+        Wp[:, i2:] -= Err @ Hu[i1:i2, i2:]
+    Q = torch.empty_like(Qp)
+    Q[:, perm] = Qp
+    return Q, S, M, rs
+
+
+def refit_params(W, Q, S, M, rs, H, bits, group):
+    """Closed-form least-squares refit of (scale, min) per group with the codes Q fixed, minimising (w - s q - m)^T H_gg (w - s q - m)
+    (block-diagonal part of H), re-encoded into the stored format (fp16 or meta8). A group keeps its old parameters unless the new
+    ones have lower block error after re-encoding."""
+    N, K = W.shape
+    G = K // group
+    qmax = (1 << bits) - 1
+    S2, M2 = S.clone(), M.clone()
+    if rs is None:
+        sc0, mn0 = S.float(), M.float()
+    else:
+        sc0, mn0 = meta8_decode(S, M, rs, bits)
+        u = rs.float() / 255.0
+        zlo, zst = zrange(bits)
+    for g in range(G):
+        a, b = g * group, (g + 1) * group
+        Hg = H[a:b, a:b]
+        q = Q[:, a:b].float()
+        w = W[:, a:b]
+        h1 = Hg.sum(1)
+        Hq = q @ Hg
+        qHq = (Hq * q).sum(-1)
+        qH1 = q @ h1
+        H11 = h1.sum()
+        qHw = (Hq * w).sum(-1)
+        Hw1 = w @ h1
+        det = qHq * H11 - qH1 * qH1
+        ok = det.abs() > 1e-12 * (qHq * H11).abs().clamp_min(1e-30)
+        s = torch.where(ok, (qHw * H11 - qH1 * Hw1) / det.where(ok, torch.ones_like(det)), sc0[:, g])
+        m = torch.where(ok, (qHq * Hw1 - qH1 * qHw) / det.where(ok, torch.ones_like(det)), mn0[:, g])
+        s = s.clamp_min(1e-8)
+        if rs is None:
+            cs, cm = s.half(), m.half()
+            sf, mf = cs.float(), cm.float()
+        else:
+            cs = torch.round(s / u).clamp_(1, 255)
+            sf = cs * u
+            z = -m / sf
+            cm = torch.round((z - zlo) / zst).clamp_(0, 255)
+            mf = -(sf * (cm * zst + zlo))
+        def blk_err(sv, mv):
+            d = q * sv[:, None] + mv[:, None] - w
+            return ((d @ Hg) * d).sum(-1)
+        better = blk_err(sf, mf) < blk_err(sc0[:, g], mn0[:, g])
+        S2[:, g] = torch.where(better, cs.to(S.dtype), S[:, g])
+        M2[:, g] = torch.where(better, cm.to(M.dtype), M[:, g])
+    return S2, M2
+
+
+def refit_full(W, Q, S, M, rs, H, bits, group, passes=2):
+    """Coordinate-descent LS refit of all group (scale, min) with the codes Q fixed, under the FULL Hessian
+    (minimise tr(E H E^T), E = Wq - W). Group g solves  A^T Hgg A p = A^T Hgg w_g - A^T c_g  with A = [q 1], p = (s, m) and
+    c_g = (E H)[:, g] - E_g Hgg (cross term to the other groups). Parameters are re-encoded in the stored format; a row keeps its
+    old (s, m) in a group unless its full objective improves. Returns (S, M)."""
+    N, K = W.shape
+    G = K // group
+    S2, M2 = S.clone(), M.clone()
+    if rs is not None:
+        u = rs.float() / 255.0
+        zlo, zst = zrange(bits)
+    Qf = Q.view(N, G, group).float()
+    Wg = W.view(N, G, group)
+    def decode(Sx, Mx):
+        if rs is None:
+            return Sx.float(), Mx.float()
+        return meta8_decode(Sx, Mx, rs, bits)
+    sc, mn = decode(S2, M2)
+    E = (Qf * sc[..., None] + mn[..., None] - Wg).view(N, K)
+    for _ in range(passes):
+        for g in range(G):
+            a, b = g * group, (g + 1) * group
+            Hgg = H[a:b, a:b]
+            q = Qf[:, g]
+            w = Wg[:, g]
+            eg = E[:, a:b]
+            c = E @ H[:, a:b] - eg @ Hgg                      # [N,g] cross term
+            h1 = Hgg.sum(1)
+            Hq = q @ Hgg
+            A11 = (Hq * q).sum(-1); A12 = q @ h1; A22 = h1.sum()
+            Hw = w @ Hgg
+            r1 = (q * Hw).sum(-1) - (q * c).sum(-1)
+            r2 = (w @ h1) - c.sum(-1)
+            det = A11 * A22 - A12 * A12
+            ok = det.abs() > 1e-10 * (A11 * A22).abs().clamp_min(1e-30)
+            dd = det.where(ok, torch.ones_like(det))
+            s = torch.where(ok, (r1 * A22 - A12 * r2) / dd, sc[:, g]).clamp_min(1e-8)
+            m = torch.where(ok, (A11 * r2 - A12 * r1) / dd, mn[:, g])
+            if rs is None:
+                cs, cm = s.half(), m.half()
+                sf, mf = cs.float(), cm.float()
+            else:
+                cs = torch.round(s / u).clamp_(1, 255)
+                sf = cs * u
+                cm = torch.round((-m / sf - zlo) / zst).clamp_(0, 255)
+                mf = -(sf * (cm * zst + zlo))
+            en = q * sf[:, None] + mf[:, None] - w
+            def obj(e):
+                return ((e @ Hgg) * e).sum(-1) + 2 * (e * c).sum(-1)
+            better = obj(en) < obj(eg)
+            S2[:, g] = torch.where(better, cs.to(S.dtype), S2[:, g])
+            M2[:, g] = torch.where(better, cm.to(M.dtype), M2[:, g])
+            sc[:, g] = torch.where(better, sf, sc[:, g])
+            mn[:, g] = torch.where(better, mf, mn[:, g])
+            E[:, a:b] = torch.where(better[:, None], en, eg)
+    return S2, M2
+
+
+def effective_weights(W, H, C, percdamp=0.01):
+    """GPTAQ-style asymmetric target: the weights that, applied to the QUANTIZED-stream inputs x_q, best reproduce the FP-stream
+    outputs W x_fp:  W_eff = W C (H + damp I)^-1  with H = E[x_q x_q^T], C = E[x_fp x_q^T] (rows: fp input channel).  Equals W when
+    the two streams coincide.  W [N,K] fp32 (device)."""
+    Hd = H.clone()
+    d = torch.diagonal(Hd)
+    d[d == 0] = 1.0
+    d.add_(percdamp * d.mean())
+    L = torch.linalg.cholesky(Hd)
+    del Hd
+    Y = (W @ C).T.contiguous()  # [K,N]  (C^T W^T)^T ... see below
+    Z = torch.cholesky_solve(Y, L)
+    return Z.T.contiguous()
