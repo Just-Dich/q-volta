@@ -37,7 +37,7 @@ Any llama-server flag spelling works (`-c`, `-ngl`, `-np`, `-ub`, `--temp`, `--t
 Defaults are llama-server's: port **9931**, temperature 0.8, top_k 40, top_p 0.95, min_p 0.05, 4 slots. Use `--temp/--top-k/--top-p` for the Qwen-recommended values.
 
 Q-Volta flags: `--backend cuda|cpu|auto|mock` (`-ngl 0` also selects CPU), `--kv fp32|fp16|int4`, `--mtp` / `--mtp-depth N` (exact greedy MTP lookahead for temperature-0 requests),
-`--prefill-chunk N`, `--tokenizer PATH`, `--max-queue N` (503 beyond N waiting; default unbounded like llama), legacy `--max-ctx`, `--model-name`, `--http-threads`, `--quiet`.
+`--prefill-chunk N`, `--tokenizer PATH` (optional when the .qv embeds a tokenizer.json; overrides it), `--no-embedded-defaults`, `--max-queue N` (503 beyond N waiting; default unbounded like llama), legacy `--max-ctx`, `--model-name`, `--http-threads`, `--quiet`.
 Vision (Inkling image input, docs/INKLING_VISION.md): `--vision-file PATH|none` (default: `<model>-vision.qv` / `<family>-vision.qv` next to the model), `--image-root DIR` (local image files, default the working directory, `""` = off),
 `--allow-remote-images` (http(s) `image_url`, SSRF-guarded, needs `curl`; off by default), `--image-max-side N` (4096), `--image-token STR`. `/props` reports `modalities.vision`.
 The `mock` backend (scripted tokens, `--mock-text`) is for tests and needs no weights.
@@ -116,3 +116,11 @@ pessimistic versus the standalone engine figures (~3.9 tok/s decode, ~20 tok/s p
 
 Model load: 1.3-2 s with a warm page cache (the CPU engine maps the weights).
 No CUDA numbers: the GPU was not used.
+
+## Self-contained .qv (embedded tokenizer / template / generation defaults)
+
+`qv_server --model x.qv` works with no `--tokenizer` and no side files when the container carries the blobs (docs/QV_FORMAT.md; add them with
+`tools/qv_embed.py`). Precedence: `--tokenizer` > embedded > sidecar search > error ("no tokenizer ..."); `--chat-template[-file]` > embedded template > template next to
+the tokenizer. The embedded generation_config.json supplies the default temperature/top_k/top_p only where the flag was not given (llama-server defaults otherwise;
+`--no-embedded-defaults` disables) and its eos ids join the stop set. /props has `qv_*` keys and /v1/models `data[0].qv` has the meta, only for files with blobs/meta.
+Tests: `python3 -m pytest tests/test_qv_embed.py` (mock backend, synthetic .qv) and `build/test_blobs`.

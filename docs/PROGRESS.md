@@ -91,3 +91,10 @@ Validated against the HF PR tower on 6 images: pixels equal to 1.2e-7, embedding
 - Driven in headless Chromium (Playwright) against the mock backend: loads, streams markdown + reasoning, settings dialog, client-side tool call, Stop. Mismatches found and fixed: /tools and /cors-proxy 403, /v1/streams/lookup + resumable streams, prompt_progress, timings_per_token, SSE pings, /v1/chat/completions/control.
 - Added /v1/messages, /v1/messages/count_tokens, /v1/responses (event sequences diffed vs llama-server), --sleep-idle-seconds, --sse-ping-interval, --ui-config(-file).
 - Not implemented: router mode, /tools, /cors-proxy, embeddings, rerank, audio; log format differs; one decoding sequence.
+
+## p23/embed (2026-11-23) - self-contained .qv (tokenizer, chat template, generation defaults, meta embedded)
+- Container format_version 2: optional `blobs` (64-byte aligned after the tensors) + `meta` in the JSON index; old files and old runtimes unaffected (docs/QV_FORMAT.md).
+- `tools/qv_embed.py` (embed / --list / --extract / in place, streamed, sha256-verified, disk check), hooks in convert.py --emit-qv, convert_inkling.py, qv_pack.py (`--no-embed` to skip).
+- Runtime: `ModelFile::blob()/meta()`, `Tokenizer::from_memory`, qv_server uses embedded tokenizer/template/eos ids/sampling defaults (flags win, `--no-embedded-defaults`), qv_tok takes a .qv.
+- Verified on real files: qwen38-27b-e1-st.qv and e0-st built, tensor-area sha256 identical to the originals, CPU-backend qv_server with no --tokenizer: /tokenize identical to the --tokenizer path and the same greedy chat answer. GPU was occupied by another job, so no CUDA run. Inkling-st not built (disk).
+- Overhead: +12.8 MB (tokenizer.json 12.8 MB, template 9 KB, configs < 1 KB) = 0.11 % of e1.

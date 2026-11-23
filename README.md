@@ -51,11 +51,11 @@
 # 1. build (CUDA 12+, CMake 3.24+, Ninja; add -DQV_CUDA=OFF for a CPU-only build)
 cmake -S . -B build -G Ninja -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc && ninja -C build
 
-# 2. get a model (one file + tokenizer)
-hf download q-project/Qwen3.8-27B-QVolta qwen38-27b-e1.qv tokenizer.json --local-dir models
+# 2. get a model (ONE self-contained file: weights + tokenizer + chat template + generation defaults)
+hf download q-project/Qwen3.8-27B-QVolta qwen38-27b-e1.qv --local-dir models
 
 # 3. serve (OpenAI / llama-server compatible API on :8080)
-./build/qv_server --model models/qwen38-27b-e1.qv --tokenizer models/tokenizer.json \
+./build/qv_server --model models/qwen38-27b-e1.qv \
     --backend cuda --kv int4 --max-ctx 131072 --mtp --mtp-depth 2
 
 curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
@@ -126,7 +126,7 @@ Reading: at about equal bytes Q-Volta decodes and prefills faster and fits a lon
 - Prefill attention uses tensor cores (3.0-3.9x faster than the fp32 kernel; 4K/8K/16K end-to-end +9% / +15% / +28%), but only ~23% of tensor-core peak; prompts above 16K are not benchmarked against NInfer.
 
 ## What works
-- **Single-file model format `.qv`**: header + JSON index + bit-plane data in one file (base weights, MTP head). Legacy `.qv.json` + `.qv.bin` pairs still load. `tools/qv_pack.py` merges a pair into one file. Bit-plane, asymmetric group-64 quantization, 2-8 bits per tensor.
+- **Single-file model format `.qv`**: header + JSON index + bit-plane data in one file (base weights, MTP head). Legacy `.qv.json` + `.qv.bin` pairs still load. Since format_version 2 the file also embeds `tokenizer.json`, `chat_template.jinja`, `generation_config.json` and a `meta` object (GGUF style): `qv_server --model x.qv` needs no `--tokenizer`; `tools/qv_embed.py` adds them to an existing file without re-quantizing. Spec: docs/QV_FORMAT.md. `tools/qv_pack.py` merges a pair into one file. Bit-plane, asymmetric group-64 quantization, 2-8 bits per tensor.
 - **Converter** `tools/convert.py` (streams BF16 -> Q-Volta, optional PEFT LoRA merge, so the pi adapter works as a merged model; runtime LoRA is planned).
 - **CUDA backend**: int8-activation dp4a GEMV decode at 81-99% of HBM peak with CUDA graphs; batched prefill (dequant slab + cuBLAS HGEMM, in-kernel GDN recurrence); split-K decode attention; exact multi-token verify for MTP.
 - **CPU backend**: AVX2 int8 kernels, pinned spin-barrier thread pool, huge-page weights, batched prefill, exact MTP.

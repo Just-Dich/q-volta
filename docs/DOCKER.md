@@ -1,6 +1,6 @@
 # Docker
 
-Weights are not baked into the image: mount a directory with one `.qv` file and `tokenizer.json` at `/models`.
+Weights are not baked into the image: mount a directory with one self-contained `.qv` file (tokenizer, chat template and generation defaults are embedded, docs/QV_FORMAT.md) at `/models`. A side `tokenizer.json` is only needed for older files without embedded blobs.
 
 ## What was and was not verified
 The machine this was written on has **no container runtime**, so `docker build` itself has not been run by the authors. What was checked:
@@ -14,7 +14,7 @@ The machine this was written on has **no container runtime**, so `docker build` 
 
 ## Use
 ```bash
-hf download q-project/Qwen3.8-27B-QVolta qwen38-27b-e1.qv tokenizer.json --local-dir models
+hf download q-project/Qwen3.8-27B-QVolta qwen38-27b-e1.qv --local-dir models
 
 # GPU image (Tesla V100 / sm_70 kernels; needs the NVIDIA container toolkit)
 docker build -t q-volta .
@@ -33,7 +33,7 @@ scripts/docker_smoke.sh cuda ./models                      # build + health + on
 
 ## Behaviour
 - Entrypoint (`docker/entrypoint.sh`): runs `qv_server --host 0.0.0.0 --port ${QV_PORT:-8080}`; if no `--model`/`-m`/`LLAMA_ARG_MODEL` is given it uses `/models/model.qv`
-  or the first `/models/*.qv`; if no `--tokenizer` is given and `/models/tokenizer.json` exists it uses that. Everything after the image name is passed to `qv_server`
+  or the first `/models/*.qv`; if no `--tokenizer` is given and `/models/tokenizer.json` exists it passes that file (it then overrides the embedded tokenizer); otherwise the tokenizer embedded in the `.qv` is used. Everything after the image name is passed to `qv_server`
   and replaces the default `CMD`, e.g. `docker run ... q-volta --backend cuda --kv int4 --max-ctx 250100 --prefill-chunk 512 --mtp --mtp-depth 2`.
   Flags: [SERVER.md](SERVER.md), [SERVER_COMPAT.md](SERVER_COMPAT.md); llama-server style `LLAMA_ARG_*` variables work.
 - Defaults: GPU image `--backend cuda --kv int4 --max-ctx 131072` (fits a 16 GB V100 with the 10.4 GiB e1 file); CPU image `--backend cpu --threads 32`.
