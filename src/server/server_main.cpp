@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <thread>
@@ -181,6 +182,36 @@ int main(int argc, char** argv) {
         app->eng->sync();
     } catch (const std::exception& e) { return fail(std::string("model load failed: ") + e.what()); }
     app->backend_name = backend;
+    // ---- vision sidecar (Inkling image input)
+    try {
+        std::string vf = o.vision_file;
+        if (vf.empty() && !o.model.empty() && app->model_arch == "inkling2_loop") {
+            std::string base = o.model;
+            if (base.size() > 3 && base.compare(base.size() - 3, 3, ".qv") == 0) base.resize(base.size() - 3);
+            const size_t sl = base.find_last_of('/');
+            const std::string dir = sl == std::string::npos ? "." : base.substr(0, sl);
+            std::string fam = base;
+            if (const size_t d = fam.find_last_of('-'); d != std::string::npos && d > sl + 1) fam.resize(d);  // inkling2-mini-q3a5 -> inkling2-mini
+            for (const std::string& cand : {base + "-vision.qv", fam + "-vision.qv", dir + "/inkling2-mini-vision.qv"})
+                if (file_exists(cand)) { vf = cand; break; }
+        }
+        if (vf == "mock") {
+            app->venc = std::make_unique<qv::MockVisionEncoder>();
+        } else if (!vf.empty() && vf != "none") {
+            const bool cu = backend == "cuda";
+            app->venc = qv::vision::Encoder::create(vf, cu);
+            std::fprintf(stderr, "[qv_server] vision: %s (%s encoder, image tokens = ceil(h/40)*ceil(w/40), remote images %s, local root '%s')\n", vf.c_str(), app->venc->backend(),
+                         o.allow_remote_images ? "ALLOWED" : "off", o.image_root.c_str());
+        }
+        if (app->venc) {
+            app->image_token_id = app->tok.token_id(o.image_token);
+            if (app->image_token_id < 0) return fail("image token " + o.image_token + " is not in the tokenizer");
+            app->vsrc.allow_remote = o.allow_remote_images;
+            app->vsrc.limits.max_side = o.image_max_side;
+            std::error_code ec;
+            app->vsrc.local_root = o.image_root.empty() ? "" : std::filesystem::absolute(o.image_root, ec).string();
+        }
+    } catch (const std::exception& e) { return fail(std::string("vision load failed: ") + e.what()); }
     std::fprintf(stderr, "[qv_server] model loaded in %.1fs (backend=%s, threads=%d, n_ctx=%d, slots=%d, mtp=%d, tokenizer=%s)\n", std::chrono::duration<double>(Clock::now() - t0).count(),
                  backend.c_str(), eo.threads, o.ctx, app->n_slots, (int)o.mtp, tpath.c_str());
     app->ready = true;

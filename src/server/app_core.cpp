@@ -52,7 +52,7 @@ Value App::model_json() const {
     m.set("object", "model");
     Value arch = Value::object();
     Value in = Value::array(), out = Value::array();
-    in.push("text"); out.push("text");
+    in.push("text"); if (venc) in.push("image"); out.push("text");
     arch.set("input_modalities", std::move(in));
     arch.set("output_modalities", std::move(out));
     m.set("architecture", std::move(arch));
@@ -124,7 +124,7 @@ void App::handle_props(http::Conn& c) {
     r.set("model_ftype", model_arch == "mock" ? "mock" : "Q-Volta");
     r.set("model_path", o.model);
     Value mod = Value::object();
-    mod.set("vision", false);
+    mod.set("vision", venc != nullptr);
     mod.set("video", false);
     mod.set("audio", false);
     r.set("modalities", std::move(mod));
@@ -208,6 +208,7 @@ void App::handle_slot_action(const http::Request& req, http::Conn& c, int id) {
         cached_.clear();
         r.set("n_erased", n);
     } else if (action == "save") {
+        for (int c : cached_) if (c < 0) throw_error(400, "Unable to save slot: it holds image tokens (images are not serialised)");
         const std::string fn = body.find("filename")->as_string();
         FILE* f = std::fopen(slot_path(fn).c_str(), "wb");
         if (!f) throw_error(500, "Unable to save slot", "server_error");

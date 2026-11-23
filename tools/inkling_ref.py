@@ -322,7 +322,7 @@ class Inkling:
         return rb(residual + m_out, emu)
 
     # ---------------- model -----------------
-    def forward(self, ids, cache, want_trace=False, all_logits=False):
+    def forward(self, ids, cache, want_trace=False, all_logits=False, inject=None):
         t0 = time.time()
         emu = self.emu
         n = len(ids)
@@ -330,6 +330,10 @@ class Inkling:
         emb = self.s.f.get_slice("model.llm.embed.weight")
         x = torch.stack([emb[int(i):int(i) + 1][0] for i in ids]).float()
         h = rms_w(x, self.w("model.llm.embed_norm.weight"), emu)
+        if inject is not None:  # vision: inject = (bool mask [n], embeddings [mask.sum(), 2304]) replaces the post-embed_norm rows
+            m, e = inject
+            h = h.clone()
+            h[torch.as_tensor(m)] = torch.as_tensor(e).float()
         trace = {"emb": h.clone()} if want_trace else None
         blocks = h.new_zeros(n, 0, C.H)
         app = 0

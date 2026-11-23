@@ -32,7 +32,8 @@ const OwnFlag kOwn[] = {
     {"--mtp-depth", "mtp-depth", 1}, {"--prefill-chunk", "prefill-chunk", 1}, {"--tokenizer", "tokenizer", 1},
     {"--model-name", "alias", 1}, {"--max-ctx", "ctx-size", 1}, {"--http-threads", "threads-http", 1}, {"--max-queue", "max-queue", 1},
     {"--default-max-tokens", "predict", 1}, {"--quiet", "log-disable", 0}, {"--mock-text", "mock-text", 1},
-    {"--mock-loop", "mock-loop", 0}, {"--mlock", "mlock", 0}, {"--no-mlock", "no-mlock", 0}, {"--mmap", "mmap", 0}, {"--no-mmap", "no-mmap", 0}, {"--mock-delay-us", "mock-delay-us", 1},
+    {"--mock-loop", "mock-loop", 0}, {"--vision-file", "vision-file", 1}, {"--allow-remote-images", "allow-remote-images", 0}, {"--image-root", "image-root", 1},
+    {"--image-max-side", "image-max-side", 1}, {"--image-token", "image-token", 1}, {"--mlock", "mlock", 0}, {"--no-mlock", "no-mlock", 0}, {"--mmap", "mmap", 0}, {"--no-mmap", "no-mmap", 0}, {"--mock-delay-us", "mock-delay-us", 1},
 };
 
 bool truthy(const std::string& v) { return v == "1" || v == "on" || v == "enabled" || v == "true" || v == "yes"; }
@@ -96,7 +97,7 @@ const std::set<std::string>& handled() {
         "backend", "kv", "kv4-kmode", "mtp", "no-mtp", "mtp-depth", "prefill-chunk", "tokenizer", "max-queue", "mock-text", "mock-loop", "mock-delay-us",
         "reasoning-preserve", "context-shift", "warmup", "flash-attn", "mlock", "mmap", "no-mmap", "perf", "escape", "verbosity", "log-colors", "log-timestamps",
         "log-prefix", "kv-unified", "cache-idle-slots", "sse-ping-interval", "lora", "lora-scaled", "ssl-key-file", "ssl-cert-file", "hf-repo", "model-url", "docker-repo",
-        "hf-file", "hf-token", "offline", "no-mlock",
+        "hf-file", "hf-token", "offline", "no-mlock", "vision-file", "allow-remote-images", "image-root", "image-max-side", "image-token",
     };
     return s;
 }
@@ -200,6 +201,11 @@ void apply(Options& o, const Resolved& r, const std::string& flag, const std::st
     else if (c == "prefill-chunk") o.prefill_chunk = to_int(val, flag);
     else if (c == "tokenizer") o.tokenizer = val;
     else if (c == "max-queue") o.max_queue = to_int(val, flag);
+    else if (c == "vision-file") o.vision_file = val;
+    else if (c == "allow-remote-images") o.allow_remote_images = true;
+    else if (c == "image-root") o.image_root = val;
+    else if (c == "image-max-side") o.image_max_side = to_int(val, flag);
+    else if (c == "image-token") o.image_token = val;
     else if (c == "mock-text") o.mock_text = val;
     else if (c == "mock-loop") o.mock_loop = true;
     else if (c == "mock-delay-us") o.mock_delay_us = to_int(val, flag);

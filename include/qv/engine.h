@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -39,6 +40,13 @@ class Engine {
     virtual void step(int token, int pos) = 0;
     // Batched prefill of T tokens at positions [pos0, pos0+T); leaves logits of the last token ready.
     virtual void prefill(const int* tokens, int T, int pos0) = 0;
+    // Vision (Inkling engines): batched prefill where positions with mask[t] != 0 take their input embedding from `emb` instead of the token
+    // embedding (+ embed_norm): `emb` holds one hidden-size float row per masked position, packed in order. tokens[t] at masked positions is
+    // only a placeholder id. Leaves logits of the last token ready. Other engines throw.
+    virtual void prefill_embeds(const int* tokens, const float* emb, const unsigned char* mask, int T, int pos0) {
+        (void)tokens; (void)emb; (void)mask; (void)T; (void)pos0;
+        throw std::runtime_error("this engine does not support image embeddings");
+    }
     // Greedy decode n tokens; first = token at start_pos (argmax of the logits after the context).
     virtual void decode_greedy(int first, int start_pos, int n, std::vector<int>& out, bool use_graph) = 0;
     virtual int argmax() = 0;                         // greedy next token from the last step's logits

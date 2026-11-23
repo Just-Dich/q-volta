@@ -90,20 +90,46 @@ class InklingEngine final : public Engine {
         }
     }
 
-    void prefill(const int* tokens, int T, int pos0) override {
+    void prefill(const int* tokens, int T, int pos0) override { prefill_impl(tokens, nullptr, nullptr, T, pos0); }
+    // Vision: rows with mask[t] != 0 take their residual-stream input from `emb` (packed, one H-row per masked position, in order)
+    // instead of embed + embed_norm (docs/INKLING_VISION.md section 7).
+    void prefill_embeds(const int* tokens, const float* emb, const unsigned char* mask, int T, int pos0) override { prefill_impl(tokens, emb, mask, T, pos0); }
+    void prefill_impl(const int* tokens, const float* emb, const unsigned char* mask, int T, int pos0) {
         const bool batched = !opt_.dump_hidden && std::getenv("QV_INK_STEP_PREFILL") == nullptr;
         if (pos0 + T > opt_.max_ctx) throw std::runtime_error("context overflow");
         int off = 0;
+        const float* e = emb;
         while (off < T) {
             const int n = std::min(T - off, opt_.prefill_chunk);
+            const unsigned char* m = mask ? mask + off : nullptr;
             if (!batched || n < 4) {
-                for (int i = 0; i < n; ++i) step(tokens[off + i], pos0 + off + i);
+                for (int i = 0; i < n; ++i) {
+                    if (m && m[i]) { step_override(tokens[off + i], pos0 + off + i, e); e += ik::H; }
+                    else step(tokens[off + i], pos0 + off + i);
+                }
             } else {
-                prefill_chunk(tokens + off, n, pos0 + off);
+                prefill_chunk(tokens + off, n, pos0 + off, m, e);
+                if (m) for (int i = 0; i < n; ++i) if (m[i]) e += ik::H;
             }
             off += n;
         }
         QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
+    }
+    // single token whose embedding row is injected (uncaptured forward; used for <4-token chunks / debug paths)
+    void step_override(int token, int pos, const float* row) {
+        if (pos >= opt_.max_ctx) throw std::runtime_error("context overflow");
+        if (tp_n_ == TP_SLOTS) { QV_CUDA_CHECK(cudaStreamSynchronize(stream_)); tp_n_ = 0; }
+        int* tp = h_tp_ + 2 * tp_n_++;
+        tp[0] = token;
+        tp[1] = pos;
+        QV_CUDA_CHECK(cudaMemcpyAsync(d_tok_, tp, 2 * sizeof(int), cudaMemcpyHostToDevice, stream_));
+        if (!d_ovr_) { QV_CUDA_CHECK(cudaMalloc(&d_ovr_, ik::H * 4)); }
+        QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
+        QV_CUDA_CHECK(cudaMemcpy(d_ovr_, row, ik::H * 4, cudaMemcpyHostToDevice));
+        ovr_on_ = true;
+        forward();
+        ovr_on_ = false;
+        if (opt_.dump_hidden) collect_dump();
     }
 
     void decode_greedy(int first, int start_pos, int n, std::vector<int>& out, bool use_graph) override {
@@ -168,6 +194,8 @@ class InklingEngine final : public Engine {
     std::vector<LayerW> lw_;
     std::vector<App> apps_;
     QMat embed_, unembed_;
+    float* d_ovr_ = nullptr;  // vision: injected embedding row for step_override
+    bool ovr_on_ = false;
     const float *embed_norm_, *final_norm_, *out_query_, *msgq_ = nullptr;
     // state
     __half *lk_, *lv_, *gk_ = nullptr, *gv_ = nullptr;
@@ -471,13 +499,25 @@ class InklingEngine final : public Engine {
         ik::gate_apply_t(fT_, gT_, h, msg, (long)T * ik::H, out, stream_);
     }
 
-    void prefill_chunk(const int* tokens, int T, int pos0) {
+    void prefill_chunk(const int* tokens, int T, int pos0, const unsigned char* mask = nullptr, const float* emb = nullptr) {
         if (!cublas_) alloc_prefill();
         if (T > Tp_) throw std::runtime_error("prefill chunk larger than allocation");
         cudaStream_t s = stream_;
         QV_CUDA_CHECK(cudaMemcpyAsync(d_ptok_, tokens, T * 4, cudaMemcpyHostToDevice, s));  // caller keeps `tokens` alive until sync: copy via pinned below
         QV_CUDA_CHECK(cudaStreamSynchronize(s));
         ik::embed_norm(embed_, d_ptok_, embed_norm_, hT_, blocksT_, s, T);
+        if (mask) {  // vision: overwrite masked rows (runs of consecutive rows -> one copy each) in the hidden state and block 0
+            for (int i = 0; i < T;) {
+                if (!mask[i]) { ++i; continue; }
+                int j = i;
+                while (j < T && mask[j]) ++j;
+                QV_CUDA_CHECK(cudaMemcpyAsync(hT_ + (size_t)i * ik::H, emb, (size_t)(j - i) * ik::H * 4, cudaMemcpyHostToDevice, s));
+                QV_CUDA_CHECK(cudaMemcpyAsync(blocksT_ + (size_t)i * ik::H, emb, (size_t)(j - i) * ik::H * 4, cudaMemcpyHostToDevice, s));
+                QV_CUDA_CHECK(cudaStreamSynchronize(s));  // `emb` is pageable host memory: complete before it can change
+                emb += (size_t)(j - i) * ik::H;
+                i = j;
+            }
+        }
         const long TH = (long)Tp_ * ik::H;
         const InklingConfig& K = cfg_.ink;
         for (const App& A : apps_) {
@@ -698,6 +738,10 @@ class InklingEngine final : public Engine {
     void forward() {
         cudaStream_t s = stream_;
         ik::embed_norm(embed_, d_tok_, embed_norm_, h_, blocks_, s);
+        if (ovr_on_) {
+            QV_CUDA_CHECK(cudaMemcpyAsync(h_, d_ovr_, ik::H * 4, cudaMemcpyDeviceToDevice, s));
+            QV_CUDA_CHECK(cudaMemcpyAsync(blocks_, d_ovr_, ik::H * 4, cudaMemcpyDeviceToDevice, s));
+        }
         if (dump_d_) QV_CUDA_CHECK(cudaMemcpyAsync(dump_d_, h_, ik::H * 4, cudaMemcpyDeviceToDevice, s));
         for (const App& A : apps_) {
             run_app(A);

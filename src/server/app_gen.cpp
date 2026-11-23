@@ -349,6 +349,7 @@ Task App::parse_task(const Value& body, Kind kind) {
             } else if (!type.empty() && type != "text")
                 throw_error(400, "response_format type must be one of \"text\", \"json_object\" or \"json_schema\", but got: " + type);
         }
+        std::vector<std::string> image_urls;
         const Value* msgs = body.find("messages");
         if (!msgs) throw_error(400, "'messages' is required");
         if (!msgs->is_array()) throw_error(400, "Expected 'messages' to be an array");
@@ -363,9 +364,33 @@ Task App::parse_task(const Value& body, Kind kind) {
             if (c && c->is_array()) {
                 for (auto& part : c->items()) {
                     std::string pt = part.is_object() ? Body{part}.str("type", "") : "";
-                    if (pt == "image_url" || pt == "input_audio" || pt == "image" || pt == "video_url")
+                    if (pt == "input_audio" || pt == "video_url")
                         throw_error(500, "image input is not supported - hint: if this is unexpected, you may need to provide the mmproj", "server_error");
+                    if (pt == "image_url" || pt == "input_image" || pt == "image") {
+                        if (!venc) throw_error(500, "image input is not supported - hint: if this is unexpected, you may need to provide the mmproj", "server_error");
+                        std::string url;
+                        if (const Value* iu = part.find("image_url")) url = iu->is_string() ? iu->as_string() : (iu->is_object() && iu->find("url") && iu->find("url")->is_string() ? iu->find("url")->as_string() : "");
+                        else if (const Value* iu2 = part.find("url"); iu2 && iu2->is_string()) url = iu2->as_string();
+                        else if (const Value* iu3 = part.find("image"); iu3 && iu3->is_string()) url = iu3->as_string();
+                        if (url.empty()) throw_error(400, "image part has no url (expected {\"type\":\"image_url\",\"image_url\":{\"url\":...}})");
+                        image_urls.push_back(url);
+                    }
                 }
+            }
+        }
+        // decode + preprocess every image now (CPU, cheap) so that bad images are a clean 400 before anything streams
+        std::vector<std::shared_ptr<vision::Pixels>> images;
+        std::vector<uint64_t> image_hash;
+        for (auto& u : image_urls) {
+            try {
+                std::vector<uint8_t> bytes = vision::load_image_bytes(u, vsrc);
+                uint64_t h = 1469598103934665603ull;
+                for (uint8_t b : bytes) { h ^= b; h *= 1099511628211ull; }
+                vision::Rgb8 im = vision::decode_image(bytes.data(), bytes.size(), vsrc.limits);
+                images.push_back(std::make_shared<vision::Pixels>(vision::preprocess(im, venc->cfg())));
+                image_hash.push_back(h);
+            } catch (const vision::ImageError& e) {
+                throw_error(400, std::string("image: ") + e.what());
             }
         }
         ChatInput ci;
@@ -402,6 +427,27 @@ Task App::parse_task(const Value& body, Kind kind) {
         catch (const std::exception& e) { throw_error(400, e.what()); }
         t.prompt_text = co.prompt;
         t.prompt = tok.encode(co.prompt, true);
+        if (!images.empty() || (venc && image_token_id >= 0 && std::count(t.prompt.begin(), t.prompt.end(), image_token_id) > 0)) {
+            // each template placeholder token becomes one token per image embedding row (HF Inkling2Processor.replace_image_token)
+            size_t np = std::count(t.prompt.begin(), t.prompt.end(), image_token_id);
+            if (np != images.size()) throw_error(400, "the chat template produced " + std::to_string(np) + " image placeholders for " + std::to_string(images.size()) + " images");
+            std::vector<int> ex;
+            size_t k = 0;
+            for (int id : t.prompt) {
+                if (id != image_token_id) { ex.push_back(id); continue; }
+                ImagePart ip;
+                ip.start = (int)ex.size();
+                ip.n = images[k]->tokens();
+                ip.px = images[k];
+                for (int j = 0; j < ip.n; ++j) {  // negative pseudo id: unique per (image content, row) so the prompt cache can only match the identical image
+                    uint64_t h = (image_hash[k] ^ ((uint64_t)(j + 1) * 0x9E3779B97F4A7C15ull)) * 0xff51afd7ed558ccdull;
+                    ex.push_back(-1 - (int)((h >> 33) & 0x3fffffff));
+                }
+                t.images.push_back(ip);
+                ++k;
+            }
+            t.prompt = std::move(ex);
+        }
         t.thinking_open = co.thinking_open;
         t.think_start = co.think_start;
         t.think_end = co.think_end;
@@ -487,6 +533,25 @@ void App::lease_release(long) {
     cv_.notify_all();
 }
 
+// prefill prompt tokens [off, off+n) of a task with images: placeholder rows take the encoder rows (negative ids mark them)
+void App::prefill_with_images(const Task& t, int off, int n, const std::vector<std::vector<float>>& emb) {
+    const int H = venc->cfg().text_hidden;
+    std::vector<int> ids(t.prompt.begin() + off, t.prompt.begin() + off + n);
+    std::vector<unsigned char> mask(n, 0);
+    std::vector<float> rows;
+    for (size_t k = 0; k < t.images.size(); ++k) {
+        const ImagePart& ip = t.images[k];
+        const int a = std::max(off, ip.start), b = std::min(off + n, ip.start + ip.n);
+        for (int p = a; p < b; ++p) {
+            mask[p - off] = 1;
+            ids[p - off] = image_token_id >= 0 ? image_token_id : 0;
+            const float* src = emb[k].data() + (size_t)(p - ip.start) * H;
+            rows.insert(rows.end(), src, src + H);
+        }
+    }
+    eng->prefill_embeds(ids.data(), rows.data(), mask.data(), n, off);
+}
+
 GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::function<bool(const Chunk&)>& on_chunk, const std::function<void(int)>& on_start) {
     GenResult r;
     // ---- admission: FIFO ticket, slots are logical (one engine)
@@ -525,10 +590,19 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
         { std::lock_guard<std::mutex> lk(mu_); slots_[sid].n_prompt_cache = (int)start; }
         on_start(sid);
         auto tp0 = now();
+        std::vector<std::vector<float>> img_emb;  // encoder output per image (only images with rows at or after `start`)
+        for (auto& ip : t.images) {
+            img_emb.emplace_back();
+            if (ip.start + ip.n <= (int)start) continue;
+            if (!alive()) { r.aborted = true; return r; }
+            img_emb.back().resize((size_t)ip.n * venc->cfg().text_hidden);
+            venc->encode(*ip.px, img_emb.back().data());
+        }
         for (size_t off = start; off < (size_t)N; off += chunk) {
             if (!alive()) { r.aborted = true; return r; }
             int n = (int)std::min<size_t>(chunk, N - off);
-            eng->prefill(t.prompt.data() + off, n, (int)off);
+            if (t.images.empty()) eng->prefill(t.prompt.data() + off, n, (int)off);
+            else prefill_with_images(t, (int)off, n, img_emb);
             cached_.insert(cached_.end(), t.prompt.begin() + off, t.prompt.begin() + off + n);
             std::lock_guard<std::mutex> lk(mu_);
             slots_[sid].n_prompt_processed = (int)(off + n - start);
@@ -537,7 +611,9 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
         if (t.n_predict == 0) { r.stop_type = "limit"; r.tokens_cached = (int)cached_.size(); goto done; }
 
         {
-            Sampler sampler(t.sp, t.prompt);
+            std::vector<int> sprompt;
+            for (int id : t.prompt) if (id >= 0) sprompt.push_back(id);
+            Sampler sampler(t.sp, t.images.empty() ? t.prompt : sprompt);
             const bool constrained = !t.grammar.empty();
             if (constrained) {
                 grammar::Triggers trig;

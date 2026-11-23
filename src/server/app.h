@@ -20,6 +20,7 @@
 #include "server/http.h"
 #include "server/options.h"
 #include "tokenizer/tokenizer.h"
+#include "vision/vision.h"
 
 namespace qv::server {
 
@@ -44,8 +45,14 @@ struct TokProb {
     std::vector<std::tuple<int, std::string, std::vector<int>, float>> top;  // id, text, bytes, logprob or prob
 };
 
+struct ImagePart {       // one image inside Task::prompt: tokens [start, start+n) are image placeholders
+    int start = 0, n = 0;
+    std::shared_ptr<vision::Pixels> px;
+};
+
 struct Task {
     Kind kind = Kind::Native;
+    std::vector<ImagePart> images;  // chat requests with image_url parts; prompt holds negative pseudo ids at these positions (content-hash keyed)
     std::vector<int> prompt;
     std::string prompt_text;
     int n_predict = -1;
@@ -101,6 +108,9 @@ class App {
     Tokenizer tok;
     std::unique_ptr<Engine> eng;
     std::unique_ptr<ChatTemplates> tmpl;
+    std::unique_ptr<vision::Encoder> venc;  // null = no image input
+    vision::SourceOptions vsrc;
+    int image_token_id = -1;
     std::string backend_name, tokenizer_path, model_id, model_template, model_arch;
     std::vector<int> stop_ids;
     int n_ctx = 4096, chunk = 256, n_slots = 4, mtp_chunk = 8;
@@ -153,6 +163,7 @@ class App {
     long lease_acquire(const std::function<bool()>& alive);  // FIFO turn on the engine; -1 if the client left while waiting
     void lease_release(long ticket);
     struct Admission;
+    void prefill_with_images(const Task& t, int off, int n, const std::vector<std::vector<float>>& emb);
     GenResult generate(Task& t, const std::function<bool()>& alive, const std::function<bool(const Chunk&)>& on_chunk, const std::function<void(int)>& on_start);
     // ---- handlers
     void handle_completion(const http::Request&, http::Conn&, Kind);

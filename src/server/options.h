@@ -20,6 +20,12 @@ struct Options {
     int kv_mode = 0, kv4_kmode = 0;
     bool mtp = false;
     int mtp_depth = 1;
+    // ---- vision (Inkling image input; docs/INKLING_VISION.md)
+    std::string vision_file;           // sidecar .qv; "" = auto (<model stem>-vision.qv, then <dir>/<family>-vision.qv), "none" = off, "mock" = test encoder
+    bool allow_remote_images = false;  // http(s) image_url fetching (SSRF-guarded); data: URLs and files below --image-root always work
+    std::string image_root = ".";      // local image files / file:// URLs are only served from below this directory ("" disables)
+    int image_max_side = 4096;
+    std::string image_token = "<|unused_200054|>";
     // ---- http
     std::string host = "127.0.0.1";
     int port = 9931;                   // llama-server default of the reference commit

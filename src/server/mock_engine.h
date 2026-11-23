@@ -21,6 +21,11 @@ class MockEngine : public Engine {
     }
     void step(int, int pos) override { delay(1); k_ = pos + 1 - prompt_end_; }
     void prefill(const int*, int T, int pos0) override { delay(T / 8 + 1); prompt_end_ = pos0 + T; k_ = 0; }
+    void prefill_embeds(const int*, const float*, const unsigned char* mask, int T, int pos0) override {
+        for (int i = 0; i < T; ++i) n_embeds_ += mask[i] ? 1 : 0;
+        prefill(nullptr, T, pos0);
+    }
+    long n_embeds_ = 0;  // image rows received through prefill_embeds (tests)
     void decode_greedy(int first, int start_pos, int n, std::vector<int>& out, bool) override {
         out.resize(n);
         int tok = first;
@@ -58,4 +63,18 @@ class MockEngine : public Engine {
     void delay(int units) const { if (delay_us_ > 0) std::this_thread::sleep_for(std::chrono::microseconds((long)delay_us_ * units)); }
 };
 
+}  // namespace qv
+
+#include "vision/vision.h"
+namespace qv {
+// Test encoder (`--vision-file mock`): deterministic rows, hidden size 8, no weights.
+class MockVisionEncoder : public vision::Encoder {
+   public:
+    MockVisionEncoder() { cfg_.text_hidden = 8; }
+    const char* backend() const override { return "mock"; }
+    void encode(const vision::Pixels& p, float* out) override {
+        for (int i = 0; i < p.tokens() * 8; ++i) out[i] = 0.01f * (float)(i % 7);
+        last_ms = 0.1;
+    }
+};
 }  // namespace qv

@@ -140,6 +140,17 @@ class InkCpuEngine final : public Engine, public InklingCpuInfo {
             forward(tokens + c0, n, pos0 + c0, c0 + n == T ? 1 : 0, c0);
         }
     }
+    // Vision: masked rows take their input embedding from `emb` (packed rows, in order) instead of embed + embed_norm.
+    void prefill_embeds(const int* tokens, const float* emb, const unsigned char* mask, int T, int pos0) override {
+        if (pos0 + T > opt_.max_ctx) throw std::runtime_error("context overflow");
+        prep_dump(T);
+        const float* e = emb;
+        for (int c0 = 0; c0 < T; c0 += Tc_) {
+            const int n = std::min(Tc_, T - c0);
+            forward(tokens + c0, n, pos0 + c0, c0 + n == T ? 1 : 0, c0, mask + c0, e);
+            for (int i = 0; i < n; ++i) if (mask[c0 + i]) e += H;
+        }
+    }
     void decode_greedy(int first, int start_pos, int n, std::vector<int>& out, bool) override {
         out.resize(n);
         int tok = first;
@@ -924,14 +935,21 @@ class InkCpuEngine final : public Engine, public InklingCpuInfo {
     }
 
     // ------------------------------------------------------------------------------------------------ whole forward
-    void forward(const int* toks, int T, int pos0, int want_logits, int dump_off = 0) {
+    void forward(const int* toks, int T, int pos0, int want_logits, int dump_off = 0, const unsigned char* mask = nullptr, const float* emb = nullptr) {
         dump_off_ = dump_off;
         if (pos0 == 0) reset();
         const auto& ik = cfg_.ink;
         {
             Scope sc(this, P_EMB);
+            std::vector<int> eidx;
+            if (mask) {
+                eidx.resize(T);
+                int c = 0;
+                for (int t = 0; t < T; ++t) { eidx[t] = c; c += mask[t] ? 1 : 0; }
+            }
             par_t(T, [&](size_t b, size_t e, int) {
                 for (size_t t = b; t < e; ++t) {
+                    if (mask && mask[t]) { std::memcpy(hid_.data() + t * H, emb + (size_t)eidx[t] * H, H * 4); continue; }
                     float x[H];
                     embed_row(embed_, toks[t], x);
                     rms_w(x, embed_norm_, hid_.data() + t * H, H, 1e-6f);
