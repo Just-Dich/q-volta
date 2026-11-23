@@ -91,3 +91,5 @@ Validated against the HF PR tower on 6 images: pixels equal to 1.2e-7, embedding
 - Driven in headless Chromium (Playwright) against the mock backend: loads, streams markdown + reasoning, settings dialog, client-side tool call, Stop. Mismatches found and fixed: /tools and /cors-proxy 403, /v1/streams/lookup + resumable streams, prompt_progress, timings_per_token, SSE pings, /v1/chat/completions/control.
 - Added /v1/messages, /v1/messages/count_tokens, /v1/responses (event sequences diffed vs llama-server), --sleep-idle-seconds, --sse-ping-interval, --ui-config(-file).
 - Not implemented: router mode, /tools, /cors-proxy, embeddings, rerank, audio; log format differs; one decoding sequence.
+## p19/ink-mtp + p22/ink-mtp2 (2026-11-23) - Inkling MTP
+DSpark drafter graph reconstructed from vLLM and validated with a torch reference (mean accepted 3.5/7 on code); CUDA implementation with bit-exact batched verify, sidecar `inkling2-mini-mtp.qv` (258 MiB), server flags. Exact; speedup 0.55-1.73x depending on text, about 1.25x typical. Verify (2.5 ms per extra row) is the bottleneck; not optimised. See docs/INKLING_MTP.md.

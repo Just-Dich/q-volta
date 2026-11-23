@@ -26,6 +26,7 @@ struct Options {
     std::string image_root = ".";      // local image files / file:// URLs are only served from below this directory ("" disables)
     int image_max_side = 4096;
     std::string image_token = "<|unused_200054|>";
+    std::string mtp_file;  // Inkling: MTP sidecar container (default <model>-mtp.qv)
     // ---- http
     std::string host = "127.0.0.1";
     int port = 9931;                   // llama-server default of the reference commit

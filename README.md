@@ -138,7 +138,7 @@ Reading: at about equal bytes Q-Volta decodes and prefills faster and fits a lon
 Better quantization (smaller file at equal quality), runtime LoRA inside the model file, 256K context (int4 KV), adaptive MTP depth and a restricted draft vocabulary, server MTP, CPU prefill (fp32 scale overhead), ARM/NEON.
 
 ## Inkling-2-Mini
-The engine also runs thinkingmachines/Inkling-2-Mini (MoE, looped layers) on the V100 and the CPU backend: ~120 tok/s decode on the V100 through the server, no MTP yet. How to run it and what was measured: [docs/INKLING_RUN.md](docs/INKLING_RUN.md); design and parity with the Hugging Face implementation: [docs/INKLING_SPEC.md](docs/INKLING_SPEC.md), [docs/INKLING_ENGINE.md](docs/INKLING_ENGINE.md).
+The engine also runs thinkingmachines/Inkling-2-Mini (MoE, looped layers) on the V100 and the CPU backend: ~120 tok/s decode on the V100 through the server; exact MTP speculative decoding (sidecar drafter) gives about 1.25x on code at short context and 0.55-1.73x over the measured matrix (docs/INKLING_MTP.md). How to run it and what was measured: [docs/INKLING_RUN.md](docs/INKLING_RUN.md); design and parity with the Hugging Face implementation: [docs/INKLING_SPEC.md](docs/INKLING_SPEC.md), [docs/INKLING_ENGINE.md](docs/INKLING_ENGINE.md).
 
 ### Inkling vision (image input)
 `qv_server` accepts OpenAI `image_url` content parts for Inkling-2-Mini when the vision sidecar `inkling2-mini-vision.qv` (0.64 GB, made by `tools/convert_inkling_vision.py`) sits next to the model (or `--vision-file PATH`).

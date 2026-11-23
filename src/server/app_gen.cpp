@@ -638,6 +638,7 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
             const bool want_probs = t.n_probs > 0;
             const bool use_chunk = o.mtp && argmax_ok && !want_probs && !t.reasoning_end;
             std::vector<int> forced;
+            if (std::getenv("QV_MTP_DEBUG")) std::fprintf(stderr, "[qv_server] use_chunk=%d (mtp=%d argmax_ok=%d constrained=%d probs=%d)\n", (int)use_chunk, (int)o.mtp, (int)argmax_ok, (int)constrained, (int)want_probs);
             Chunk ck;
             bool hit_stop_word = false;
             const int budget = t.n_predict;  // <0: unlimited
@@ -751,6 +752,7 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
                 }
             }
             r.predicted_ms = ms(td0, now());
+            if (std::getenv("QV_MTP_DEBUG")) { qv::MtpStats ms_; eng->mtp_stats(ms_); std::fprintf(stderr, "[qv_server] mtp stats: cycles=%ld accepted=%ld plain_steps=%ld\n", ms_.cycles, ms_.accepted, ms_.plain_steps); }
             if (r.tokens_cached == 0) r.tokens_cached = (int)cached_.size();
         }
     } catch (const ApiError&) {
