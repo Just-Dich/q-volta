@@ -165,7 +165,16 @@ int main(int argc, char** argv) {
             qv::ModelFile mf = qv::ModelFile::open(stem);
             if (eo.mtp && mf.cfg.arch == "inkling2_loop") {  // Inkling MTP drafter: sidecar container, default <model>-mtp.qv; depth 3 unless given (depth 1 is slower than plain)
                 std::string base = stem.size() > 3 && stem.compare(stem.size() - 3, 3, ".qv") == 0 ? stem.substr(0, stem.size() - 3) : stem;
-                eo.mtp_file = o.mtp_file.empty() ? base + "-mtp.qv" : o.mtp_file;
+                auto exists = [](const std::string& f) { return std::ifstream(f).good(); };
+                if (!o.mtp_file.empty()) eo.mtp_file = o.mtp_file;
+                else if (exists(base + "-mtp.qv")) eo.mtp_file = base + "-mtp.qv";
+                else {  // quant suffix after the last '-' dropped: inkling2-mini-q3a5.qv -> inkling2-mini-mtp.qv
+                    const size_t d = base.rfind('-'), sl = base.rfind('/');
+                    const std::string alt = d != std::string::npos && (sl == std::string::npos || d > sl) ? base.substr(0, d) + "-mtp.qv" : "";
+                    if (!alt.empty() && exists(alt)) eo.mtp_file = alt;
+                    else return fail("--mtp: MTP sidecar not found (tried " + base + "-mtp.qv" + (alt.empty() ? "" : " and " + alt) + "); pass --mtp-file PATH");
+                }
+                app->mtp_chunk = 32;  // a speculative cycle commits up to depth+1 tokens; short chunks end in slow plain tail steps
                 if (eo.mtp_depth == 1) eo.mtp_depth = 3;
             }
             if (backend == "cpu") {
