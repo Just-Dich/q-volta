@@ -9,6 +9,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <thread>
 
 #include <map>
 
@@ -73,6 +74,7 @@ struct Task {
     bool return_progress = false;
     int sse_ping_interval = 30;  // seconds of silence before an SSE comment ping, <= 0 disables
     std::function<void(int total, int cache, int processed, double ms)> on_progress;
+    std::shared_ptr<std::atomic<bool>> reasoning_end;  // set by POST /v1/chat/completions/control {action: reasoning_end}
 };
 
 struct SlotInfo {
@@ -148,9 +150,20 @@ class App {
     int fim_pre = -1, fim_suf = -1, fim_mid = -1, fim_rep = -1, fim_sep = -1;
 
     void init_slots();
+    // --sleep-idle-seconds: the engine is destroyed after N idle seconds (VRAM / RAM freed) and rebuilt by `reload_engine` on the next task
+    std::function<std::unique_ptr<Engine>()> reload_engine;
+    std::atomic<bool> sleeping{false};
+    void start_sleep_watcher();
+    void stop_sleep_watcher();
+    int cached_n_embd = 0;
+    long long cached_weight_bytes = 0;
     void route(const http::Request& req, http::Conn& c);
 
    private:
+    std::thread sleep_thr_;
+    std::atomic<bool> sleep_stop_{false};
+    std::atomic<long long> last_task_ms_{0};
+    void ensure_engine();  // under the engine lease: wake from sleep
     // ---- engine queue + slots
     std::mutex mu_;
     std::condition_variable cv_;
@@ -176,6 +189,9 @@ class App {
     Value gen_settings(const Task& t, int flavor) const;
     Value timings_json(const GenResult& r) const;
     Value timings_json(int cache, int prompt_n, double prompt_ms, int pred_n, double pred_ms) const;
+    // reasoning control (POST /v1/chat/completions/control)
+    std::map<std::string, std::shared_ptr<std::atomic<bool>>> controls_;
+    void handle_control(const http::Request&, http::Conn&);
     // resumable streams
     std::mutex sm_;
     std::map<std::string, StreamSessionPtr> sessions_;

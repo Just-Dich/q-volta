@@ -473,6 +473,7 @@ struct ChunkView {
     bool has_choice = false, has_usage = false;
     long long prompt = 0, completion = 0, cached = 0;
     std::string id, model;
+    Value timings;
 };
 ChunkView view_of(const Value& c) {
     ChunkView v;
@@ -494,6 +495,7 @@ ChunkView view_of(const Value& c) {
                 }
         }
     }
+    if (const Value* tm = get(c, "timings")) v.timings = *tm;
     if (const Value* u = get(c, "usage"); u && u->is_object()) {
         v.has_usage = true;
         if (const Value* x = get(*u, "prompt_tokens")) v.prompt = x->as_int();
@@ -589,6 +591,7 @@ struct ResponsesXlate : StreamXlate {
     std::map<long long, Call> calls;
     ChunkView last;
     Parsed usage;
+    Value timings;
 
     std::vector<std::string> feed(const Value& chunk) override {
         std::vector<std::string> ev;
@@ -640,7 +643,7 @@ struct ResponsesXlate : StreamXlate {
                 ev.push_back(sse("response.function_call_arguments.delta", d));
             }
         }
-        if (v.has_usage && !v.has_choice) { usage.prompt = v.prompt; usage.completion = v.completion; usage.cached = v.cached; for (auto& s : finish()) ev.push_back(std::move(s)); }
+        if (v.has_usage && !v.has_choice) { timings = v.timings; usage.prompt = v.prompt; usage.completion = v.completion; usage.cached = v.cached; for (auto& s : finish()) ev.push_back(std::move(s)); }
         return ev;
     }
 
@@ -679,6 +682,7 @@ struct ResponsesXlate : StreamXlate {
         r.set("id", resp_id); r.set("object", "response"); r.set("created_at", (long long)std::time(nullptr)); r.set("status", "completed"); r.set("model", model);
         r.set("output", std::move(output)); r.set("usage", resp_usage(usage));
         Value d = obj(); d.set("type", "response.completed"); d.set("response", std::move(r));
+        if (!timings.is_null()) d.set("timings", timings);
         ev.push_back(sse("response.completed", d));
         return ev;
     }

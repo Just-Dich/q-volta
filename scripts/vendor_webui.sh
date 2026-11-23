@@ -22,8 +22,9 @@ for root, _, fs in os.walk(src):
         p = os.path.join(root, f); rel = os.path.relpath(p, src)
         d = open(p, "rb").read()
         o = os.path.join(dst, rel); os.makedirs(os.path.dirname(o), exist_ok=True)
-        with open(o, "wb") as fo, gzip.GzipFile(filename="", mode="wb", fileobj=fo, compresslevel=9, mtime=0) as g:  # mtime 0: reproducible ETags
+        with open(o, "wb") as fo, gzip.GzipFile(filename="", mode="wb", fileobj=fo, compresslevel=6, mtime=0) as g:  # mtime 0: reproducible ETags
             g.write(d)
+        with open(o, "r+b") as fo: fo.seek(9); fo.write(b"\x03")  # OS = Unix, like the gzip streams llama.cpp's CMake writes (identical bytes -> identical ETags)
         man.append((rel, hashlib.sha256(d).hexdigest(), len(d)))
 man.sort()
 open(os.path.join(out, "MANIFEST.sha256"), "w").write("".join(f"{h}  {r}  ({n} bytes)\n" for r, h, n in man))

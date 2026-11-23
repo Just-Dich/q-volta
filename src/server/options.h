@@ -26,6 +26,7 @@ struct Options {
     int http_threads = -1;
     int timeout = 3600;
     int sse_ping_interval = 30;
+    int sleep_idle_seconds = -1;
     std::string path, api_prefix;
     bool webui = true;
     std::string ui_config;             // --ui-config JSON (returned as props.ui_settings)

@@ -294,6 +294,7 @@ void App::parse_sampling(const Value& bv, Task& t) {
     t.id_slot = b.integer("id_slot", -1);
     t.timings_per_token = b.boolean("timings_per_token", false);
     t.return_progress = b.boolean("return_progress", false);
+    if (b.boolean("reasoning_control", false)) t.reasoning_end = std::make_shared<std::atomic<bool>>(false);
     t.sse_ping_interval = b.integer("sse_ping_interval", o.sse_ping_interval);
     t.return_tokens = b.boolean("return_tokens", false);
     t.stream = b.boolean("stream", false);
@@ -497,7 +498,8 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
     // ---- admission: FIFO ticket, slots are logical (one engine)
     long ticket = lease_acquire(alive);
     if (ticket < 0) { r.aborted = true; return r; }
-    struct Release { App& a; long ticket; ~Release() { a.lease_release(ticket); } } rel{*this, ticket};
+    struct Release { App& a; long ticket; ~Release() { a.last_task_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count(); a.lease_release(ticket); } } rel{*this, ticket};
+    try { ensure_engine(); } catch (const std::exception& e) { throw_error(503, std::string("model reload failed: ") + e.what(), "unavailable_error"); }
 
     int sid = 0;
     {
@@ -558,7 +560,8 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
             std::vector<int> lookahead;
             size_t la = 0;
             const bool want_probs = t.n_probs > 0;
-            const bool use_chunk = o.mtp && argmax_ok && !want_probs;
+            const bool use_chunk = o.mtp && argmax_ok && !want_probs && !t.reasoning_end;
+            std::vector<int> forced;
             Chunk ck;
             bool hit_stop_word = false;
             const int budget = t.n_predict;  // <0: unlimited
@@ -653,7 +656,14 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
                 }
                 eng->step(tk, (int)cached_.size());
                 cached_.push_back(tk);
-                tk = pick(tp, have_tp);
+                if (forced.empty() && t.reasoning_end && t.reasoning_end->exchange(false)) {
+                    // "skip reasoning": close the thinking block by feeding the end marker as if the model had written it
+                    const std::string seen = r.content + pending;
+                    const bool inside = (t.thinking_open || seen.find(t.think_start) != std::string::npos) && seen.find(t.think_end) == std::string::npos;
+                    if (inside) { auto ids = tok.encode("\n" + t.think_end + "\n\n", true); forced.assign(ids.begin(), ids.end()); }
+                }
+                if (!forced.empty()) { tk = forced.front(); forced.erase(forced.begin()); have_tp = false; }
+                else tk = pick(tp, have_tp);
             }
             if (!r.aborted && !hit_stop_word) {  // flush held-back text
                 pending += dec.flush();

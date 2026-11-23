@@ -1,6 +1,7 @@
 // Completion / chat / infill endpoints (native llama-server and OpenAI shapes).
 #include <algorithm>
 #include <random>
+#include <thread>
 
 #include "server/app.h"
 #include "jinja/chat.h"
@@ -90,6 +91,8 @@ void App::handle_completion(const http::Request& req, http::Conn& c, Kind kind, 
 
     const bool chat = kind == Kind::OaiChat, oai = kind != Kind::Native;
     const std::string id = oai ? "chatcmpl-" + rand_alnum(32) : "";
+    struct CtlGuard { App* a; std::string id; ~CtlGuard() { if (!id.empty()) { std::lock_guard<std::mutex> g(a->sm_); a->controls_.erase(id); } } } ctl_guard{this, ""};
+    if (chat) { std::lock_guard<std::mutex> g(sm_); controls_[id] = base.reasoning_end; ctl_guard.id = id; }
     const long long created = (long long)std::time(nullptr);
     const std::string fp = build_info;
     auto alive = [&] { return !c.peer_closed(); };
@@ -149,7 +152,9 @@ void App::handle_completion(const http::Request& req, http::Conn& c, Kind kind, 
         bool started = false, sock_ok = true;
         auto last_write = Clock::now();
         auto live = [&] { return session ? !session->cancelled() : sock_ok; };
+        std::mutex wmu;  // socket writes come from the generation thread and the ping thread
         auto emit_raw = [&](const std::string& bytes) {
+            std::lock_guard<std::mutex> g(wmu);
             if (session) session->append(bytes.data(), bytes.size());
             if (sock_ok) sock_ok = c.write_chunk(bytes);
             last_write = Clock::now();
@@ -169,10 +174,23 @@ void App::handle_completion(const http::Request& req, http::Conn& c, Kind kind, 
         };
         // SSE comment ping after `sse_ping_interval` seconds of silence (undici & co. time out on idle streams)
         const int ping_s = t.sse_ping_interval;
-        auto stream_alive = [&] {
-            if (started && ping_s > 0 && sock_ok && std::chrono::duration<double>(Clock::now() - last_write).count() > ping_s) emit_raw(":\n\n");
-            return session ? !session->cancelled() : !c.peer_closed();
-        };
+        auto stream_alive = [&] { return session ? !session->cancelled() : !c.peer_closed(); };
+        // the ping thread covers long prefill chunks, slow tokens and queue waits (the engine call cannot be interrupted)
+        struct Pinger {
+            std::thread th; std::mutex m; std::condition_variable cv; bool stop = false;
+            ~Pinger() { { std::lock_guard<std::mutex> g(m); stop = true; } cv.notify_all(); if (th.joinable()) th.join(); }
+        } pinger;
+        if (ping_s > 0) pinger.th = std::thread([&] {
+            std::unique_lock<std::mutex> lk(pinger.m);
+            while (!pinger.stop) {
+                pinger.cv.wait_for(lk, std::chrono::milliseconds(200));
+                if (pinger.stop) break;
+                double idle;
+                bool go;
+                { std::lock_guard<std::mutex> g(wmu); idle = std::chrono::duration<double>(Clock::now() - last_write).count(); go = started && sock_ok && idle > ping_s; }
+                if (go) emit_raw(":\n\n");
+            }
+        });
         const bool bool_ok_unused = true; (void)bool_ok_unused;
         GenResult total;
         int tot_dec = 0, tot_cache = 0;
@@ -399,6 +417,23 @@ void App::handle_completion(const http::Request& req, http::Conn& c, Kind kind, 
     if (fmt == ApiFmt::Responses && results.size() == 1) { respond_json(c, 200, oai_to_responses(results[0])); return; }
     if (results.size() == 1) respond_json(c, 200, results[0]);
     else { Value a = Value::array(); for (auto& r : results) a.push(std::move(r)); respond_json(c, 200, a); }
+}
+
+void App::handle_control(const http::Request& req, http::Conn& c) {
+    Value body;
+    try { body = jd::parse(req.body); } catch (const jd::ParseError& e) { throw_error(400, std::string("[json.exception.parse_error.101] parse error: ") + e.what()); }
+    auto str = [&](const char* k) { const Value* v = body.is_object() ? body.find(k) : nullptr; return v && v->is_string() ? v->as_string() : std::string(); };
+    const std::string id = str("id"), action = str("action");
+    if (id.empty()) throw_error(400, "missing completion id");
+    if (action != "reasoning_end") throw_error(400, "unknown control action");
+    std::shared_ptr<std::atomic<bool>> flag;
+    bool known = false;
+    { std::lock_guard<std::mutex> g(sm_); auto it = controls_.find(id); if (it != controls_.end()) { known = true; flag = it->second; } }
+    Value r = Value::object();
+    if (!known) { r.set("success", false); r.set("message", "no active completion for this id"); }
+    else if (!flag) { r.set("success", false); r.set("message", "reasoning control not enabled for this completion"); }
+    else { flag->store(true); r.set("success", true); }
+    respond_json(c, 200, r);
 }
 
 void App::handle_responses(const http::Request& req, http::Conn& c) {

@@ -98,7 +98,7 @@ const std::set<std::string>& handled() {
         "backend", "kv", "kv4-kmode", "mtp", "no-mtp", "mtp-depth", "prefill-chunk", "tokenizer", "max-queue", "mock-text", "mock-loop", "mock-delay-us",
         "reasoning-preserve", "context-shift", "warmup", "flash-attn", "mlock", "mmap", "no-mmap", "perf", "escape", "verbosity", "log-colors", "log-timestamps",
         "log-prefix", "kv-unified", "cache-idle-slots", "lora", "lora-scaled", "ssl-key-file", "ssl-cert-file", "hf-repo", "model-url", "docker-repo",
-        "hf-file", "hf-token", "offline", "no-mlock", "ui-config", "ui-config-file", "sse-ping-interval", "ui-mcp-proxy", "tools",
+        "hf-file", "hf-token", "offline", "no-mlock", "ui-config", "ui-config-file", "sse-ping-interval", "sleep-idle-seconds", "ui-mcp-proxy", "tools",
     };
     return s;
 }
@@ -183,6 +183,7 @@ void apply(Options& o, const Resolved& r, const std::string& flag, const std::st
         if (!o.ui_config.empty()) { try { (void)jd::parse(o.ui_config); } catch (const std::exception& e) { fail(std::string("failed to parse UI config: ") + e.what()); } }
     }
     else if (c == "ui-mcp-proxy") { if (!r.neg) warn("--ui-mcp-proxy: the CORS proxy (/cors-proxy) is not implemented by qv_server; the endpoint answers 403 as in a default llama-server"); }
+    else if (c == "sleep-idle-seconds") o.sleep_idle_seconds = to_int(val, flag);
     else if (c == "sse-ping-interval") o.sse_ping_interval = to_int(val, flag);
     else if (c == "tools") { o.tools = val; if (!val.empty()) warn("--tools: server-side built-in tools (/tools: shell, file read/write) are deliberately not implemented by qv_server; the endpoint answers 403"); }
     else if (c == "log-disable") o.log_disable = true;

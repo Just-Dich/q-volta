@@ -63,9 +63,9 @@ Value App::model_json() const {
     meta.set("n_vocab", tok.vocab_size());
     meta.set("n_ctx", n_ctx);
     meta.set("n_ctx_train", model_arch == "mock" ? n_ctx : 262144);
-    meta.set("n_embd", eng ? eng->config().hidden : 0);
+    meta.set("n_embd", cached_n_embd);
     meta.set("n_params", 0);
-    meta.set("size", eng ? (long long)eng->device_bytes_weights() : 0ll);
+    meta.set("size", cached_weight_bytes);
     meta.set("ftype", model_arch == "mock" ? "mock" : "Q-Volta");
     m.set("meta", std::move(meta));
     return m;
@@ -143,7 +143,7 @@ void App::handle_props(http::Conn& c) {
     r.set("bos_token", bos_id >= 0 ? tok.token_bytes(bos_id) : std::string());
     r.set("eos_token", eos_id >= 0 ? tok.token_bytes(eos_id) : std::string());
     r.set("build_info", build_info);
-    r.set("is_sleeping", false);
+    r.set("is_sleeping", sleeping.load());
     r.set("cors_proxy_enabled", false);
     respond_json(c, 200, r);
 }
@@ -206,6 +206,7 @@ void App::handle_slot_action(const http::Request& req, http::Conn& c, int id) {
     auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
     Value r = Value::object();
     r.set("id_slot", id);
+    ensure_engine();
     if (action == "erase") {
         long n = (long)cached_.size();
         eng->reset();
@@ -402,6 +403,7 @@ void App::route(const http::Request& req, http::Conn& c) {
         if (post && path == "/apply-template") { handle_apply_template(req, c); return; }
         if (post && (path == "/chat/completions/input_tokens" || path == "/v1/chat/completions/input_tokens")) { handle_count_tokens(req, c, ApiFmt::Oai); return; }
         if (post && (path == "/responses/input_tokens" || path == "/v1/responses/input_tokens")) { handle_count_tokens(req, c, ApiFmt::Responses); return; }
+        if (post && path == "/v1/chat/completions/control") { handle_control(req, c); return; }
         if (post && path == "/v1/messages/count_tokens") { handle_count_tokens(req, c, ApiFmt::Anthropic); return; }
         if (post && path == "/v1/messages") { handle_messages(req, c); return; }
         if (post && (path == "/v1/responses" || path == "/responses")) { handle_responses(req, c); return; }
@@ -425,12 +427,12 @@ void App::route(const http::Request& req, http::Conn& c) {
         if (post && (path == "/rerank" || path == "/reranking" || path == "/v1/rerank" || path == "/v1/reranking"))
             throw_error(501, "This server does not support reranking. Start it with `--reranking`", "not_supported_error");
         if (post && (path == "/v1/audio/transcriptions" ||
-                     path == "/v1/audio/speech" || path == "/tts" || path == "/v1/systemone" || path == "/v1/chat/completions/control"))
+                     path == "/v1/audio/speech" || path == "/tts" || path == "/v1/systemone"))
             throw_error(501, "Endpoint " + path + " is not implemented by qv_server", "not_supported_error");
         if (get && path == "/v1/stream") { handle_stream_get(req, c); return; }
         if (post && path == "/v1/streams/lookup") { handle_stream_lookup(req, c); return; }
         if (m == "DELETE" && path == "/v1/stream") { handle_stream_delete(req, c); return; }
-        if (get && frontend && serve_webui(req, c, path)) return;
+        if (get && (frontend || (o.webui && !o.path.empty())) && serve_webui(req, c, path)) return;
         // features that are off by default answer 403 (llama-server: server_setup_features)
         if ((get || post) && (path == "/tools" || path == "/cors-proxy")) {
             c.respond(403, kJson, R"({"error":{"message":"this feature is disabled","type":"feature_disabled"}})");
@@ -441,7 +443,7 @@ void App::route(const http::Request& req, http::Conn& c) {
         if (c.streaming && !c.broken) { c.write_chunk("data: " + error_json(e) + "\n\n"); c.end_chunks(); c.close_after = true; }
         else if (!c.broken) {
             std::string body = error_json(e);
-            if (e.status == 404) {  // httplib's error handler uses a different key order
+            if (e.status == 404 || e.status == 401 || (e.status == 503 && e.message == "Loading model")) {  // httplib's error handler / the llama-server middlewares use a different key order
                 Value err = Value::object();
                 err.set("message", e.message); err.set("type", e.type); err.set("code", e.status);
                 Value o2 = Value::object(); o2.set("error", std::move(err)); body = o2.dump();
@@ -455,4 +457,48 @@ void App::route(const http::Request& req, http::Conn& c) {
     }
 }
 
+}  // namespace qv::server
+
+namespace qv::server {
+static long long mono_ms() { return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count(); }
+
+void App::ensure_engine() {
+    last_task_ms_ = mono_ms();
+    if (eng) return;
+    auto t0 = Clock::now();
+    std::fprintf(stderr, "[qv_server] server is exiting sleeping state (reloading the model)\n");
+    eng = reload_engine();
+    eng->sync();
+    cached_.clear();
+    sleeping = false;
+    std::fprintf(stderr, "[qv_server] model reloaded in %.1fs\n", std::chrono::duration<double>(Clock::now() - t0).count());
+}
+
+void App::start_sleep_watcher() {
+    if (o.sleep_idle_seconds <= 0 || !reload_engine) return;
+    last_task_ms_ = mono_ms();
+    sleep_thr_ = std::thread([this] {
+        while (!sleep_stop_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            if (!ready || sleeping || !eng) continue;
+            if (mono_ms() - last_task_ms_ < 1000LL * o.sleep_idle_seconds) continue;
+            long ticket;
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                if (waiting_ != 0 || serving_ != next_ticket_) continue;  // busy
+                ticket = next_ticket_++;                                 // engine lease: nothing else can start while we unload
+            }
+            {
+                struct Rel { App& a; long t; ~Rel() { a.lease_release(t); } } rel{*this, ticket};
+                if (mono_ms() - last_task_ms_ >= 1000LL * o.sleep_idle_seconds && eng) {
+                    std::fprintf(stderr, "[qv_server] server is entering sleeping state (idle for %d s): model unloaded\n", o.sleep_idle_seconds);
+                    eng.reset();
+                    cached_.clear();
+                    sleeping = true;
+                }
+            }
+        }
+    });
+}
+void App::stop_sleep_watcher() { sleep_stop_ = true; if (sleep_thr_.joinable()) sleep_thr_.join(); }
 }  // namespace qv::server

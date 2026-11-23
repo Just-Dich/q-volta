@@ -154,38 +154,47 @@ int main(int argc, char** argv) {
     eo.threads = o.threads > 0 ? o.threads : (int)std::min(32u, std::max(1u, std::thread::hardware_concurrency()));
     app->chunk = o.prefill_chunk > 0 ? o.prefill_chunk : (o.ubatch > 0 ? o.ubatch : (backend == "cuda" ? 2048 : 256));
     eo.prefill_chunk = app->chunk;
-    try {
+    auto make_engine = [&]() -> std::unique_ptr<qv::Engine> {
+        std::unique_ptr<qv::Engine> eng;
         if (backend == "mock") {
             if (const char* ms = std::getenv("QV_MOCK_LOAD_MS")) std::this_thread::sleep_for(std::chrono::milliseconds(std::atoi(ms)));
             auto script = app->tok.encode(o.mock_text, false);
-            app->eng = std::make_unique<qv::MockEngine>(app->tok.vocab_size(), script, app->eos_id, o.mock_loop, o.mock_delay_us);
-            app->model_arch = "mock";
+            eng = std::make_unique<qv::MockEngine>(app->tok.vocab_size(), script, app->eos_id, o.mock_loop, o.mock_delay_us);
         } else {
-            if (o.model.empty()) return fail("no model: pass -m MODEL (or set LLAMA_ARG_MODEL)");
+            if (o.model.empty()) throw std::runtime_error("no model: pass -m MODEL (or set LLAMA_ARG_MODEL)");
             qv::ModelFile mf = qv::ModelFile::open(stem);
             if (backend == "cpu") {
 #ifdef QV_HAVE_CPU
-                app->eng = qv::make_cpu_engine(mf, eo);
+                eng = qv::make_cpu_engine(mf, eo);
 #else
-                return fail("this build has no CPU engine");
+                throw std::runtime_error("this build has no CPU engine");
 #endif
             } else {
 #ifdef QV_HAVE_CUDA
-                app->eng = qv::make_cuda_engine(mf, eo);
+                eng = qv::make_cuda_engine(mf, eo);
 #else
-                return fail("this build has no CUDA engine (configure with -DQV_CUDA=ON)");
+                throw std::runtime_error("this build has no CUDA engine (configure with -DQV_CUDA=ON)");
 #endif
             }
-            app->model_arch = app->eng->config().arch;
         }
+        return eng;
+    };
+    try {
+        app->eng = make_engine();
+        app->model_arch = backend == "mock" ? "mock" : app->eng->config().arch;
+        app->cached_n_embd = backend == "mock" ? 0 : app->eng->config().hidden;
+        app->cached_weight_bytes = backend == "mock" ? 0 : (long long)app->eng->device_bytes_weights();
         app->eng->sync();
     } catch (const std::exception& e) { return fail(std::string("model load failed: ") + e.what()); }
+    app->reload_engine = make_engine;
     app->backend_name = backend;
     std::fprintf(stderr, "[qv_server] model loaded in %.1fs (backend=%s, threads=%d, n_ctx=%d, slots=%d, mtp=%d, tokenizer=%s)\n", std::chrono::duration<double>(Clock::now() - t0).count(),
                  backend.c_str(), eo.threads, o.ctx, app->n_slots, (int)o.mtp, tpath.c_str());
     app->ready = true;
+    app->start_sleep_watcher();
     std::fprintf(stderr, "[qv_server] server is listening on http://%s:%d (model id \"%s\")\n", host.c_str(), srv.port(), app->model_id.c_str());
     http_thread.join();
+    app->stop_sleep_watcher();
     g_server = nullptr;
     std::fprintf(stderr, "[qv_server] shut down\n");
     return 0;
