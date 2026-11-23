@@ -62,6 +62,15 @@ class InklingEngine final : public Engine {
         load_weights(mf);
         bind(mf);
         alloc_state();
+        if (opt.mtp && !opt.mtp_file.empty()) {
+            load_mtp(opt.mtp_file);
+            mtp_ = true;
+            alloc_mtp();
+            int ones[16];
+            for (int i = 0; i < 16; ++i) ones[i] = i + 1;
+            d_dummy_i_ = dalloc<int>(16);
+            QV_CUDA_CHECK(cudaMemcpy(d_dummy_i_, ones, sizeof ones, cudaMemcpyHostToDevice));
+        }
         reset();
     }
     ~InklingEngine() override {
@@ -69,8 +78,10 @@ class InklingEngine final : public Engine {
         if (g_fwd_) cudaGraphExecDestroy(g_fwd_);
         if (g_dec_) cudaGraphExecDestroy(g_dec_);
         if (h_tp_) cudaFreeHost(h_tp_);
+        for (int i = 0; i < 9; ++i) if (g_mtp_[i]) cudaGraphExecDestroy(g_mtp_[i]);
         for (void* p : allocs_) cudaFree(p);
         cudaFree(weights_);
+        if (mw_) cudaFree(mw_);
         cudaStreamDestroy(stream_);
     }
 
@@ -87,6 +98,7 @@ class InklingEngine final : public Engine {
         } else {
             if (!g_fwd_) g_fwd_ = capture(false);
             QV_CUDA_CHECK(cudaGraphLaunch(g_fwd_, stream_));
+            if (mtp_) mtp_ingest(featv_, 1, 0, d_pos_, nullptr, nullptr);
         }
     }
 
@@ -139,6 +151,11 @@ class InklingEngine final : public Engine {
         tp[0] = first;
         tp[1] = start_pos;
         QV_CUDA_CHECK(cudaMemcpyAsync(d_tok_, tp, 2 * sizeof(int), cudaMemcpyHostToDevice, stream_));
+        if (mtp_ && opt_.mtp) {
+            QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
+            mtp_decode(first, start_pos, n, out);
+            return;
+        }
         if (use_graph && !g_dec_) g_dec_ = capture(true);
         for (int i = 0; i < n; ++i) {
             if (use_graph) {
@@ -177,6 +194,8 @@ class InklingEngine final : public Engine {
     const std::vector<float>& hidden_dump() const override { return hidden_; }
     const std::vector<float>& logits_dump() const override { return logits_dump_; }
     const std::vector<int>& aux_dump() const override { return rids_; }
+    void set_mtp_enabled(bool e) override { opt_.mtp = e; }
+    void mtp_stats(MtpStats& st) const override { st = mstats_; }
     void sync() override { QV_CUDA_CHECK(cudaStreamSynchronize(stream_)); }
     size_t device_bytes_weights() const override { return weights_bytes_; }
     size_t device_bytes_state() const override { return state_bytes_; }
@@ -453,6 +472,7 @@ class InklingEngine final : public Engine {
         arawT_ = palloc<float>(T * H); ymoeT_ = palloc<float>(T * H); mrawT_ = palloc<float>(T * H); prevhT_ = palloc<float>(T * H);
         prevb2T_ = palloc<float>(T * H); uT_ = palloc<float>(3 * T * H); gsT_ = palloc<float>(3 * T * H); msgsT_ = palloc<float>(4 * T * H);
         PB_ = palloc<float>(T * ik::PS); xmf_ = palloc<float>(T * H); router32_ = palloc<float>((size_t)24 * 128 * H); rlogT_ = palloc<float>(T * 128); wtsT_ = palloc<float>(T * 8);
+        if (mtp_) { featT_ = palloc<float>(T * 4 * H); finT_ = palloc<float>(T * H); }
         g32_ = palloc<float>(T * 64); fT_ = palloc<float>(T * H); gT_ = palloc<float>(T * H);
         xhT_ = palloc<__half>(3 * T * H); xmh_ = palloc<__half>(T * H); qh_ = palloc<__half>(T * 3072); relh_ = palloc<__half>(T * 24 * 16);
         rlT_ = palloc<__half>(T * 24 * 1024); o16_ = palloc<__half>(T * 3072);
@@ -522,6 +542,9 @@ class InklingEngine final : public Engine {
         const InklingConfig& K = cfg_.ink;
         for (const App& A : apps_) {
             prefill_app(A, T, pos0);
+            if (mtp_ && (A.idx == 4 || A.idx == 22 || A.idx == 40))
+                QV_CUDA_CHECK(cudaMemcpy2DAsync(featT_ + (size_t)(A.idx == 4 ? 0 : A.idx == 22 ? 1 : 2) * ik::H, 4 * ik::H * 4, hT_, ik::H * 4, ik::H * 4, T,
+                                                cudaMemcpyDeviceToDevice, s));
             if (g_pfdump) {
                 QV_CUDA_CHECK(cudaStreamSynchronize(s));
                 hidden_.resize((size_t)50 * ik::H);
@@ -532,6 +555,14 @@ class InklingEngine final : public Engine {
                 ik::copy_f32(hT_, prevhT_, TH, s);
                 ik::copy_f32(blocksT_ + 2 * TH, prevb2T_, TH, s);
             }
+        }
+        if (mtp_) {  // final-norm features of all rows, then the drafter's context K/V of the chunk
+            ik::ArArgs f2;
+            f2.mode = 0; f2.B = 4; f2.Q = 1; f2.mix = 1; f2.epi = 2; f2.ntok = Tp_; f2.allpar = 1;
+            f2.h = hT_; f2.blocks = blocksT_; f2.queries = out_query_; f2.nw[0] = final_norm_; f2.xh_out = xhT_; f2.xn_out = finT_;
+            ik::attn_res(f2, T, s);
+            QV_CUDA_CHECK(cudaMemcpy2DAsync(featT_ + (size_t)3 * ik::H, 4 * ik::H * 4, finT_, ik::H * 4, ik::H * 4, T, cudaMemcpyDeviceToDevice, s));
+            for (int g = 0; g < T; g += RR) mtp_ingest(featT_ + (size_t)g * 4 * ik::H, std::min(RR, T - g), pos0 + g, nullptr, nullptr, nullptr);
         }
         // last token: final mix + norm + head
         ik::ArArgs f;
@@ -745,6 +776,8 @@ class InklingEngine final : public Engine {
         if (dump_d_) QV_CUDA_CHECK(cudaMemcpyAsync(dump_d_, h_, ik::H * 4, cudaMemcpyDeviceToDevice, s));
         for (const App& A : apps_) {
             run_app(A);
+            if (mtp_ && (A.idx == 4 || A.idx == 22 || A.idx == 40))
+                QV_CUDA_CHECK(cudaMemcpyAsync(featv_ + (size_t)(A.idx == 4 ? 0 : A.idx == 22 ? 1 : 2) * ik::H, h_, ik::H * 4, cudaMemcpyDeviceToDevice, s));
             if (A.L == cfg_.ink.loop_end - 1 && A.p < cfg_.ink.loop_passes - 1) {  // messages for the next pass
                 ik::ArArgs m;
                 m.mode = 0; m.B = 1; m.Q = 4; m.mix = 1; m.epi = 0;
@@ -758,6 +791,7 @@ class InklingEngine final : public Engine {
         f.h = h_; f.blocks = blocks_; f.queries = out_query_; f.nw[0] = final_norm_; f.xn_out = xn_f_; f.q8 = q8x_;
         ik::attn_res(f, 1, s);
         if (dump_d_) QV_CUDA_CHECK(cudaMemcpyAsync(dump_d_ + 49 * ik::H, xn_f_, ik::H * 4, cudaMemcpyDeviceToDevice, s));
+        if (mtp_) QV_CUDA_CHECK(cudaMemcpyAsync(featv_ + (size_t)3 * ik::H, xn_f_, ik::H * 4, cudaMemcpyDeviceToDevice, s));
         gemv_q8(unembed_, q8x_, logits_, nullptr, s);
         ik::softcap_inplace(logits_, cfg_.ink.unpadded_vocab, cfg_.ink.final_logit_softcap, s);
     }
@@ -893,6 +927,8 @@ class InklingEngine final : public Engine {
             QV_CUDA_CHECK(cudaMemcpyAsync(rid_d_ + A.idx * 8, ids_, 32, cudaMemcpyDeviceToDevice, s));
         }
     }
+
+#include "cuda_inkling_mtp.inc"
 };
 
 }  // namespace

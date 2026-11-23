@@ -48,6 +48,7 @@ int main(int argc, char** argv) {
     bool gen = false, dbench = false;
     int synth_ctx = 0;
     int mtp_depth = 1;
+    std::string mtp_file;
     int n = 128, max_ctx = 4096, warm = 8, chunk = -1;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -63,6 +64,7 @@ int main(int argc, char** argv) {
         else if (a == "--prefill-chunk") chunk = std::stoi(next());
         else if (a == "--mtp") mtp = true;
         else if (a == "--mtp-depth") mtp_depth = std::stoi(next());
+        else if (a == "--mtp-file") mtp_file = next();
         else if (a == "--graph") graph = true;
         else if (a == "--tail") tail = std::stoi(next());
         else if (a == "--sparse-list") sparse_list = next();
@@ -90,6 +92,11 @@ int main(int argc, char** argv) {
     opt.threads = threads;
     opt.mtp = mtp;
     opt.mtp_depth = mtp_depth;
+    if (mtp && mtp_file.empty()) {  // Inkling: default sidecar next to the model: <model>-mtp.qv
+        std::string base = model.size() > 3 && model.compare(model.size() - 3, 3, ".qv") == 0 ? model.substr(0, model.size() - 3) : model;
+        mtp_file = base + "-mtp.qv";
+    }
+    opt.mtp_file = mtp_file;
     if (kv != "fp32" && kv != "fp16" && kv != "int4") { std::fprintf(stderr, "--kv fp32|fp16|int4\n"); return 2; }
     opt.kv_mode = kv == "int4" ? 1 : kv == "fp16" ? 2 : 0;
     opt.kv4_kmode = kmode == "token" ? 1 : 0;
