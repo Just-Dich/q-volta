@@ -1238,6 +1238,54 @@ def test_structure_matches_llama(pair, c):
     assert not problems, "\n" + "\n".join(problems)
 
 
+PW_PY = os.environ.get("PLAYWRIGHT_PY", "/tmp/pwenv/bin/python")
+PW_BROWSERS = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "/tmp/pwbrowsers")
+BROWSER_SCRIPT = os.path.join(ROOT, "tests", "webui_browser_check.py")
+
+
+def run_browser(url, *flags):
+    out = tempfile.mkdtemp(prefix="webui_shots_")
+    r = subprocess.run([PW_PY, BROWSER_SCRIPT, url, out] + list(flags), capture_output=True, text=True, timeout=180, env=dict(os.environ, PLAYWRIGHT_BROWSERS_PATH=PW_BROWSERS))
+    assert r.returncode == 0, r.stderr[-2000:]
+    return json.loads(r.stdout.strip().splitlines()[-1]), out
+
+
+@pytest.mark.skipif(not (os.path.exists(PW_PY) and os.path.isdir(PW_BROWSERS)), reason="playwright + chromium not installed (see tests/webui_browser_check.py)")
+def test_webui_in_browser():
+    """The real UI in headless Chromium: loads, shows the model, streams an answer with reasoning, runs a browser tool call, stops a generation."""
+    s = Srv(qv_cmd("--mock-text", "The user says hi.\n</think>\n\nHello from **Q-Volta**!\n\n1. one\n2. two\n", "--temp", "0", "--top-k", "1", "--mock-delay-us", "20000", "-a", "mock-model"), name="browser")
+    try:
+        res, out = run_browser(f"http://127.0.0.1:{s.port}/")
+        assert not res["page_errors"], res["page_errors"]
+        assert "Hello from Q-Volta!" in res["text"].replace("\n", " ") or "Hello from" in res["text"], res["text"][-400:]
+        calls = {(m, p.split("?")[0]): st for m, p, st in res["requests"]}
+        assert calls[("GET", "props")] == 200 and calls[("GET", "v1/models")] == 200 and calls[("POST", "v1/chat/completions")] == 200 and calls[("POST", "v1/streams/lookup")] == 200
+        assert calls[("GET", "tools")] == 403            # server tools are disabled by default, the UI copes
+        assert "Settings" in res["settings_text"] and "API Key" in res["settings_text"]
+        for f in ("webui_home.png", "webui_streaming.png", "webui_chat.png", "webui_settings.png"): assert os.path.getsize(os.path.join(out, f)) > 5000
+    finally:
+        s.stop()
+    s = Srv(qv_cmd("--mock-text", "I will check the time.\n</think>\n\n" + "<tool_call>\n<function=get_datetime>\n</function>\n</tool_call>", "--temp", "0", "--top-k", "1", "--mock-delay-us", "20000"), name="browser_tool")
+    try:
+        res, _ = run_browser(f"http://127.0.0.1:{s.port}/", "--tool", "--prompt", "what time is it?", "--wait", "5")
+        n_chat = sum(1 for m, p, st in res["requests"] if p == "v1/chat/completions")
+        assert n_chat >= 2, "the UI must run the browser-side tool and send the tool result back (2nd completion request)"
+        assert "Current time" in res["text"]
+    finally:
+        s.stop()
+    s = Srv(qv_cmd("--mock-text", "word " * 200, "--mock-delay-us", "100000"), name="browser_stop")
+    try:
+        res, _ = run_browser(f"http://127.0.0.1:{s.port}/", "--stop")
+        assert not res["page_errors"]
+        dels = [r for r in res["requests"] if r[0] == "DELETE" and r[1].startswith("v1/stream")]
+        assert dels and dels[0][2] == 204, res["requests"]
+        t0 = time.time()
+        while time.time() - t0 < 5 and any(x["is_processing"] for x in s.req("GET", "/slots")[2]): time.sleep(0.1)
+        assert not any(x["is_processing"] for x in s.req("GET", "/slots")[2]), "Stop in the UI must end the generation on the server"
+    finally:
+        s.stop()
+
+
 # ---- web UI routes and Anthropic / Responses endpoints against the real llama-server (UI enabled in both)
 UI_PATHS = ["/", "/index.html", "/build.json", "/sw.js", "/service-worker.js", "/manifest.webmanifest", "/_app/version.json", "/favicon.svg", "/favicon.ico", "/nope.js", "/tools", "/cors-proxy"]
 UI_HDRS = ("content-type", "content-encoding", "cache-control", "cross-origin-embedder-policy", "cross-origin-opener-policy")
