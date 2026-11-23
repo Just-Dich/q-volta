@@ -1,0 +1,1 @@
+{"engine": "llama.cpp", "tag": "IQ3_XXS_im", "mode": "none", "tokens": 4096, "window": 512, "scored": 4088, "ppl": 8.99197, "mean_nll": 2.196332}

@@ -184,3 +184,13 @@ Correctness: greedy 32/32 vs the Q3A5 reference goldens on all four prompts (ste
 Prefill (4K prompt): chunk 2048 2118 tok/s, chunk 4096 2764 tok/s (target 2500 met at chunk 4096). 8K 2005 tok/s, 32K 1830, 128K 1164, 256K 766 (int4, chunk 2048, includes quadratic attention; 256K = 334 s).
 Passkey (chat template via HF tokenizers, key at 50 % depth, greedy 200 tokens): found at 8K, 32K, 128K and 256K with int4 KV; also 32K fp16.
 Decode is ~33 % of the HBM bound: latency-bound small kernels (see INKLING_ENGINE.md). "Synthetic" = decode over unwritten KV at that position (speed only).
+
+## Comparison with llama.cpp on the same V100 (p18/compare, 2026-11-21..23)
+Protocol, commands, caveats and the full table: benchmarks/compare/README.md; data: benchmarks/compare/results.json and raw/. llama.cpp 9d6f04f CUDA sm_70, `-fa 1 -ngl 99`, 3 interleaved rounds under /tmp/qv_bench.lock, SM clock 1530 MHz. Quality reference: llama.cpp Q8_0 GGUF (proxy: ppl 8.467 vs BF16 8.468 on 8x512), same 4088-token wikitext window for ppl/KL on both engines.
+| model | GiB | ppl 8x512 | ppl 4088 | KL to Q8_0 | tg128 / decode tok/s | pp2048 | max ctx |
+|---|---:|---:|---:|---:|---:|---:|---|
+| llama.cpp Q3_K_M | 12.77 | 8.905 | 6.047 | 0.0535 | 42.3 | 931 | 39.9K f16 / 74.8K q8_0 / 132.1K q4_0 |
+| Q-Volta e0 | 12.63 | 9.511 | 6.257 | 0.1018 | 52.2 | 1250 | 38.9K fp16 / 140.3K int4 |
+| llama.cpp IQ3_XXS + imatrix | 10.89 | 8.992 | 6.102 | 0.0751 | 38.7 | 779 | 70.7K / 129.0K / 219.1K |
+| Q-Volta e1 | 10.44 | 9.278 | 6.281 | 0.0923 | 57.6 | 1250 | 74.8K fp16 / 267.3K int4 |
+MTP (llama.cpp `--spec-type draft-mtp`, supported for qwen35): code 74.8 (Q3_K_M) / 68.8 (IQ3_XXS) vs Q-Volta 131.7 (e0) / 135.9 (e1); prose 56.9 / 52.6 vs 86.5 / 93.8. Verdict: Q-Volta is faster (decode +23%/+49%, prefill +34%/+57% at 2048) and fits more int4 KV; llama.cpp is better in quality at equal bytes. llama.cpp's MTP output equality with plain greedy was not checked.
