@@ -33,7 +33,7 @@ class Conn {
     bool send_all(std::string_view s);  // false on error / peer gone
     bool peer_closed();                 // non-blocking check for FIN/RST
     // Whole response with Content-Length (status >= 400 closes the connection, like llama-server).
-    bool respond(int status, const std::string& content_type, const std::string& body, const Headers& extra = {});
+    bool respond(int status, const std::string& content_type, std::string_view body, const Headers& extra = {});
     // Streaming: headers with Transfer-Encoding: chunked, then write_chunk()*, then end_chunks().
     bool begin_stream(int status, const std::string& content_type, const Headers& extra = {});
     bool write_chunk(std::string_view data);

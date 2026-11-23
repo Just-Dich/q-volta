@@ -54,15 +54,19 @@ static Value apply_response_fields(const Value& rf, Value&& res) {
     return o;
 }
 
-void App::handle_completion(const http::Request& req, http::Conn& c, Kind kind) {
+void App::handle_completion(const http::Request& req, http::Conn& c, Kind kind, ApiFmt fmt, const Value* body_in) {
     Value body;
-    try { body = jd::parse(req.body); }
-    catch (const jd::ParseError& e) { throw_error(400, std::string("[json.exception.parse_error.101] parse error: ") + e.what()); }
+    if (body_in) body = *body_in;
+    else {
+        try { body = jd::parse(req.body); }
+        catch (const jd::ParseError& e) { throw_error(400, std::string("[json.exception.parse_error.101] parse error: ") + e.what()); }
+    }
     if (!body.is_object() && kind == Kind::OaiChat) throw_error(400, "'messages' is required");
 
     // ---- prompts (native /completion accepts an array of prompts: one result per prompt, non-streaming)
     std::vector<std::vector<int>> prompts;
     Task base = parse_task(body, kind);
+    if (fmt != ApiFmt::Oai) base.include_usage = true;  // the translators emit their closing events on the usage chunk
     if (kind == Kind::OaiChat) prompts.push_back(base.prompt);
     else {
         const Value* p = body.find("prompt");
@@ -138,17 +142,42 @@ void App::handle_completion(const http::Request& req, http::Conn& c, Kind kind) 
     if (base.stream) {
         Task t = base;
         t.prompt = prompts[0];
-        bool started = false, ok = true;
+        // X-Conversation-Id opts in to a replay buffer: generation then survives a client disconnect (llama-server spipe)
+        StreamSessionPtr session;
+        if (const std::string cid = req.header("x-conversation-id"); !cid.empty()) session = stream_create(cid);
+        struct Fin { StreamSessionPtr s; ~Fin() { if (s) s->finalize(); } } fin{session};
+        bool started = false, sock_ok = true;
+        auto last_write = Clock::now();
+        auto live = [&] { return session ? !session->cancelled() : sock_ok; };
+        auto emit_raw = [&](const std::string& bytes) {
+            if (session) session->append(bytes.data(), bytes.size());
+            if (sock_ok) sock_ok = c.write_chunk(bytes);
+            last_write = Clock::now();
+            return live();
+        };
         auto begin = [&](int) {
             if (started) return;
             started = true;
-            ok = c.begin_stream(200, "text/event-stream");
+            sock_ok = c.begin_stream(200, "text/event-stream");
+            last_write = Clock::now();
         };
-        auto sse = [&](const Value& v) { if (ok) ok = c.write_chunk("data: " + v.dump() + "\n\n"); return ok; };
+        std::unique_ptr<StreamXlate> xl = make_stream_xlate(fmt, (int)t.prompt.size());
+        auto sse = [&](const Value& v) {
+            if (!xl) return emit_raw("data: " + v.dump() + "\n\n");
+            for (auto& ev : xl->feed(v)) emit_raw(ev);
+            return live();
+        };
+        // SSE comment ping after `sse_ping_interval` seconds of silence (undici & co. time out on idle streams)
+        const int ping_s = t.sse_ping_interval;
+        auto stream_alive = [&] {
+            if (started && ping_s > 0 && sock_ok && std::chrono::duration<double>(Clock::now() - last_write).count() > ping_s) emit_raw(":\n\n");
+            return session ? !session->cancelled() : !c.peer_closed();
+        };
+        const bool bool_ok_unused = true; (void)bool_ok_unused;
         GenResult total;
         int tot_dec = 0, tot_cache = 0;
         std::vector<GenResult> results;
-        for (int ci = 0; ci < (oai ? base.n_choices : 1) && ok; ++ci) {
+        for (int ci = 0; ci < (oai ? base.n_choices : 1) && live(); ++ci) {
             Task tc = t;
             if (ci > 0 && tc.sp.has_seed) tc.sp.seed += ci;
             const chat::ParseParams pp = parse_params_of(tc);
@@ -169,6 +198,7 @@ void App::handle_completion(const http::Request& req, http::Conn& c, Kind kind) 
                 o2.set("choices", Value::array()).push(std::move(ch));
                 return o2;
             };
+            std::optional<Value> cur_timings;
             auto emit_delta = [&](const chat::Delta& dl, const std::vector<TokProb>& probs) {
                 Value o2 = base_chunk("chat.completion.chunk");
                 Value d = Value::object();
@@ -188,10 +218,14 @@ void App::handle_completion(const http::Request& req, http::Conn& c, Kind kind) 
                 ch.set("delta", std::move(d));
                 if (!probs.empty()) { Value lp = Value::object(); lp.set("content", probs_json(probs, t.post_probs)); ch.set("logprobs", std::move(lp)); }
                 o2.set("choices", Value::array()).push(std::move(ch));
+                if (cur_timings) o2.set("timings", *cur_timings);
                 return sse(o2);
             };
             auto on_chunk = [&](const Chunk& ck) {
-                if (!ok) return false;
+                if (!live()) return false;
+                std::optional<Value> tm;
+                if (tc.timings_per_token) tm = timings_json(ck.n_cache, ck.n_prompt_eval, ck.prompt_ms, ck.n_decoded, ck.predicted_ms);
+                cur_timings = tm;
                 if (kind == Kind::Native || kind == Kind::Infill) {
                     Value o2 = Value::object();
                     o2.set("index", 0);
@@ -201,6 +235,7 @@ void App::handle_completion(const http::Request& req, http::Conn& c, Kind kind) 
                     o2.set("id_slot", -1);
                     o2.set("tokens_predicted", ck.n_decoded);
                     o2.set("tokens_evaluated", (int)t.prompt.size());
+                    if (tm) o2.set("timings", *tm);
                     if (!ck.probs.empty()) o2.set("completion_probabilities", probs_json(ck.probs, t.post_probs));
                     return sse(o2);
                 }
@@ -221,12 +256,49 @@ void App::handle_completion(const http::Request& req, http::Conn& c, Kind kind) 
                 if (!ck.probs.empty()) { Value lp = Value::object(); lp.set("content", probs_json(ck.probs, t.post_probs)); ch.set("logprobs", std::move(lp)); } else ch.set("logprobs", Value());
                 ch.set("finish_reason", Value());
                 o2.set("choices", Value::array()).push(std::move(ch));
+                if (tm) o2.set("timings", *tm);
                 return sse(o2);
             };
-            GenResult r = generate(tc, alive, on_chunk, begin);
-            if (r.aborted) { c.close_after = true; return; }
+            if (tc.return_progress) {
+                tc.on_progress = [&](int total, int cache, int processed, double ms) {
+                    begin(0);
+                    Value pr = Value::object();
+                    pr.set("total", total); pr.set("cache", cache); pr.set("processed", processed); pr.set("time_ms", ms);
+                    Value o2;
+                    if (chat) {
+                        o2 = base_chunk("chat.completion.chunk");
+                        Value d = Value::object();
+                        d.set("role", "assistant");
+                        d.set("content", Value());
+                        Value ch = Value::object();
+                        ch.set("finish_reason", Value());
+                        ch.set("index", ci);
+                        ch.set("delta", std::move(d));
+                        o2.set("choices", Value::array()).push(std::move(ch));
+                    } else if (kind == Kind::OaiCmpl) {
+                        o2 = base_chunk("text_completion");
+                        Value ch = Value::object();
+                        ch.set("text", ""); ch.set("index", ci); ch.set("logprobs", Value()); ch.set("finish_reason", Value());
+                        o2.set("choices", Value::array()).push(std::move(ch));
+                    } else {
+                        o2 = Value::object();
+                        o2.set("index", 0); o2.set("content", ""); o2.set("tokens", Value::array()); o2.set("stop", false); o2.set("id_slot", -1);
+                        o2.set("tokens_predicted", 0); o2.set("tokens_evaluated", (int)t.prompt.size());
+                    }
+                    o2.set("prompt_progress", std::move(pr));
+                    sse(o2);
+                };
+            }
+            GenResult r = generate(tc, stream_alive, on_chunk, begin);
+            if (xl) xl->stopping_word = r.stopping_word;
+            if (r.aborted) {
+                if (session && session->cancelled() && sock_ok) c.end_chunks();  // explicit stop (DELETE /v1/stream): end the stream cleanly
+                else c.close_after = true;
+                return;
+            }
             begin(0);
             if (chat && first) { first = false; sse(role_chunk()); }
+            cur_timings.reset();
             if (chat) {  // release text held back by the parser
                 chat::ParseParams q = pp; q.partial = true; q.flush = true;
                 chat::Message cur = chat::parse_output(acc, q);
@@ -263,14 +335,15 @@ void App::handle_completion(const http::Request& req, http::Conn& c, Kind kind) 
             }
         }
         begin(0);
-        if (chat && base.include_usage && ok) {
+        if (chat && base.include_usage && live()) {
             Value o2 = base_chunk("chat.completion.chunk");
             o2.set("usage", usage_of((int)t.prompt.size(), tot_cache, tot_dec));
             o2.set("timings", timings_of(total));
             sse(o2);
         }
-        if (oai && ok) ok = c.write_chunk("data: [DONE]\n\n");
-        if (ok) c.end_chunks();
+        if (xl) { for (auto& ev : xl->finish()) emit_raw(ev); }
+        else if (oai && live()) emit_raw("data: [DONE]\n\n");
+        if (sock_ok) c.end_chunks();
         else c.close_after = true;
         return;
     }
@@ -322,8 +395,41 @@ void App::handle_completion(const http::Request& req, http::Conn& c, Kind kind) 
         results.push_back(std::move(resp));
         grs.push_back(rs_.back());
     }
+    if (fmt == ApiFmt::Anthropic && results.size() == 1) { respond_json(c, 200, oai_to_anthropic(results[0], grs[0].stopping_word)); return; }
+    if (fmt == ApiFmt::Responses && results.size() == 1) { respond_json(c, 200, oai_to_responses(results[0])); return; }
     if (results.size() == 1) respond_json(c, 200, results[0]);
     else { Value a = Value::array(); for (auto& r : results) a.push(std::move(r)); respond_json(c, 200, a); }
+}
+
+void App::handle_responses(const http::Request& req, http::Conn& c) {
+    Value body;
+    try { body = jd::parse(req.body); }
+    catch (const jd::ParseError& e) { throw_error(400, std::string("[json.exception.parse_error.101] parse error: ") + e.what()); }
+    Value conv;
+    try { conv = responses_to_oai(body); } catch (const std::exception& e) { throw_error(400, e.what(), "invalid_request_error"); }
+    handle_completion(req, c, Kind::OaiChat, ApiFmt::Responses, &conv);
+}
+
+void App::handle_messages(const http::Request& req, http::Conn& c) {
+    Value body;
+    try { body = jd::parse(req.body); }
+    catch (const jd::ParseError& e) { throw_error(400, std::string("[json.exception.parse_error.101] parse error: ") + e.what()); }
+    Value conv;
+    try { conv = anthropic_to_oai(body); } catch (const std::exception& e) { throw_error(400, e.what(), "invalid_request_error"); }
+    handle_completion(req, c, Kind::OaiChat, ApiFmt::Anthropic, &conv);
+}
+
+void App::handle_count_tokens(const http::Request& req, http::Conn& c, ApiFmt fmt) {
+    Value body;
+    try { body = jd::parse(req.body); }
+    catch (const jd::ParseError& e) { throw_error(400, std::string("[json.exception.parse_error.101] parse error: ") + e.what()); }
+    if (fmt == ApiFmt::Responses) { try { body = responses_to_oai(body); } catch (const std::exception& e) { throw_error(400, e.what(), "invalid_request_error"); } }
+    else if (fmt == ApiFmt::Anthropic) { try { body = anthropic_to_oai(body); } catch (const std::exception& e) { throw_error(400, e.what(), "invalid_request_error"); } }
+    Task t = parse_task(body, Kind::OaiChat);
+    Value v = Value::object();
+    v.set("input_tokens", (long long)t.prompt.size());
+    if (fmt != ApiFmt::Anthropic) v.set("object", "response.input_tokens");
+    respond_json(c, 200, v);
 }
 
 void App::handle_infill(const http::Request& req, http::Conn& c) {

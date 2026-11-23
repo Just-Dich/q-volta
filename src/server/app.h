@@ -4,6 +4,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -17,6 +18,7 @@
 #include "qv/engine.h"
 #include "sampling/sampler.h"
 #include "server/chat_render.h"
+#include "server/compat_api.h"
 #include "server/http.h"
 #include "server/options.h"
 #include "tokenizer/tokenizer.h"
@@ -67,6 +69,10 @@ struct Task {
     std::string think_start = "<think>", think_end = "</think>";
     std::string model_echo;
     bool logprobs_oai = false;
+    // streaming extras (llama-server: return_progress, sse_ping_interval, X-Conversation-Id)
+    bool return_progress = false;
+    int sse_ping_interval = 30;  // seconds of silence before an SSE comment ping, <= 0 disables
+    std::function<void(int total, int cache, int processed, double ms)> on_progress;
 };
 
 struct SlotInfo {
@@ -93,7 +99,38 @@ struct Chunk {
     std::vector<int> tokens;
     std::vector<TokProb> probs;
     int n_decoded = 0;
+    int n_cache = 0, n_prompt_eval = 0;     // timing snapshot (timings_per_token)
+    double prompt_ms = 0, predicted_ms = 0;
 };
+
+// Resumable stream buffer (llama-server server-stream.cpp): a streaming request carrying X-Conversation-Id keeps generating after the
+// client disconnects; the SSE bytes are kept (4 MiB ring, 300 s after completion) and can be replayed from an offset via GET /v1/stream.
+class StreamSession {
+   public:
+    explicit StreamSession(std::string id);
+    bool append(const char* data, size_t len);
+    void finalize();
+    void cancel() { cancelled_.store(true); }
+    bool cancelled() const { return cancelled_.load(); }
+    bool done() const;
+    size_t total() const;
+    size_t dropped() const;
+    long long completed_at() const;
+    // drains from `offset` (advanced) into `sink` until finalized or should_stop; false when the offset was dropped from the ring
+    bool read_from(size_t& offset, const std::function<bool(const char*, size_t)>& sink, const std::function<bool()>& should_stop);
+    std::string id;
+    long long started_at;
+
+   private:
+    mutable std::mutex mu_;
+    std::condition_variable cv_;
+    std::string buf_;
+    size_t dropped_ = 0;
+    bool done_ = false;
+    long long completed_ = 0;
+    std::atomic<bool> cancelled_{false};
+};
+using StreamSessionPtr = std::shared_ptr<StreamSession>;
 
 class App {
    public:
@@ -138,6 +175,15 @@ class App {
     std::string piece_bytes(int id, std::vector<int>& bytes) const;
     Value gen_settings(const Task& t, int flavor) const;
     Value timings_json(const GenResult& r) const;
+    Value timings_json(int cache, int prompt_n, double prompt_ms, int pred_n, double pred_ms) const;
+    // resumable streams
+    std::mutex sm_;
+    std::map<std::string, StreamSessionPtr> sessions_;
+    StreamSessionPtr stream_create(const std::string& id);
+    StreamSessionPtr stream_get(const std::string& id);
+    void handle_stream_get(const http::Request&, http::Conn&);
+    void handle_stream_lookup(const http::Request&, http::Conn&);
+    void handle_stream_delete(const http::Request&, http::Conn&);
     Value probs_json(const std::vector<TokProb>& v, bool post) const;
     Task parse_task(const Value& body, Kind kind);
     void parse_sampling(const Value& body, Task& t);
@@ -155,7 +201,9 @@ class App {
     struct Admission;
     GenResult generate(Task& t, const std::function<bool()>& alive, const std::function<bool(const Chunk&)>& on_chunk, const std::function<void(int)>& on_start);
     // ---- handlers
-    void handle_completion(const http::Request&, http::Conn&, Kind);
+    void handle_completion(const http::Request&, http::Conn&, Kind, ApiFmt fmt = ApiFmt::Oai, const Value* body_in = nullptr);
+    void handle_responses(const http::Request&, http::Conn&);
+    void handle_count_tokens(const http::Request&, http::Conn&, ApiFmt fmt);
     void handle_infill(const http::Request&, http::Conn&);
     void handle_tokenize(const http::Request&, http::Conn&);
     void handle_detokenize(const http::Request&, http::Conn&);
@@ -167,7 +215,8 @@ class App {
     void handle_models(http::Conn&);
     void handle_messages(const http::Request&, http::Conn&);
     void respond_json(http::Conn& c, int status, const Value& v, const http::Headers& extra = {});
-    void serve_static(const http::Request& req, http::Conn& c);
+    bool serve_webui(const http::Request& req, http::Conn& c, const std::string& path);
+    static bool is_frontend_path(const std::string& path);
     Value model_json() const;
 };
 

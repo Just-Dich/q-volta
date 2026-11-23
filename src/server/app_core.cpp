@@ -132,8 +132,12 @@ void App::handle_props(http::Conn& c) {
     r.set("endpoint_slots", o.slots);
     r.set("endpoint_props", o.props);
     r.set("endpoint_metrics", o.metrics);
-    r.set("ui", !o.path.empty());
-    r.set("ui_settings", Value::object());
+    r.set("ui", o.webui);
+    {
+        Value us = Value::object();
+        if (!o.ui_config.empty()) { try { us = jd::parse(o.ui_config); } catch (...) {} }
+        r.set("ui_settings", std::move(us));
+    }
     r.set("chat_template", tmpl ? tmpl->source() : std::string());
     r.set("chat_template_caps", tmpl ? tmpl->caps() : Value::object());
     r.set("bos_token", bos_id >= 0 ? tok.token_bytes(bos_id) : std::string());
@@ -350,16 +354,6 @@ void App::handle_apply_template(const http::Request& req, http::Conn& c) {
     respond_json(c, 200, r);
 }
 
-void App::serve_static(const http::Request& req, http::Conn& c) {
-    std::string p = req.path;
-    if (p.empty() || p == "/") p = "/index.html";
-    if (p.find("..") != std::string::npos) throw_error(404, "File Not Found", "not_found_error");
-    bool ok;
-    std::string data = read_all(o.path + p, ok);
-    if (!ok) throw_error(404, "File Not Found", "not_found_error");
-    c.respond(200, mime_of(p), data);
-}
-
 void App::route(const http::Request& req, http::Conn& c) {
     // ---- headers common to every response
     std::string origin = req.header("origin");
@@ -377,10 +371,12 @@ void App::route(const http::Request& req, http::Conn& c) {
             else throw_error(404, "File Not Found", "not_found_error");
             if (path.empty()) path = "/";
         }
+        // UI assets are public and load while the model is still loading (llama-server: frontend_paths)
+        const bool frontend = is_frontend_path(path) || path == "/sw.js" || path == "/service-worker.js";
         // ---- model loading
-        if (!ready.load()) throw_error(503, "Loading model", "unavailable_error");
-        // ---- API key (public: /health, /v1/health)
-        const bool is_public = path == "/health" || path == "/v1/health";
+        if (!ready.load() && !frontend) throw_error(503, "Loading model", "unavailable_error");
+        // ---- API key (public: /health, /v1/health, UI assets)
+        const bool is_public = path == "/health" || path == "/v1/health" || frontend;
         if (!o.api_keys.empty() && !is_public) {
             std::string k = req.header("authorization");
             if (k.empty()) k = req.header("x-api-key");
@@ -404,12 +400,11 @@ void App::route(const http::Request& req, http::Conn& c) {
         if (post && path == "/tokenize") { handle_tokenize(req, c); return; }
         if (post && path == "/detokenize") { handle_detokenize(req, c); return; }
         if (post && path == "/apply-template") { handle_apply_template(req, c); return; }
-        if (post && (path == "/chat/completions/input_tokens" || path == "/v1/chat/completions/input_tokens")) {
-            Value body;
-            try { body = jd::parse(req.body); } catch (const jd::ParseError& e) { throw_error(400, std::string("[json.exception.parse_error.101] parse error: ") + e.what()); }
-            Task t = parse_task(body, Kind::OaiChat);
-            Value v = Value::object(); v.set("input_tokens", (long long)t.prompt.size()); v.set("object", "response.input_tokens"); respond_json(c, 200, v); return;
-        }
+        if (post && (path == "/chat/completions/input_tokens" || path == "/v1/chat/completions/input_tokens")) { handle_count_tokens(req, c, ApiFmt::Oai); return; }
+        if (post && (path == "/responses/input_tokens" || path == "/v1/responses/input_tokens")) { handle_count_tokens(req, c, ApiFmt::Responses); return; }
+        if (post && path == "/v1/messages/count_tokens") { handle_count_tokens(req, c, ApiFmt::Anthropic); return; }
+        if (post && path == "/v1/messages") { handle_messages(req, c); return; }
+        if (post && (path == "/v1/responses" || path == "/responses")) { handle_responses(req, c); return; }
         if (get && path == "/slots") { handle_slots(req, c); return; }
         if (post && path.rfind("/slots/", 0) == 0) {
             int id;
@@ -429,10 +424,18 @@ void App::route(const http::Request& req, http::Conn& c) {
             throw_error(501, o.embedding ? "Q-Volta engines do not expose pooled embeddings; /embeddings is not implemented" : "This server does not support embeddings. Start it with `--embeddings`", "not_supported_error");
         if (post && (path == "/rerank" || path == "/reranking" || path == "/v1/rerank" || path == "/v1/reranking"))
             throw_error(501, "This server does not support reranking. Start it with `--reranking`", "not_supported_error");
-        if (post && (path == "/v1/messages" || path == "/v1/messages/count_tokens" || path == "/v1/responses" || path == "/responses" || path == "/v1/audio/transcriptions" ||
+        if (post && (path == "/v1/audio/transcriptions" ||
                      path == "/v1/audio/speech" || path == "/tts" || path == "/v1/systemone" || path == "/v1/chat/completions/control"))
             throw_error(501, "Endpoint " + path + " is not implemented by qv_server", "not_supported_error");
-        if (get && (!o.path.empty())) { serve_static(req, c); return; }
+        if (get && path == "/v1/stream") { handle_stream_get(req, c); return; }
+        if (post && path == "/v1/streams/lookup") { handle_stream_lookup(req, c); return; }
+        if (m == "DELETE" && path == "/v1/stream") { handle_stream_delete(req, c); return; }
+        if (get && frontend && serve_webui(req, c, path)) return;
+        // features that are off by default answer 403 (llama-server: server_setup_features)
+        if ((get || post) && (path == "/tools" || path == "/cors-proxy")) {
+            c.respond(403, kJson, R"({"error":{"message":"this feature is disabled","type":"feature_disabled"}})");
+            return;
+        }
         throw_error(404, "File Not Found", "not_found_error");
     } catch (const ApiError& e) {
         if (c.streaming && !c.broken) { c.write_chunk("data: " + error_json(e) + "\n\n"); c.end_chunks(); c.close_after = true; }

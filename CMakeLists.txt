@@ -132,8 +132,16 @@ if(QV_CPU OR QV_CUDA)
   if(NOT QV_GIT_REV)
     set(QV_GIT_REV "dev")
   endif()
+  # llama.cpp web UI (vendored, pre-gzipped, MIT: src/server/webui/README.md) embedded as a generated source: no runtime file dependency
+  file(GLOB_RECURSE QV_WEBUI_FILES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/server/webui/gzip/*)
+  set(QV_WEBUI_CPP ${CMAKE_BINARY_DIR}/webui_assets.cpp)
+  add_custom_command(OUTPUT ${QV_WEBUI_CPP}
+    COMMAND ${CMAKE_COMMAND} -DWEBUI_DIR=${CMAKE_SOURCE_DIR}/src/server/webui/gzip -DOUT=${QV_WEBUI_CPP} -P ${CMAKE_SOURCE_DIR}/cmake/qv_embed_webui.cmake
+    DEPENDS ${QV_WEBUI_FILES} ${CMAKE_SOURCE_DIR}/cmake/qv_embed_webui.cmake
+    COMMENT "Embedding the llama.cpp web UI" VERBATIM)
   add_executable(qv_server src/server/server_main.cpp src/server/http.cpp src/server/options.cpp src/server/chat_render.cpp
-                 src/server/app_core.cpp src/server/app_gen.cpp src/server/app_handlers.cpp)
+                 src/server/app_core.cpp src/server/app_gen.cpp src/server/app_handlers.cpp src/server/app_webui.cpp src/server/app_stream.cpp src/server/compat_api.cpp ${QV_WEBUI_CPP})
+  target_include_directories(qv_server PRIVATE src)
   target_compile_definitions(qv_server PRIVATE QV_GIT_REV="${QV_GIT_REV}")
   target_link_libraries(qv_server PRIVATE qv_text qv_core qv_jinja qv_grammar Threads::Threads)
   if(QV_CPU)

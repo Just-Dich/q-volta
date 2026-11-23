@@ -160,7 +160,10 @@ Value App::gen_settings(const Task& t, int flavor) const {  // flavor 0: complet
     return o;
 }
 
-Value App::timings_json(const GenResult& r) const {
+Value App::timings_json(const GenResult& r) const { return timings_json(r.n_cache, r.n_prompt_eval, r.prompt_ms, r.n_decoded, r.predicted_ms); }
+
+Value App::timings_json(int cache, int pn, double pms, int dn, double dms) const {
+    struct { int n_cache, n_prompt_eval, n_decoded; double prompt_ms, predicted_ms; } r{cache, pn, dn, pms, dms};
     Value o = Value::object();
     o.set("cache_n", r.n_cache);
     o.set("prompt_n", r.n_prompt_eval);
@@ -290,6 +293,8 @@ void App::parse_sampling(const Value& bv, Task& t) {
     t.cache_prompt = b.boolean("cache_prompt", o.cache_prompt);
     t.id_slot = b.integer("id_slot", -1);
     t.timings_per_token = b.boolean("timings_per_token", false);
+    t.return_progress = b.boolean("return_progress", false);
+    t.sse_ping_interval = b.integer("sse_ping_interval", o.sse_ping_interval);
     t.return_tokens = b.boolean("return_tokens", false);
     t.stream = b.boolean("stream", false);
     t.n_predict = b.integer("n_predict", b.integer("max_tokens", b.integer("max_completion_tokens", o.n_predict)));
@@ -525,13 +530,14 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
         { std::lock_guard<std::mutex> lk(mu_); slots_[sid].n_prompt_cache = (int)start; }
         on_start(sid);
         auto tp0 = now();
+        if (t.on_progress) t.on_progress(N, (int)start, (int)start, 0.0);
         for (size_t off = start; off < (size_t)N; off += chunk) {
             if (!alive()) { r.aborted = true; return r; }
             int n = (int)std::min<size_t>(chunk, N - off);
             eng->prefill(t.prompt.data() + off, n, (int)off);
             cached_.insert(cached_.end(), t.prompt.begin() + off, t.prompt.begin() + off + n);
-            std::lock_guard<std::mutex> lk(mu_);
-            slots_[sid].n_prompt_processed = (int)(off + n - start);
+            { std::lock_guard<std::mutex> lk(mu_); slots_[sid].n_prompt_processed = (int)(off + n - start); }
+            if (t.on_progress) t.on_progress(N, (int)start, (int)(off + n), ms(tp0, now()));
         }
         r.prompt_ms = ms(tp0, now());
         if (t.n_predict == 0) { r.stop_type = "limit"; r.tokens_cached = (int)cached_.size(); goto done; }
@@ -557,6 +563,7 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
             bool hit_stop_word = false;
             const int budget = t.n_predict;  // <0: unlimited
             auto td0 = now();
+            auto stamp = [&](Chunk& k) { k.n_cache = r.n_cache; k.n_prompt_eval = r.n_prompt_eval; k.prompt_ms = r.prompt_ms; k.predicted_ms = ms(td0, now()); };
             auto pick = [&](TokProb& tp, bool& have_tp) -> int {
                 have_tp = false;
                 if (argmax_ok && !want_probs) return eng->argmax();
@@ -609,6 +616,7 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
                     ck.text = pending;
                     r.content += pending;
                     pending.clear();
+                    stamp(ck);
                     if (!on_chunk(ck)) r.aborted = true;
                     ck = Chunk();
                     break;
@@ -622,6 +630,7 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
                 if (!out.empty() || have_tp) {
                     ck.text = out;
                     r.content += out;
+                    stamp(ck);
                     if (!on_chunk(ck)) { r.aborted = true; break; }
                     ck = Chunk();
                 }
@@ -651,6 +660,7 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
                 if (!pending.empty() || !ck.tokens.empty()) {
                     ck.text = pending;
                     r.content += pending;
+                    stamp(ck);
                     on_chunk(ck);
                 }
             }
