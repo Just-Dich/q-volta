@@ -394,7 +394,7 @@ def main():
         dbg_ref = [h_ref[0, :dbg].cpu().clone()]
         dbg_q = [h_q[0, :dbg].cpu().clone()]
         nxt = 0
-        print(f"[{time.time()-t0:6.0f}s] embed done", flush=True)
+        print(f"[{time.time()-t0:6.0f}s] embed done  gpu_alloc={torch.cuda.memory_allocated()/2**30:.1f} GiB", flush=True)
     else:
         h_ref, h_q, h_cal = st["h_ref"].to(dev), st["h_q"].to(dev), None if st["h_cal"] is None else st["h_cal"].to(dev)
         h_fp = None if st.get("h_fp") is None else st["h_fp"].to(dev)
@@ -428,7 +428,7 @@ def main():
         resid_e = None
         with torch.no_grad():
             if use_h:
-                resid_e = float((h_cal.view(-1, h_cal.shape[-1]).float() ** 2).sum(-1).mean())
+                resid_e = float(sum((h_cal[c0:c0 + 16].float() ** 2).sum(-1).sum() for c0 in range(0, len(h_cal), 16)) / (h_cal.shape[0] * h_cal.shape[1]))
                 mods = {"a": mixer.in_proj_qkv if ltypes[i] == "linear_attention" else mixer.q_proj,
                         "o": mixer.out_proj if ltypes[i] == "linear_attention" else mixer.o_proj,
                         "m": layer_ref.mlp.gate_proj, "d": layer_ref.mlp.down_proj}
@@ -443,20 +443,18 @@ def main():
                         hooks.append(m.register_forward_pre_hook(lambda mod, a, acc=acc: acc.add(a[0])))
                 if args.gptaq:
                     mask_c = causal_c if ltypes[i] == "full_attention" else None
-                    qo, fo = [], []
                     for b in range(0, h_cal.shape[0], args.calib_batch):
-                        qo.append(layer_ref(h_cal[b:b + args.calib_batch].float(), position_embeddings=pe_c, attention_mask=mask_c).to(h_cal.dtype))
+                        layer_ref(h_cal[b:b + args.calib_batch].float(), position_embeddings=pe_c, attention_mask=mask_c)
                         xq = dict(cap)
-                        fo.append(layer_ref(h_fp[b:b + args.calib_batch].float(), position_embeddings=pe_c, attention_mask=mask_c).to(h_cal.dtype))
+                        h_fp[b:b + args.calib_batch] = layer_ref(h_fp[b:b + args.calib_batch].float(), position_embeddings=pe_c,
+                                                                 attention_mask=mask_c).to(h_fp.dtype)  # fp stream advances in place
                         for key in mods:
                             Hs[key].add(xq[key])
                             Cs[key].addmm_(cap[key].T, xq[key])
                         cap.clear()
-                    h_cal_ref_out = torch.cat(qo)
-                    h_fp = torch.cat(fo)
+                    h_cal_ref_out = None
                     for key in Cs:
                         Cs[key].div_(Hs[key].n)
-                    del qo, fo
                 else:
                     h_cal_ref_out = run_layer(layer_ref, h_cal, pe_c, causal_c, ltypes[i], args.calib_batch)
                 if not sens:
@@ -486,7 +484,7 @@ def main():
             Hm = Hs[hk].mean() if (use_h and hk) else None
             colw = torch.diag(Hm).clone() if Hm is not None else None
             Hu = None
-            if args.method == "gptq" and Hm is not None:
+            if args.method == "gptq" and Hm is not None and (args.gptq_mode == "orig" or sens):
                 if hk not in Hu_cache:
                     Hu_cache[hk] = Q.hinv_chol(Hm, dmap.get(hk, args.percdamp))
                 Hu = Hu_cache[hk]

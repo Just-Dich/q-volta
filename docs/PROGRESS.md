@@ -81,3 +81,6 @@ Not supported: `<[id]>` token elements; non-integer minimum/maximum are not enfo
 
 ## p18/compare (2026-11-23) - fair comparison stand vs llama.cpp on the V100
 benchmarks/compare/: scripts, `llama_eval.cpp` (libllama harness writing/reading the qv_run eval format), results.json, raw/, README with protocol and verdict. Measured: Q8_0 reference (ppl 8.467), Q3_K_M, IQ3_XXS+imatrix (Q-Volta GPTQ calibration text) vs e0/e1: llama.cpp better quality at equal bytes, Q-Volta faster (decode, prefill, MTP) and longer int4 KV. ExLlamaV2/V3, vLLM, SGLang not run on sm_70 (reasons in the compare README). Missing: IQ3_S, no-imatrix IQ3, BF16-based KL.
+
+## p21/quant2 (2026-11-23) - quantization quality at equal bytes (interim)
+Proxy ablation on held-out text (see docs/QUANTIZATION.md "p21/quant2"): act-order+damping per tensor class cuts held-out layer error 6-12%, 128 calibration sequences beat 32 by 12-25%, g64 costs less per unit error than 4-bit upgrades, down_proj GPTQ overfits. Tools committed; full e1b1/e0b1 runs started, no model-level number measured yet, README claims unchanged. Branch p21/quant2.
