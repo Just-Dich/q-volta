@@ -425,6 +425,7 @@ void mtp_decode(int first, int start_pos, int n, std::vector<int>& out) {
     const int Rmax = std::min(8, std::max(2, opt_.mtp_depth + 1));
     const int Rv = Rmax <= 2 ? 2 : Rmax == 3 ? 3 : Rmax <= 4 ? 4 : 8;
     int st[8] = {first, start_pos, 0, 0, 0, 0, 0, 0};
+    if (std::getenv("QV_MTP_PROF")) { mtp_profile(); std::exit(0); }
     if (start_pos + n + RR > opt_.max_ctx) throw std::runtime_error("context overflow");
     QV_CUDA_CHECK(cudaMemcpyAsync(vst_, st, sizeof st, cudaMemcpyHostToDevice, stream_));
     if (!g_mtp_[Rv]) g_mtp_[Rv] = mtp_capture(Rv);
@@ -458,4 +459,45 @@ void mtp_decode(int first, int start_pos, int n, std::vector<int>& out) {
         mstats_.plain_steps += 1;
     }
     mstats_.plain_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// QV_MTP_PROF=1: per-stage GPU time (each stage in its own CUDA graph, 50 replays; state contents irrelevant, nothing is committed)
+void mtp_profile() {
+    cudaStream_t s = stream_;
+    auto cap = [&](auto fn) {
+        QV_CUDA_CHECK(cudaStreamSynchronize(s));
+        QV_CUDA_CHECK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
+        fn();
+        cudaGraph_t g; cudaGraphExec_t ge;
+        QV_CUDA_CHECK(cudaStreamEndCapture(s, &g));
+        QV_CUDA_CHECK(cudaGraphInstantiate(&ge, g, 0));
+        QV_CUDA_CHECK(cudaGraphDestroy(g));
+        return ge;
+    };
+    auto time = [&](cudaGraphExec_t ge) {
+        cudaEvent_t a, b; cudaEventCreate(&a); cudaEventCreate(&b);
+        for (int i = 0; i < 5; ++i) cudaGraphLaunch(ge, s);
+        cudaEventRecord(a, s);
+        for (int i = 0; i < 50; ++i) cudaGraphLaunch(ge, s);
+        cudaEventRecord(b, s); cudaEventSynchronize(b);
+        float ms; cudaEventElapsedTime(&ms, a, b);
+        cudaEventDestroy(a); cudaEventDestroy(b); cudaGraphExecDestroy(ge);
+        return ms / 50;
+    };
+    int st[8] = {1000, 0, 0, 0, 0, 0, 0, 0};
+    st[1] = 600;  // any position inside the prefilled context
+    QV_CUDA_CHECK(cudaMemcpyAsync(vst_, st, sizeof st, cudaMemcpyHostToDevice, s));
+    std::fprintf(stderr, "[mtp-prof] draft_block %.3f ms\n", time(cap([&] { draft_block(); })));
+    for (int R : {1, 2, 3, 4, 8}) {
+        if (R == 1) { std::fprintf(stderr, "[mtp-prof] plain 1-token step %.3f ms\n", time(cap([&] { forward(); }))); continue; }
+        std::fprintf(stderr, "[mtp-prof] verify R=%d %.3f ms\n", R, time(cap([&] { verify_forward(R); })));
+    }
+    std::fprintf(stderr, "[mtp-prof] accept+commit+ingest(R=8) %.3f ms\n", time(cap([&] {
+        ik::accept_rows(vtok_, vy_, 8, vst_, d_gen_, nacc_hist_, s);
+        const int* nc = vst_ + 2;
+        ik::conv_commit_n(khist_, RR, cst_k_, 1024, 48, nc, s); ik::conv_commit_n(vhist_, RR, cst_v_, 1024, 48, nc, s);
+        ik::conv_commit_n(hist_a_, RR, cst_a_, ik::H, 48, nc, s); ik::conv_commit_n(hist_m_, RR, cst_m_, ik::H, 48, nc, s);
+        ik::ring_commit(lk_, lv_, ltk_, ltv_, RR, n_lslots_, RR, vst_ + 1, nc, s);
+        mtp_ingest(featv_, 8, 0, vst_ + 1, nc, nc);
+    })));
 }

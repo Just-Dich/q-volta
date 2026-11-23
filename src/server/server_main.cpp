@@ -47,7 +47,7 @@ void print_help() {
         "  --frequency-penalty, --mirostat, --xtc-*, --dry-*, --dynatemp-*, -s/--seed, --samplers, --ignore-eos, -l/--logit-bias,\n"
         "  --grammar, --json-schema, -to/--timeout, --cors-*, --api-prefix, --log-disable, -v\n\n"
         "Q-Volta flags:\n"
-        "  --backend cuda|cpu|auto|mock   --kv fp32|fp16|int4   --mtp / --mtp-depth N   --prefill-chunk N   --tokenizer PATH\n"
+        "  --backend cuda|cpu|auto|mock   --kv fp32|fp16|int4   --mtp / --mtp-depth N / --mtp-file PATH (Inkling)   --prefill-chunk N   --tokenizer PATH\n"
         "  --max-queue N (503 beyond N waiting requests; default unbounded like llama-server)\n"
         "  mock backend (tests): --mock-text TEXT --mock-loop --mock-delay-us N (env QV_MOCK_LOAD_MS delays loading)\n");
 }
@@ -163,6 +163,11 @@ int main(int argc, char** argv) {
         } else {
             if (o.model.empty()) return fail("no model: pass -m MODEL (or set LLAMA_ARG_MODEL)");
             qv::ModelFile mf = qv::ModelFile::open(stem);
+            if (eo.mtp && mf.cfg.arch == "inkling2_loop") {  // Inkling MTP drafter: sidecar container, default <model>-mtp.qv; depth 3 unless given (depth 1 is slower than plain)
+                std::string base = stem.size() > 3 && stem.compare(stem.size() - 3, 3, ".qv") == 0 ? stem.substr(0, stem.size() - 3) : stem;
+                eo.mtp_file = o.mtp_file.empty() ? base + "-mtp.qv" : o.mtp_file;
+                if (eo.mtp_depth == 1) eo.mtp_depth = 3;
+            }
             if (backend == "cpu") {
 #ifdef QV_HAVE_CPU
                 app->eng = qv::make_cpu_engine(mf, eo);

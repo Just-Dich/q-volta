@@ -20,6 +20,7 @@ struct Options {
     int kv_mode = 0, kv4_kmode = 0;
     bool mtp = false;
     int mtp_depth = 1;
+    std::string mtp_file;  // Inkling: MTP sidecar container (default <model>-mtp.qv)
     // ---- http
     std::string host = "127.0.0.1";
     int port = 9931;                   // llama-server default of the reference commit
