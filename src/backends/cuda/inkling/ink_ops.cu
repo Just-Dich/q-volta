@@ -9,6 +9,9 @@
 namespace qv::cuda::ink {
 
 namespace {
+#ifndef GD_RPB
+#define GD_RPB 4
+#endif
 #ifndef MG_WPB
 #define MG_WPB 1
 #endif
@@ -461,7 +464,8 @@ UNROLL_N(UNP)
         xs[H + i] = m[i] * r2;
     }
     __syncthreads();
-    const int warp = tid >> 5, lane = tid & 31, row = blockIdx.x * 8 + warp;
+    const int warp = tid >> 5, lane = tid & 31, row = blockIdx.x * GD_RPB + (warp % GD_RPB);
+    if (warp >= GD_RPB) return;
     const uint4* wp = reinterpret_cast<const uint4*>(a.down[s] + (size_t)row * 2 * H);
     float acc = 0.f;
 UNROLL_N(UNG)
@@ -502,7 +506,7 @@ __global__ void __launch_bounds__(256) k_gate_apply(GateArgs a) {
     a.out[s][r * a.ors + i] = (1.f - tanhf(f)) * a.h[s][r * a.hrs + i] + tanhf(gn) * a.msg[s][r * a.mrs + i];
 }
 void gate(const GateArgs& a, cudaStream_t s) {
-    k_gate_down<<<dim3(8, a.S * a.R), 256, 0, s>>>(a);
+    k_gate_down<<<dim3(64 / GD_RPB, a.S * a.R), 256, 0, s>>>(a);
     k_gate_apply<<<dim3((H + 255) / 256, a.S * a.R), 256, 0, s>>>(a);
 }
 
