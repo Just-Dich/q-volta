@@ -27,35 +27,149 @@
 #include "../../third_party/stb/stb_image.h"
 #include "vision.h"
 
+extern "C" {
+#include "../../third_party/libwebp/src/webp/decode.h"
+#include "../../third_party/libwebp/src/webp/demux.h"
+}
+
 extern char** environ;
 
 namespace qv::vision {
+
+static bool has_prefix(const uint8_t* d, size_t n, const char* m, size_t off = 0) {
+    const size_t l = std::strlen(m);
+    return n >= off + l && !std::memcmp(d + off, m, l);
+}
+
+// Name of a recognised but unsupported container, or "" (magic bytes only).
+static std::string unsupported_format(const uint8_t* d, size_t n) {
+    if (has_prefix(d, n, "ftyp", 4) && n >= 12) {
+        const std::string b((const char*)d + 8, 4);
+        if (b == "avif" || b == "avis") return "AVIF";
+        if (b == "heic" || b == "heix" || b == "hevc" || b == "hevx" || b == "heim" || b == "heis" || b == "mif1" || b == "msf1") return "HEIC";
+        return "ISO-BMFF (" + b + ")";
+    }
+    if (n >= 4 && ((!std::memcmp(d, "II*", 3) && d[3] == 0) || (!std::memcmp(d, "MM", 2) && d[2] == 0 && d[3] == 0x2a) || (!std::memcmp(d, "II+", 3) && d[3] == 0))) return "TIFF";
+    if (n >= 2 && d[0] == 0xff && d[1] == 0x0a) return "JPEG XL";
+    if (n >= 12 && !std::memcmp(d, "\0\0\0\x0cJXL ", 8)) return "JPEG XL";
+    if (n >= 12 && !std::memcmp(d, "\0\0\0\x0cjP  ", 8)) return "JPEG 2000";
+    if (n >= 4 && !std::memcmp(d, "\0\0\1\0", 4)) return "ICO";
+    if (has_prefix(d, n, "%PDF")) return "PDF";
+    if (has_prefix(d, n, "<svg") || has_prefix(d, n, "<?xml")) return "SVG";
+    if (has_prefix(d, n, "8BPS")) return "";  // PSD: stb handles it
+    return "";
+}
+
+static std::string supported_list() { return "PNG, JPEG, GIF, BMP, WebP, PNM, TGA"; }
+
+// "starts with ..." preview of non-image data (HTML / JSON error pages etc.).
+static std::string preview(const uint8_t* d, size_t n) {
+    std::string o;
+    bool text = true;
+    for (size_t i = 0; i < n && i < 40; ++i) {
+        const uint8_t c = d[i];
+        if (c == '\n' || c == '\r' || c == '\t') o += ' ';
+        else if (c >= 32 && c < 127) o += (char)c;
+        else { text = false; break; }
+    }
+    if (text) return "'" + o + (n > 40 ? "...'" : "'");
+    char buf[16 * 3 + 1] = {0};
+    for (size_t i = 0; i < n && i < 16; ++i) std::snprintf(buf + i * 3, 4, "%02x ", d[i]);
+    return std::string("bytes ") + buf;
+}
+
+static bool looks_like_text(const uint8_t* d, size_t n) {
+    size_t i = 0;
+    while (i < n && std::isspace(d[i])) ++i;
+    if (i >= n) return false;
+    const uint8_t c = d[i];
+    return c == '<' || c == '{' || c == '[';
+}
+
+static bool is_webp(const uint8_t* d, size_t n) { return has_prefix(d, n, "RIFF") && has_prefix(d, n, "WEBP", 8); }
+
+// WebP (libwebp decode-only subset): still images via WebPDecode, animated via WebPAnimDecoder (first frame, composited on the canvas). Output RGBA.
+static uint8_t* decode_webp(const uint8_t* data, size_t n, const Limits& lim, int& w, int& h, bool& alpha) {
+    WebPBitstreamFeatures f;
+    const VP8StatusCode st = WebPGetFeatures(data, n, &f);
+    if (st == VP8_STATUS_NOT_ENOUGH_DATA) throw ImageError("decode", "WebP image is truncated");
+    if (st != VP8_STATUS_OK) throw ImageError("decode", "corrupt WebP image (header)");
+    w = f.width; h = f.height;
+    if (w <= 0 || h <= 0) throw ImageError("decode", "image has zero size");
+    if (w > lim.max_side || h > lim.max_side)
+        throw ImageError("too_large", "image is " + std::to_string(w) + "x" + std::to_string(h) + " px; each side must be at most " + std::to_string(lim.max_side));
+    alpha = f.has_alpha;
+    uint8_t* out = (uint8_t*)std::malloc((size_t)w * h * 4);
+    if (!out) throw ImageError("decode", "out of memory");
+    if (!f.has_animation) {
+        if (!WebPDecodeRGBAInto(data, n, out, (size_t)w * h * 4, w * 4)) { std::free(out); throw ImageError("decode", "cannot decode WebP image (corrupt or truncated)"); }
+        return out;
+    }
+    std::free(out);
+    WebPData wd{data, n};
+    WebPAnimDecoderOptions opt;
+    WebPAnimDecoderOptionsInit(&opt);
+    opt.color_mode = MODE_RGBA;
+    opt.use_threads = 0;
+    WebPAnimDecoder* dec = WebPAnimDecoderNew(&wd, &opt);
+    if (!dec) throw ImageError("decode", "cannot decode animated WebP image (corrupt or truncated)");
+    uint8_t* buf = nullptr;
+    int ts = 0;
+    uint8_t* res = nullptr;
+    if (WebPAnimDecoderGetNext(dec, &buf, &ts) && buf) {  // first frame only
+        res = (uint8_t*)std::malloc((size_t)w * h * 4);
+        if (res) std::memcpy(res, buf, (size_t)w * h * 4);
+    }
+    WebPAnimDecoderDelete(dec);
+    if (!res) throw ImageError("decode", "cannot decode the first frame of the animated WebP image");
+    alpha = true;
+    return res;
+}
 
 Rgb8 decode_image(const uint8_t* data, size_t n, const Limits& lim) {
     if (n == 0) throw ImageError("decode", "empty image data");
     if (n > lim.max_bytes) throw ImageError("too_large", "image data exceeds the " + std::to_string(lim.max_bytes >> 20) + " MiB limit");
     int w = 0, h = 0, comp = 0;
-    if (!stbi_info_from_memory(data, (int)n, &w, &h, &comp)) throw ImageError("decode", std::string("unsupported or corrupt image: ") + stbi_failure_reason());
-    if (w <= 0 || h <= 0) throw ImageError("decode", "image has zero size");
-    if (w > lim.max_side || h > lim.max_side)
-        throw ImageError("too_large", "image is " + std::to_string(w) + "x" + std::to_string(h) + " px; each side must be at most " + std::to_string(lim.max_side));
-    const bool alpha = comp == 2 || comp == 4;
-    int w2, h2, c2;
-    uint8_t* p = stbi_load_from_memory(data, (int)n, &w2, &h2, &c2, alpha ? 4 : 3);
-    if (!p) throw ImageError("decode", std::string("cannot decode image: ") + stbi_failure_reason());
+    uint8_t* p = nullptr;
+    bool alpha = false, webp = false;
+    if (is_webp(data, n)) {
+        webp = true;
+        p = decode_webp(data, n, lim, w, h, alpha);
+    } else {
+        if (!stbi_info_from_memory(data, (int)n, &w, &h, &comp)) {
+            const std::string fmt = unsupported_format(data, n);
+            if (!fmt.empty())
+                throw ImageError("decode", "unsupported image format '" + fmt + "' (supported: " + supported_list() + "); convert the image first");
+            if (looks_like_text(data, n))
+                throw ImageError("decode", "image data is not an image (starts with " + preview(data, n) + "); supported formats: " + supported_list());
+            throw ImageError("decode", "unrecognised or corrupt image data (starts with " + preview(data, n) + "); supported formats: " + supported_list() +
+                                           " (stb: " + stbi_failure_reason() + ")");
+        }
+        if (w <= 0 || h <= 0) throw ImageError("decode", "image has zero size");
+        if (w > lim.max_side || h > lim.max_side)
+            throw ImageError("too_large", "image is " + std::to_string(w) + "x" + std::to_string(h) + " px; each side must be at most " + std::to_string(lim.max_side));
+        alpha = comp == 2 || comp == 4;
+        int w2, h2, c2;
+        p = stbi_load_from_memory(data, (int)n, &w2, &h2, &c2, alpha ? 4 : 3);
+        if (!p) throw ImageError("decode", std::string("cannot decode image: ") + stbi_failure_reason());
+        w = w2; h = h2;
+    }
+    const int ch = webp ? 4 : (alpha ? 4 : 3);
     Rgb8 r;
-    r.w = w2; r.h = h2;
-    r.px.resize((size_t)w2 * h2 * 3);
-    if (!alpha) std::memcpy(r.px.data(), p, r.px.size());
-    else {  // HF Inkling2ImageProcessor.convert_to_rgb: composite onto the 8 px checkerboard (204 / 153), integer arithmetic
-        for (int y = 0; y < h2; ++y)
-            for (int x = 0; x < w2; ++x) {
-                const uint8_t* s = p + ((size_t)y * w2 + x) * 4;
+    r.w = w; r.h = h;
+    r.px.resize((size_t)w * h * 3);
+    if (!alpha) {
+        if (ch == 3) std::memcpy(r.px.data(), p, r.px.size());
+        else for (size_t i = 0; i < (size_t)w * h; ++i) std::memcpy(&r.px[i * 3], p + i * 4, 3);
+    } else {  // HF Inkling2ImageProcessor.convert_to_rgb: composite onto the 8 px checkerboard (204 / 153), integer arithmetic
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                const uint8_t* s = p + ((size_t)y * w + x) * 4;
                 const int bg = (((y / 8) + (x / 8)) % 2 == 0) ? 204 : 153, a = s[3];
-                for (int c = 0; c < 3; ++c) r.px[((size_t)y * w2 + x) * 3 + c] = (uint8_t)((s[c] * a + bg * (255 - a) + 127) / 255);
+                for (int c = 0; c < 3; ++c) r.px[((size_t)y * w + x) * 3 + c] = (uint8_t)((s[c] * a + bg * (255 - a) + 127) / 255);
             }
     }
-    stbi_image_free(p);
+    if (webp) std::free(p); else stbi_image_free(p);
     return r;
 }
 
@@ -98,14 +212,25 @@ std::vector<uint8_t> base64_decode(const std::string& s) {
     out.reserve(s.size() * 3 / 4);
     uint32_t acc = 0;
     int bits = 0;
+    size_t nchars = 0, pos = 0;
     for (unsigned char ch : s) {
+        ++pos;
         if (ch == '=' || ch == '\n' || ch == '\r' || ch == ' ') continue;
         const int v = tab[ch];
-        if (v < 0) throw ImageError("bad_url", "invalid base64 in image data URL");
+        if (v < 0) {
+            char b[96];
+            std::snprintf(b, sizeof b, "invalid base64 in image data URL (unexpected byte 0x%02x at offset %zu)", ch, pos - 1);
+            std::string m = b;
+            if (ch == '%') m += "; the payload looks percent-encoded, send plain base64";
+            throw ImageError("bad_base64", m);
+        }
+        ++nchars;
         acc = (acc << 6) | (uint32_t)v;
         bits += 6;
         if (bits >= 8) { bits -= 8; out.push_back((uint8_t)((acc >> bits) & 0xff)); }
     }
+    if (nchars == 0) throw ImageError("bad_base64", "image data URL has an empty base64 payload");
+    if (nchars % 4 == 1) throw ImageError("bad_base64", "invalid base64 in image data URL (truncated: " + std::to_string(nchars) + " characters is not a valid length)");
     return out;
 }
 

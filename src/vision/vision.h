@@ -34,7 +34,7 @@ struct Limits {
     size_t max_bytes = 32u << 20;        // encoded size cap
 };
 
-// Decode PNG/JPEG/BMP/GIF/TGA/PSD/PNM/HDR(8-bit)/PIC via stb_image; alpha is composited on the 8 px checkerboard (204/153) exactly like the HF processor.
+// Decode PNG/JPEG/BMP/GIF/TGA/PSD/PNM/PIC via stb_image and WebP (lossy/lossless/alpha/animated first frame) via libwebp; alpha is composited on the 8 px checkerboard (204/153) exactly like the HF processor.
 Rgb8 decode_image(const uint8_t* data, size_t n, const Limits& lim);
 
 // pixel_values of the HF Inkling2ImageProcessor: [rows*cols][40][40][3] float in [-1,1] (padding = -1 on the 0..255 scale, bottom/right).
