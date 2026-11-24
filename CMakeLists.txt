@@ -162,7 +162,7 @@ if(QV_CPU OR QV_CUDA)
     COMMAND ${CMAKE_COMMAND} -DWEBUI_DIR=${CMAKE_SOURCE_DIR}/src/server/webui/gzip -DOUT=${QV_WEBUI_CPP} -P ${CMAKE_SOURCE_DIR}/cmake/qv_embed_webui.cmake
     DEPENDS ${QV_WEBUI_FILES} ${CMAKE_SOURCE_DIR}/cmake/qv_embed_webui.cmake
     COMMENT "Embedding the llama.cpp web UI" VERBATIM)
-  add_executable(qv_server src/server/server_main.cpp src/server/http.cpp src/server/options.cpp src/server/chat_render.cpp
+  add_executable(qv_server src/server/server_main.cpp src/server/http.cpp src/server/options.cpp src/server/presets.cpp src/server/chat_render.cpp
                  src/server/app_core.cpp src/server/app_gen.cpp src/server/app_handlers.cpp src/server/app_webui.cpp src/server/app_stream.cpp src/server/compat_api.cpp ${QV_WEBUI_CPP})
   target_include_directories(qv_server PRIVATE src)
   target_compile_definitions(qv_server PRIVATE QV_GIT_REV="${QV_GIT_REV}")

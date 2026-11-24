@@ -780,8 +780,8 @@ std::string SchemaGrammarBuilder::add_rule(const std::string& name, const std::s
     rules_[key] = rule;
     return key;
 }
-std::string SchemaGrammarBuilder::add_schema(const std::string& name, const jd::Value& schema) {
-    Conv c(*this, schema);
+std::string SchemaGrammarBuilder::add_schema(const std::string& name, const jd::Value& schema, const jd::Value* root_schema) {
+    Conv c(*this, root_schema ? *root_schema : schema);
     std::string r = c.visit(schema, name == "root" ? "" : name);
     if (!c.errors.empty()) {
         std::string m = "JSON schema conversion failed:\n";

@@ -20,8 +20,8 @@ class SchemaGrammarBuilder {
     explicit SchemaGrammarBuilder(SchemaOptions opt = {});
     // Adds `rule ::= body` (renamed on collision); returns the final rule name.
     std::string add_rule(const std::string& name, const std::string& body);
-    // Converts `schema` (must outlive nothing: it is copied) and returns the name of its rule. `$ref`s resolve against `schema` itself.
-    std::string add_schema(const std::string& name, const jd::Value& schema);
+    // Converts `schema` (must outlive nothing: it is copied) and returns the name of its rule. `$ref`s resolve against `root_schema` (or `schema` when null).
+    std::string add_schema(const std::string& name, const jd::Value& schema, const jd::Value* root_schema = nullptr);
     // Adds a builtin json primitive rule (value, object, array, string, number, integer, boolean, null, char, ...) and its deps.
     std::string add_primitive(const std::string& name);
     const std::vector<std::string>& warnings() const { return warnings_; }

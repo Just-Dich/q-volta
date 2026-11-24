@@ -1050,6 +1050,52 @@ def test_sleep_idle_seconds():
         s.stop()
 
 
+def test_models_preset_routing(tmp_path):
+    ini = tmp_path / "presets.ini"
+    ini.write_text(
+        "[*]\n"
+        "backend = mock\n"
+        f"tokenizer = {TOKJSON}\n"
+        "max-concurrency = 2\n"
+        "default-max-tokens = 4\n"
+        "[m1]\n"
+        "model = dummy1.qv\n"
+        "mock-text = alpha\n"
+        "[m2]\n"
+        "model = dummy2.qv\n"
+        "mock-text = beta\n"
+        "max-context = 8192\n"
+    )
+    s = Srv([QV_SERVER, "--port", "@PORT@", "--models-preset", str(ini)], name="preset")
+    try:
+        st, _, m = s.req("GET", "/v1/models")
+        assert st == 200
+        by_id = {d["id"]: d for d in m["data"]}
+        assert set(by_id) == {"m1", "m2"}
+        assert by_id["m1"]["status"]["value"] == "unloaded"
+        assert by_id["m2"]["status"]["value"] == "unloaded"
+
+        st, _, r1 = s.req("POST", "/v1/chat/completions", {"model": "m1", "messages": [{"role": "user", "content": "hi"}], "chat_template_kwargs": {"enable_thinking": False}})
+        assert st == 200 and r1["model"] == "m1" and "alpha" in r1["choices"][0]["message"]["content"]
+        by_id = {d["id"]: d for d in s.req("GET", "/v1/models")[2]["data"]}
+        assert by_id["m1"]["status"]["value"] == "loaded" and by_id["m2"]["status"]["value"] == "unloaded"
+
+        st, _, r2 = s.req("POST", "/v1/chat/completions", {"model": "m2", "messages": [{"role": "user", "content": "hi"}], "chat_template_kwargs": {"enable_thinking": False}})
+        assert st == 200 and r2["model"] == "m2" and "beta" in r2["choices"][0]["message"]["content"]
+        assert s.req("GET", "/props")[2]["default_generation_settings"]["n_ctx"] == 8192
+
+        by_id = {d["id"]: d for d in s.req("GET", "/v1/models")[2]["data"]}
+        assert by_id["m1"]["status"]["value"] == "unloaded" and by_id["m2"]["status"]["value"] == "loaded"
+
+        assert s.req("POST", "/v1/chat/completions", {"model": "nope", "messages": [{"role": "user", "content": "hi"}]})[0] == 404
+        assert s.req("POST", "/models/unload", {})[0] == 200
+        assert all(d["status"]["value"] == "unloaded" for d in s.req("GET", "/v1/models")[2]["data"])
+        assert s.req("POST", "/models/load", {"model": "m1"})[0] == 200
+        assert s.req("GET", "/v1/models")[2]["data"][0]["status"]["value"] == "loaded"
+    finally:
+        s.stop()
+
+
 # =============================================================================================== part 2: structural diff vs llama-server
 def shape(v):
     if isinstance(v, dict): return {k: shape(x) for k, x in v.items()}

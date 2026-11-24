@@ -165,7 +165,7 @@ Value anthropic_to_oai(const Value& body) {
     }
     if (const Value* s = get(body, "stop_sequences")) out.set("stop", *s);
     if (const Value* mt = get(body, "max_tokens")) out.set("max_tokens", *mt); else out.set("max_tokens", 4096);
-    for (const char* k : {"temperature", "top_p", "top_k", "stream", "chat_template_kwargs", "id_slot"})
+    for (const char* k : {"model", "temperature", "top_p", "top_k", "stream", "chat_template_kwargs", "id_slot"})
         if (const Value* v = get(body, k)) out.set(k, *v);
     if (const Value* th = get(body, "thinking"); th && th->is_object() && get_str(*th, "type") == "enabled") {
         const Value* b = get(*th, "budget_tokens");
