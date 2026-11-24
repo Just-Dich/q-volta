@@ -13,14 +13,16 @@ namespace qv {
 
 class MockEngine : public Engine {
    public:
-    MockEngine(int vocab, std::vector<int> script, int eos, bool loop, int delay_us) : script_(std::move(script)), eos_(eos), loop_(loop), delay_us_(delay_us) {
+    MockEngine(int vocab, std::vector<int> script, int eos, bool loop, int delay_us, int n_seq = 1) : script_(std::move(script)), eos_(eos), loop_(loop), delay_us_(delay_us), st_(std::max(1, n_seq)) {
         cfg_.vocab = vocab;
         cfg_.eos = eos;
         cfg_.arch = "mock";
         if (script_.empty()) script_.push_back(eos);
     }
-    void step(int, int pos) override { delay(1); k_ = pos + 1 - prompt_end_; }
-    void prefill(const int*, int T, int pos0) override { delay(T / 8 + 1); prompt_end_ = pos0 + T; k_ = 0; }
+    int n_seq() const override { return (int)st_.size(); }
+    void select_seq(int i) override { if (i < 0 || i >= (int)st_.size()) throw std::runtime_error("sequence index out of range"); cur_ = i; }
+    void step(int, int pos) override { delay(1); st_[cur_].k = pos + 1 - st_[cur_].prompt_end; }
+    void prefill(const int*, int T, int pos0) override { delay(T / 8 + 1); st_[cur_].prompt_end = pos0 + T; st_[cur_].k = 0; }
     void prefill_embeds(const int*, const float*, const unsigned char* mask, int T, int pos0) override {
         for (int i = 0; i < T; ++i) n_embeds_ += mask[i] ? 1 : 0;
         prefill(nullptr, T, pos0);
@@ -41,7 +43,7 @@ class MockEngine : public Engine {
         const float ru[3] = {18.0f, 17.0f, 16.0f};
         for (int j = 0; j < 3; ++j) { int a = (t + 1 + j * 7919) % V; if (a != t) out[a] = ru[j]; }
     }
-    void reset() override { k_ = 0; prompt_end_ = 0; }
+    void reset() override { st_[cur_].k = 0; st_[cur_].prompt_end = 0; }
     const std::vector<float>& hidden_dump() const override { return empty_; }
     const std::vector<float>& logits_dump() const override { return empty_; }
     void sync() override {}
@@ -53,9 +55,12 @@ class MockEngine : public Engine {
     int eos_;
     bool loop_;
     int delay_us_;
-    int k_ = 0, prompt_end_ = 0;
+    struct Seq { int k = 0, prompt_end = 0; };
+    std::vector<Seq> st_;
+    int cur_ = 0;
     std::vector<float> empty_;
     int scripted() const {
+        const int k_ = st_[cur_].k;
         if (k_ < (int)script_.size()) return script_[k_];
         if (loop_) return script_[k_ % script_.size()];
         return eos_;

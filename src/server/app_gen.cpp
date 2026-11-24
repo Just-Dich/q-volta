@@ -457,6 +457,8 @@ Task App::parse_task(const Value& body, Kind kind) {
         t.thinking_open = co.thinking_open;
         t.think_start = co.think_start;
         t.think_end = co.think_end;
+        t.reasoning_budget = o.reasoning_budget;
+        t.reasoning_budget_msg = o.reasoning_budget_message;
         t.stops.insert(t.stops.end(), co.additional_stops.begin(), co.additional_stops.end());
         t.tool_fmt = co.tool_format;
         if (has_tools) {
@@ -514,28 +516,113 @@ std::shared_ptr<grammar::Matcher> App::get_matcher(const std::string& gbnf) {
 }
 
 // ------------------------------------------------------------------------------------------------ generation
-long App::lease_acquire(const std::function<bool()>& alive) {
+int App::pick_slot_locked(const Waiter& w) const {
+    if (!multi_seq) {
+        if (n_busy_ >= 1) return -1;
+        return (w.want >= 0 && w.want < n_slots) ? w.want : owner_slot_;
+    }
+    if (w.want >= 0 && w.want < n_slots) return slot_busy_[w.want] ? -1 : w.want;
+    int best = -1;
+    size_t best_len = 0;
+    for (int s = 0; s < n_slots; ++s) {  // 1. idle slot whose cached context is a prefix of the prompt (longest wins)
+        if (slot_busy_[s]) continue;
+        const std::vector<int>& c = slot_cached_[s];
+        if (w.prompt && !c.empty() && c.size() <= w.prompt->size() && c.size() > best_len && std::equal(c.begin(), c.end(), w.prompt->begin())) { best = s; best_len = c.size(); }
+    }
+    if (best >= 0) return best;
+    for (int s = 0; s < n_slots; ++s) if (!slot_busy_[s] && slot_cached_[s].empty()) return s;  // 2. an empty slot
+    for (int s = 0; s < n_slots; ++s)                                                          // 3. least recently used
+        if (!slot_busy_[s] && (best < 0 || slot_used_[s] < slot_used_[best])) best = s;
+    return best;
+}
+
+void App::dispatch_locked() {
+    bool excl_ahead = false;
+    for (Waiter& w : waiters_) {
+        if (w.granted) continue;
+        if (w.kind == 1) {
+            if (!excl_held_ && n_busy_ == 0 && n_users_ == 0) { w.granted = true; excl_held_ = true; }
+            excl_ahead = true;
+        } else if (w.kind == 2) {
+            if (!excl_held_ && !excl_ahead) { w.granted = true; ++n_users_; }
+        } else {
+            if (excl_held_ || (excl_ahead && !w.user)) continue;  // a model user (w.user) may finish its request while an exclusive waiter waits for it
+            if (n_busy_ >= conc_limit_) continue;
+            int sid = pick_slot_locked(w);
+            if (sid < 0) continue;
+            w.granted = true; w.sid = sid; slot_busy_[sid] = 1; ++n_busy_;
+        }
+    }
+}
+
+long App::wait_granted(int kind, int want, const std::vector<int>* prompt, bool user, const std::function<bool()>& alive, int* sid_out) {
     std::unique_lock<std::mutex> lk(mu_);
-    if (o.max_queue >= 0 && waiting_ >= o.max_queue && serving_ != next_ticket_)
-        throw_error(503, "The server is busy (request queue is full). Retry later.");
-    long ticket = next_ticket_++;
-    ++waiting_;
-    while (serving_ != ticket) {
+    const long ticket = next_ticket_++;
+    waiters_.push_back(Waiter{ticket, kind, want, prompt, user, false, -1});
+    dispatch_locked();
+    auto find = [&] { for (auto it = waiters_.begin(); it != waiters_.end(); ++it) if (it->ticket == ticket) return it; return waiters_.end(); };
+    if (o.max_queue >= 0 && kind != 2) {
+        int pending = 0;
+        for (const Waiter& w : waiters_) pending += !w.granted;
+        auto it = find();
+        if (!it->granted && pending > o.max_queue) {
+            waiters_.erase(it);
+            dispatch_locked();
+            cv_.notify_all();
+            throw_error(503, "The server is busy (request queue is full). Retry later.");
+        }
+    }
+    cv_.notify_all();
+    for (;;) {
+        auto it = find();
+        if (it->granted) {
+            if (sid_out) *sid_out = it->sid;
+            waiters_.erase(it);
+            return ticket;
+        }
         cv_.wait_for(lk, std::chrono::milliseconds(100));
-        if (serving_ != ticket && !alive()) {
-            --waiting_;
-            skipped_.insert(ticket);
+        it = find();
+        if (!it->granted && !alive()) {
+            waiters_.erase(it);
+            dispatch_locked();
+            cv_.notify_all();
             return -1;
         }
     }
-    --waiting_;
-    return ticket;
 }
 
+long App::lease_acquire(const std::function<bool()>& alive) { return wait_granted(1, -1, nullptr, false, alive, nullptr); }
 void App::lease_release(long) {
     std::lock_guard<std::mutex> lk(mu_);
-    ++serving_;
-    while (skipped_.count(serving_)) { skipped_.erase(serving_); ++serving_; }
+    excl_held_ = false;
+    dispatch_locked();
+    cv_.notify_all();
+}
+long App::user_acquire(const std::function<bool()>& alive) { return wait_granted(2, -1, nullptr, false, alive, nullptr); }
+void App::user_release() {
+    std::lock_guard<std::mutex> lk(mu_);
+    --n_users_;
+    dispatch_locked();
+    cv_.notify_all();
+}
+void App::lease_downgrade() {
+    std::lock_guard<std::mutex> lk(mu_);
+    excl_held_ = false;
+    ++n_users_;
+    dispatch_locked();
+    cv_.notify_all();
+}
+int App::slot_acquire(const Task& t, bool user, const std::function<bool()>& alive) {
+    int sid = -1;
+    long tk = wait_granted(0, t.id_slot, &t.prompt, user, alive, &sid);
+    return tk < 0 ? -1 : sid;
+}
+void App::slot_release(int sid) {
+    std::lock_guard<std::mutex> lk(mu_);
+    slot_busy_[sid] = 0;
+    --n_busy_;
+    slot_used_[sid] = ++use_clock_;
+    dispatch_locked();
     cv_.notify_all();
 }
 
@@ -560,16 +647,20 @@ void App::prefill_with_images(const Task& t, int off, int n, const std::vector<s
 
 GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::function<bool(const Chunk&)>& on_chunk, const std::function<void(int)>& on_start, long existing_ticket) {
     GenResult r;
-    // ---- admission: FIFO ticket, slots are logical (one engine)
-    long ticket = existing_ticket >= 0 ? existing_ticket : lease_acquire(alive);
-    if (ticket < 0) { r.aborted = true; return r; }
-    struct Release { App& a; long ticket; bool own; ~Release() { a.last_task_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count(); if (own) a.lease_release(ticket); } } rel{*this, ticket, existing_ticket < 0};
+    int busy_sum = 0;  // sum over decoded tokens of the number of running slots (n_busy_slots_per_decode)
+    // ---- admission: FIFO queue for a free slot (slot i == engine sequence i; engines with one sequence run one request at a time)
+    const int sid = slot_acquire(t, existing_ticket >= 0, alive);
+    if (sid < 0) { r.aborted = true; return r; }
+    struct Release { App& a; int sid; ~Release() { a.last_task_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count(); a.slot_release(sid); } } rel{*this, sid};
     try { ensure_engine(); } catch (const std::exception& e) { throw_error(503, std::string("model reload failed: ") + e.what(), "unavailable_error"); }
-
-    int sid = 0;
+    std::vector<int>& cached_ = cached_of(sid);
+    // one engine turn: select this slot's sequence and hold the engine until the guard dies (FIFO fair across the running slots)
+    struct EngOp {
+        std::unique_lock<FairMutex> lk;
+        EngOp(App& a, int sid) : lk(a.eng_mu_) { a.eng->select_seq(a.seq_of(sid)); }
+    };
     {
         std::lock_guard<std::mutex> lk(mu_);
-        sid = (t.id_slot >= 0 && t.id_slot < n_slots) ? t.id_slot : owner_slot_;
         SlotInfo& s = slots_[sid];
         s.processing = true; s.has_task = true; s.id_task = task_counter_++;
         s.n_prompt = (int)t.prompt.size(); s.n_prompt_processed = 0; s.n_prompt_cache = 0; s.n_decoded = 0; s.n_remain = t.n_predict;
@@ -591,7 +682,7 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
     try {
         size_t start = 0;
         if (t.cache_prompt && !cached_.empty() && cached_.size() <= (size_t)N && std::equal(cached_.begin(), cached_.end(), t.prompt.begin())) start = cached_.size();
-        else { eng->reset(); cached_.clear(); }
+        else { EngOp op(*this, sid); eng->reset(); cached_.clear(); }
         r.n_cache = (int)start;
         r.n_prompt_eval = N - (int)start;
         { std::lock_guard<std::mutex> lk(mu_); slots_[sid].n_prompt_cache = (int)start; }
@@ -604,16 +695,20 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
             if (ip.start + ip.n <= (int)start) continue;
             if (!alive()) { r.aborted = true; return r; }
             img_emb.back().resize((size_t)ip.n * venc->cfg().text_hidden);
-            venc->encode(*ip.px, img_emb.back().data());
+            { std::lock_guard<std::mutex> vlk(venc_mu_); venc->encode(*ip.px, img_emb.back().data()); }
         }
-        for (size_t off = start; off < (size_t)N; off += chunk) {
+        for (size_t off = start; off < (size_t)N;) {
             if (!alive()) { r.aborted = true; return r; }
-            int n = (int)std::min<size_t>(chunk, N - off);
-            if (t.images.empty()) eng->prefill(t.prompt.data() + off, n, (int)off);
-            else prefill_with_images(t, (int)off, n, img_emb);
+            // prefill budget per engine turn: with other slots running, smaller chunks so their decode steps are not stalled for long
+            const int ch = (multi_seq && n_busy_ > 1) ? std::min(chunk, std::max(1, shared_chunk)) : chunk;
+            int n = (int)std::min<size_t>(ch, N - off);
+            { EngOp op(*this, sid);
+              if (t.images.empty()) eng->prefill(t.prompt.data() + off, n, (int)off);
+              else prefill_with_images(t, (int)off, n, img_emb); }
             cached_.insert(cached_.end(), t.prompt.begin() + off, t.prompt.begin() + off + n);
             { std::lock_guard<std::mutex> lk(mu_); slots_[sid].n_prompt_processed = (int)(off + n - start); }
             if (t.on_progress) t.on_progress(N, (int)start, (int)(off + n), ms(tp0, now()));
+            off += n;
         }
         r.prompt_ms = ms(tp0, now());
         if (t.n_predict == 0) { r.stop_type = "limit"; r.tokens_cached = (int)cached_.size(); goto done; }
@@ -638,16 +733,33 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
             const bool want_probs = t.n_probs > 0;
             const bool use_chunk = o.mtp && argmax_ok && !want_probs && !t.reasoning_end;
             std::vector<int> forced;
+            int reason_toks = 0;
+            bool budget_hit = false;
+            auto in_reasoning = [&]() -> bool {  // is the model currently inside its thinking block (prompt-opened or self-opened, not yet closed)?
+                const std::string seen = r.content + pending;
+                if (t.tool_fmt == ToolFormat::Inkling) {
+                    const size_t a = seen.rfind("<|content_thinking|>"), b = seen.rfind("<|end_message|>");
+                    if (a == std::string::npos) return t.thinking_open && b == std::string::npos;
+                    return b == std::string::npos || b < a;
+                }
+                return (t.thinking_open || seen.find(t.think_start) != std::string::npos) && seen.find(t.think_end) == std::string::npos;
+            };
             if (std::getenv("QV_MTP_DEBUG")) std::fprintf(stderr, "[qv_server] use_chunk=%d (mtp=%d argmax_ok=%d constrained=%d probs=%d)\n", (int)use_chunk, (int)o.mtp, (int)argmax_ok, (int)constrained, (int)want_probs);
             Chunk ck;
             bool hit_stop_word = false;
             const int budget = t.n_predict;  // <0: unlimited
             auto td0 = now();
             auto stamp = [&](Chunk& k) { k.n_cache = r.n_cache; k.n_prompt_eval = r.n_prompt_eval; k.prompt_ms = r.prompt_ms; k.predicted_ms = ms(td0, now()); };
-            auto pick = [&](TokProb& tp, bool& have_tp) -> int {
-                have_tp = false;
+            // engine part of picking the next token (caller holds the engine turn): argmax id, or -1 with the logits copied to `lg`
+            auto fetch = [&]() -> int {
                 if (argmax_ok && !want_probs) return eng->argmax();
                 eng->logits(lg);
+                return -1;
+            };
+            // host part (sampling, logprobs): runs outside the engine turn so other slots can use the GPU meanwhile
+            auto finish = [&](int a, TokProb& tp, bool& have_tp) -> int {
+                have_tp = false;
+                if (a >= 0) return a;
                 if (want_probs) raw = lg;
                 int tkn = argmax_ok ? (int)(std::max_element(lg.begin(), lg.end()) - lg.begin()) : sampler.sample(lg);
                 if (want_probs) {
@@ -668,11 +780,13 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
             };
             TokProb tp;
             bool have_tp = false;
-            int tk = pick(tp, have_tp);
+            int tk;
+            { int a; { EngOp op(*this, sid); a = fetch(); } tk = finish(a, tp, have_tp); }
             for (int n = 0;;) {
                 ++n;
                 r.n_decoded = n;
                 { std::lock_guard<std::mutex> lk(mu_); slots_[sid].n_decoded = n; slots_[sid].n_remain = budget < 0 ? -1 : budget - n; }
+                busy_sum += n_busy_.load();
                 r.tokens.push_back(tk);
                 const bool is_eos = std::find(stop_ids.begin(), stop_ids.end(), tk) != stop_ids.end();
                 if (is_eos) { r.stop_type = "eos"; r.tokens_cached = (int)cached_.size(); break; }
@@ -723,6 +837,7 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
                     int room = std::min(mtp_chunk, n_ctx - (int)cached_.size());
                     if (budget >= 0) room = std::min(room, budget - n);
                     if (room >= 2) {
+                        EngOp op(*this, sid);
                         eng->decode_greedy(tk, (int)cached_.size(), room, lookahead, false);
                         cached_.push_back(tk);
                         for (int i = 0; i + 1 < room; ++i) cached_.push_back(lookahead[i]);
@@ -731,8 +846,23 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
                         continue;
                     }
                 }
-                eng->step(tk, (int)cached_.size());
+                int fa;
+                {  // one engine turn per token: step + fetch the result (argmax id / logits) of this sequence
+                    EngOp op(*this, sid);
+                    eng->step(tk, (int)cached_.size());
+                    fa = fetch();
+                }
                 cached_.push_back(tk);
+                // --reasoning-budget N: after N tokens inside the thinking block close it (optional message first), like llama-server's budget sampler
+                if (forced.empty() && !budget_hit && t.reasoning_budget > 0 && in_reasoning()) {
+                    if (++reason_toks >= t.reasoning_budget) {
+                        budget_hit = true;
+                        const bool ink = t.tool_fmt == ToolFormat::Inkling;
+                        const std::string tail = ink ? "<|end_message|><|message_model|><|content_text|>" : "\n" + t.think_end + "\n\n";
+                        auto ids = tok.encode((t.reasoning_budget_msg.empty() ? std::string() : (ink ? t.reasoning_budget_msg : "\n" + t.reasoning_budget_msg)) + tail, true);
+                        forced.assign(ids.begin(), ids.end());
+                    }
+                }
                 if (forced.empty() && t.reasoning_end && t.reasoning_end->exchange(false)) {
                     // "skip reasoning": close the thinking block by feeding the end marker as if the model had written it
                     const std::string seen = r.content + pending;
@@ -740,7 +870,7 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
                     if (inside) { auto ids = tok.encode("\n" + t.think_end + "\n\n", true); forced.assign(ids.begin(), ids.end()); }
                 }
                 if (!forced.empty()) { tk = forced.front(); forced.erase(forced.begin()); have_tp = false; }
-                else tk = pick(tp, have_tp);
+                else tk = finish(fa, tp, have_tp);
             }
             if (!r.aborted && !hit_stop_word) {  // flush held-back text
                 pending += dec.flush();
@@ -758,7 +888,7 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
     } catch (const ApiError&) {
         throw;
     } catch (const std::exception& e) {
-        eng->reset();
+        { EngOp op(*this, sid); eng->reset(); }
         cached_.clear();
         std::fprintf(stderr, "[qv_server] engine error: %s\n", e.what());
         throw_error(500, std::string("engine error: ") + e.what());
@@ -775,7 +905,7 @@ done:
         m_.n_decode_total += r.n_decoded;
         m_.n_tokens_max = std::max<long long>(m_.n_tokens_max, (long long)cached_.size());
         m_.b_prompt_tokens += r.n_prompt_eval; m_.b_prompt_s += r.prompt_ms / 1e3; m_.b_pred_tokens += r.n_decoded; m_.b_pred_s += r.predicted_ms / 1e3;
-        m_.b_busy_sum += r.n_decoded; m_.b_decode += r.n_decoded;
+        m_.b_busy_sum += busy_sum; m_.b_decode += r.n_decoded;
     }
     if (o.verbosity >= 3 && !o.log_disable)
         std::fprintf(stderr, "[qv_server] slot %d task done: prompt=%d cached=%d gen=%d stop=%s%s prompt=%.0fms gen=%.0fms (%.2f tok/s)\n", sid, N, r.n_cache, r.n_decoded,

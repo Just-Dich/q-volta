@@ -47,14 +47,18 @@ class CudaEngine final : public Engine {
     CudaEngine(const ModelFile& mf, const EngineOptions& opt) : opt_(opt) {
         cfg_ = mf.cfg;
         if (opt_.mtp_depth < 1 || opt_.mtp_depth > 3) throw std::runtime_error("mtp_depth must be 1..3");
+        if (opt_.n_seq < 1) opt_.n_seq = 1;
+        if (opt_.n_seq > 1 && opt_.mtp) throw std::runtime_error("MTP supports one sequence (use n_seq = 1)");
         QV_CUDA_CHECK(cudaStreamCreate(&stream_));
         load_weights(mf);
         bind(mf);
         alloc_state();
-        reset();
+        for (int i = opt_.n_seq - 1; i >= 0; --i) { select_seq(i); reset(); }  // ends on sequence 0
     }
     ~CudaEngine() override {
-        if (graph_exec_) cudaGraphExecDestroy(graph_exec_);
+        seqs_[cur_seq_] = snapshot();
+        for (SeqSt& q : seqs_) if (q.graph_exec) cudaGraphExecDestroy(q.graph_exec);
+        graph_exec_ = nullptr;
         lp_.destroy();
         if (h_tp_) cudaFreeHost(h_tp_);
         if (opt_.mtp) { cudaFreeHost(h_a_); cudaFreeHost(h_b_); cudaFreeHost(h_res_); }
@@ -653,7 +657,37 @@ class CudaEngine final : public Engine {
         QV_CUDA_CHECK(cudaGraphLaunch(vgraph_[NT], stream_));
     }
 
+    int n_seq() const override { return opt_.n_seq; }
+    // views onto the current sequence: recurrent / KV state, logits, token+position buffer, decode graph (weights and scratch are shared)
+    void select_seq(int i) override {
+        if (i < 0 || i >= opt_.n_seq) throw std::runtime_error("sequence index out of range");
+        if (i == cur_seq_) return;
+        seqs_[cur_seq_] = snapshot();
+        const SeqSt& q = seqs_[i];
+        conv_state_ = q.conv_state; gdn_state_ = q.gdn_state; k_cache_ = q.k_cache; v_cache_ = q.v_cache; kv4_blocks_ = q.kv4_blocks;
+        kv4_ring_k_ = q.kv4_ring_k; kv4_ring_v_ = q.kv4_ring_v; kv4_ = q.kv4; logits_ = q.logits;
+        d_tok_ = q.d_tok; d_pos_ = q.d_tok + 1; d_gen_ = q.d_gen; graph_exec_ = q.graph_exec;
+        cur_seq_ = i;
+    }
+
    private:
+    struct SeqSt {
+        float *conv_state = nullptr, *gdn_state = nullptr, *k_cache = nullptr, *v_cache = nullptr, *logits = nullptr;
+        uint8_t* kv4_blocks = nullptr;
+        __half *kv4_ring_k = nullptr, *kv4_ring_v = nullptr;
+        std::vector<Kv4Layer> kv4;
+        int *d_tok = nullptr, *d_gen = nullptr;
+        cudaGraphExec_t graph_exec = nullptr;
+    };
+    std::vector<SeqSt> seqs_;
+    int cur_seq_ = 0;
+    SeqSt snapshot() const {
+        SeqSt q;
+        q.conv_state = conv_state_; q.gdn_state = gdn_state_; q.k_cache = k_cache_; q.v_cache = v_cache_; q.kv4_blocks = kv4_blocks_;
+        q.kv4_ring_k = kv4_ring_k_; q.kv4_ring_v = kv4_ring_v_; q.kv4 = kv4_; q.logits = logits_; q.d_tok = d_tok_; q.d_gen = d_gen_;
+        q.graph_exec = graph_exec_;
+        return q;
+    }
     EngineOptions opt_;
     cudaStream_t stream_{};
     char* weights_ = nullptr;
@@ -828,34 +862,46 @@ class CudaEngine final : public Engine {
         const int conv_C = 2 * c.lin_k_heads * c.lin_k_dim + c.lin_v_heads * c.lin_v_dim;
         conv_bytes_ = (size_t)n_gdn_ * conv_C * 3 * 4;
         gdn_bytes_ = (size_t)n_gdn_ * c.lin_v_heads * c.lin_k_dim * c.lin_v_dim * 4;
-        conv_state_ = dalloc<float>(conv_bytes_ / 4);
-        gdn_state_ = dalloc<float>(gdn_bytes_ / 4);
-        kv4_on_ = opt_.kv_mode != 0;
-        const int n_kv_layers = n_attn_ + (opt_.mtp ? 1 : 0);
-        if (kv4_on_) {
-            if (c.head_dim != KV4_D || c.n_kv_heads * 6 != c.n_heads) throw std::runtime_error("int4/fp16 KV needs head_dim 256, 6 q heads per kv head");
-            const bool exact = opt_.kv_mode == 2;  // fp16 KV: full-length fp16 ring, no quantization
-            const int nblk = exact ? 1 : (opt_.max_ctx + KV4_BLK - 1) / KV4_BLK;
-            const int ring_n = exact ? opt_.max_ctx : KV4_RING;
-            kv4_blocks_ = dalloc<uint8_t>((size_t)n_kv_layers * c.n_kv_heads * nblk * KV4_REC_BYTES);
-            kv4_ring_k_ = dalloc<__half>((size_t)n_kv_layers * c.n_kv_heads * ring_n * KV4_D);
-            kv4_ring_v_ = dalloc<__half>((size_t)n_kv_layers * c.n_kv_heads * ring_n * KV4_D);
-            for (int i = 0; i < n_kv_layers; ++i) {
-                Kv4Layer l;
-                l.blocks = kv4_blocks_ + (size_t)i * c.n_kv_heads * nblk * KV4_REC_BYTES;
-                l.ring_k = kv4_ring_k_ + (size_t)i * c.n_kv_heads * ring_n * KV4_D;
-                l.ring_v = kv4_ring_v_ + (size_t)i * c.n_kv_heads * ring_n * KV4_D;
-                l.nblocks = nblk;
-                l.kmode = opt_.kv4_kmode;
-                l.ring_n = ring_n;
-                l.exact = exact;
-                kv4_.push_back(l);
+        seqs_.assign(opt_.n_seq, SeqSt());
+        for (int sq = 0; sq < opt_.n_seq; ++sq) {  // per-sequence state
+            kv4_.clear();
+            conv_state_ = dalloc<float>(conv_bytes_ / 4);
+            gdn_state_ = dalloc<float>(gdn_bytes_ / 4);
+            kv4_on_ = opt_.kv_mode != 0;
+            const int n_kv_layers = n_attn_ + (opt_.mtp ? 1 : 0);
+            if (kv4_on_) {
+                if (c.head_dim != KV4_D || c.n_kv_heads * 6 != c.n_heads) throw std::runtime_error("int4/fp16 KV needs head_dim 256, 6 q heads per kv head");
+                const bool exact = opt_.kv_mode == 2;  // fp16 KV: full-length fp16 ring, no quantization
+                const int nblk = exact ? 1 : (opt_.max_ctx + KV4_BLK - 1) / KV4_BLK;
+                const int ring_n = exact ? opt_.max_ctx : KV4_RING;
+                kv4_blocks_ = dalloc<uint8_t>((size_t)n_kv_layers * c.n_kv_heads * nblk * KV4_REC_BYTES);
+                kv4_ring_k_ = dalloc<__half>((size_t)n_kv_layers * c.n_kv_heads * ring_n * KV4_D);
+                kv4_ring_v_ = dalloc<__half>((size_t)n_kv_layers * c.n_kv_heads * ring_n * KV4_D);
+                for (int i = 0; i < n_kv_layers; ++i) {
+                    Kv4Layer l;
+                    l.blocks = kv4_blocks_ + (size_t)i * c.n_kv_heads * nblk * KV4_REC_BYTES;
+                    l.ring_k = kv4_ring_k_ + (size_t)i * c.n_kv_heads * ring_n * KV4_D;
+                    l.ring_v = kv4_ring_v_ + (size_t)i * c.n_kv_heads * ring_n * KV4_D;
+                    l.nblocks = nblk;
+                    l.kmode = opt_.kv4_kmode;
+                    l.ring_n = ring_n;
+                    l.exact = exact;
+                    kv4_.push_back(l);
+                }
+            } else {
+                size_t kv = (size_t)n_kv_layers * c.n_kv_heads * opt_.max_ctx * c.head_dim;
+                k_cache_ = dalloc<float>(kv);
+                v_cache_ = dalloc<float>(kv);
             }
-        } else {
-            size_t kv = (size_t)n_kv_layers * c.n_kv_heads * opt_.max_ctx * c.head_dim;
-            k_cache_ = dalloc<float>(kv);
-            v_cache_ = dalloc<float>(kv);
+            logits_ = dalloc<float>(c.vocab);
+            d_tok_ = dalloc<int>(2);  // [token, pos] contiguous: one H2D copy per step
+            d_pos_ = d_tok_ + 1;
+            d_gen_ = dalloc<int>(opt_.max_ctx + 1);
+            graph_exec_ = nullptr;
+            seqs_[sq] = snapshot();
         }
+        cur_seq_ = opt_.n_seq - 1;
+        select_seq(0);
         x_ = dalloc<float>(c.hidden);
         xn_ = dalloc<float>(c.hidden);
         xs_ = dalloc<float>(std::max(c.inter, 2 * c.n_heads * c.head_dim) / 32 + 32);
@@ -873,10 +919,6 @@ class CudaEngine final : public Engine {
         g_ = dalloc<float>(c.inter);
         u_ = dalloc<float>(c.inter);
         act_ = dalloc<float>(c.inter);
-        logits_ = dalloc<float>(c.vocab);
-        d_tok_ = dalloc<int>(2);  // [token, pos] contiguous: one H2D copy per step
-        d_pos_ = d_tok_ + 1;
-        d_gen_ = dalloc<int>(opt_.max_ctx + 1);
         QV_CUDA_CHECK(cudaMallocHost(&h_tp_, 2 * sizeof(int)));
         d_arg_ = dalloc<int>(1);
         {

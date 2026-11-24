@@ -91,7 +91,7 @@ const std::set<std::string>& handled() {
     static const std::set<std::string> s = {
         "model", "models-preset", "models-max", "ctx-size", "threads", "threads-http", "n-gpu-layers", "gpu-layers", "batch-size", "ubatch-size", "host", "port", "api-key", "api-key-file",
         "alias", "parallel", "cont-batching", "cache-prompt", "jinja", "chat-template", "chat-template-file", "chat-template-kwargs", "reasoning-format",
-        "reasoning", "reasoning-budget", "reasoning-effort", "metrics", "slots", "props", "embedding", "predict", "temp", "top-k", "top-p", "min-p",
+        "reasoning", "reasoning-budget", "reasoning-budget-message", "reasoning-effort", "metrics", "slots", "props", "embedding", "predict", "temp", "top-k", "top-p", "min-p",
         "typical", "top-nsigma", "xtc-probability", "xtc-threshold", "repeat-penalty", "repeat-last-n", "presence-penalty", "frequency-penalty",
         "dry-multiplier", "dry-base", "dry-allowed-length", "dry-penalty-last-n", "dry-sequence-breaker", "mirostat", "mirostat-lr", "mirostat-ent",
         "dynatemp-range", "dynatemp-exp", "seed", "samplers", "ignore-eos", "logit-bias", "timeout", "path", "ui", "log-disable", "verbose", "log-verbosity",
@@ -144,6 +144,7 @@ void apply(Options& o, const Resolved& r, const std::string& flag, const std::st
         else fail("invalid --reasoning-format '" + val + "' (auto, none, deepseek, deepseek-legacy)");
     } else if (c == "reasoning") o.reasoning = val == "on" || truthy(val) ? 1 : (val == "off" || falsey(val) ? 0 : -1);
     else if (c == "reasoning-budget") o.reasoning_budget = to_int(val, flag);
+    else if (c == "reasoning-budget-message") o.reasoning_budget_message = val;
     else if (c == "reasoning-effort") o.reasoning_effort = val == "default" ? "" : val;
     else if (c == "metrics") o.metrics = true;
     else if (c == "slots") o.slots = !r.neg;

@@ -58,6 +58,8 @@ class InklingEngine final : public Engine {
             k.topk != ik::TOPK || k.expert_ff != ik::FF || k.window != 1024 || k.rel_extent != 1024 || k.d_rel != 16 || k.sconv_kernel != 4 ||
             k.attn_res_block != 6 || k.n_shared_experts != 0 || !k.w13_interleaved)
             throw std::runtime_error("unsupported inkling configuration");
+        if (opt_.n_seq < 1) opt_.n_seq = 1;
+        if (opt_.n_seq > 1 && opt.mtp) throw std::runtime_error("MTP supports one sequence (use n_seq = 1)");
         QV_CUDA_CHECK(cudaStreamCreate(&stream_));
         load_weights(mf);
         bind(mf);
@@ -71,12 +73,16 @@ class InklingEngine final : public Engine {
             d_dummy_i_ = dalloc<int>(16);
             QV_CUDA_CHECK(cudaMemcpy(d_dummy_i_, ones, sizeof ones, cudaMemcpyHostToDevice));
         }
-        reset();
+        for (int i = opt_.n_seq - 1; i >= 0; --i) { select_seq(i); reset(); }  // ends on sequence 0
     }
     ~InklingEngine() override {
         if (cublas_) cublasDestroy(cublas_);
-        if (g_fwd_) cudaGraphExecDestroy(g_fwd_);
-        if (g_dec_) cudaGraphExecDestroy(g_dec_);
+        seqs_[cur_seq_] = snapshot();
+        for (SeqSt& q : seqs_) {
+            if (q.g_fwd) cudaGraphExecDestroy(q.g_fwd);
+            if (q.g_dec) cudaGraphExecDestroy(q.g_dec);
+        }
+        g_fwd_ = g_dec_ = nullptr;
         if (h_tp_) cudaFreeHost(h_tp_);
         for (int i = 0; i < 9; ++i) if (g_mtp_[i]) cudaGraphExecDestroy(g_mtp_[i]);
         for (void* p : allocs_) cudaFree(p);
@@ -200,7 +206,39 @@ class InklingEngine final : public Engine {
     size_t device_bytes_weights() const override { return weights_bytes_; }
     size_t device_bytes_state() const override { return state_bytes_; }
 
+    int n_seq() const override { return opt_.n_seq; }
+    // Sequence switch: the members below (KV caches, conv states, token/position/logits buffers, CUDA graphs) are views onto the current
+    // sequence; everything else (weights, scratch, prefill buffers) is shared and fully rewritten by every step/chunk.
+    void select_seq(int i) override {
+        if (i < 0 || i >= opt_.n_seq) throw std::runtime_error("sequence index out of range");
+        if (i == cur_seq_) return;
+        seqs_[cur_seq_] = snapshot();
+        const SeqSt& q = seqs_[i];
+        lk_ = q.lk; lv_ = q.lv; gk_ = q.gk; gv_ = q.gv; gkq_ = q.gkq; gvq_ = q.gvq; gks_ = q.gks; gvs_ = q.gvs;
+        cst_k_ = q.cst_k; cst_v_ = q.cst_v; cst_a_ = q.cst_a; cst_m_ = q.cst_m;
+        d_tok_ = q.d_tok; d_pos_ = q.d_tok + 1; d_gen_ = q.d_gen; logits_ = q.logits; g_fwd_ = q.g_fwd; g_dec_ = q.g_dec;
+        cur_seq_ = i;
+    }
+
    private:
+    struct SeqSt {
+        __half *lk = nullptr, *lv = nullptr, *gk = nullptr, *gv = nullptr;
+        uint8_t *gkq = nullptr, *gvq = nullptr;
+        __half2 *gks = nullptr, *gvs = nullptr;
+        float *cst_k = nullptr, *cst_v = nullptr, *cst_a = nullptr, *cst_m = nullptr, *logits = nullptr;
+        int *d_tok = nullptr, *d_gen = nullptr;
+        cudaGraphExec_t g_fwd = nullptr, g_dec = nullptr;
+    };
+    std::vector<SeqSt> seqs_;
+    int cur_seq_ = 0;
+    size_t seq_bytes_ = 0;
+    SeqSt snapshot() const {
+        SeqSt q;
+        q.lk = lk_; q.lv = lv_; q.gk = gk_; q.gv = gv_; q.gkq = gkq_; q.gvq = gvq_; q.gks = gks_; q.gvs = gvs_;
+        q.cst_k = cst_k_; q.cst_v = cst_v_; q.cst_a = cst_a_; q.cst_m = cst_m_; q.logits = logits_;
+        q.d_tok = d_tok_; q.d_gen = d_gen_; q.g_fwd = g_fwd_; q.g_dec = g_dec_;
+        return q;
+    }
     static constexpr int TP_SLOTS = 4096;
     static constexpr int NSPLIT_L = 8, NSPLIT_G = 64;
     EngineOptions opt_;
@@ -400,20 +438,33 @@ class InklingEngine final : public Engine {
 
     void alloc_state() {
         const int H = ik::H;
-        lk_ = dalloc<__half>((size_t)n_lslots_ * ik::NKV * 1024 * ik::HD);
-        lv_ = dalloc<__half>((size_t)n_lslots_ * ik::NKV * 1024 * ik::HD);
-        if (kv4_) {
-            const size_t rows = (size_t)n_gslots_ * ik::NKV * opt_.max_ctx;
-            gkq_ = dalloc<uint8_t>(rows * 64); gvq_ = dalloc<uint8_t>(rows * 64);
-            gks_ = dalloc<__half2>(rows * 2); gvs_ = dalloc<__half2>(rows * 2);
-        } else {
-            gk_ = dalloc<__half>((size_t)n_gslots_ * ik::NKV * opt_.max_ctx * ik::HD);
-            gv_ = dalloc<__half>((size_t)n_gslots_ * ik::NKV * opt_.max_ctx * ik::HD);
+        seqs_.assign(opt_.n_seq, SeqSt());
+        for (int i = 0; i < opt_.n_seq; ++i) {  // per-sequence state
+            const size_t b0 = state_bytes_;
+            lk_ = dalloc<__half>((size_t)n_lslots_ * ik::NKV * 1024 * ik::HD);
+            lv_ = dalloc<__half>((size_t)n_lslots_ * ik::NKV * 1024 * ik::HD);
+            if (kv4_) {
+                const size_t rows = (size_t)n_gslots_ * ik::NKV * opt_.max_ctx;
+                gkq_ = dalloc<uint8_t>(rows * 64); gvq_ = dalloc<uint8_t>(rows * 64);
+                gks_ = dalloc<__half2>(rows * 2); gvs_ = dalloc<__half2>(rows * 2);
+            } else {
+                gk_ = dalloc<__half>((size_t)n_gslots_ * ik::NKV * opt_.max_ctx * ik::HD);
+                gv_ = dalloc<__half>((size_t)n_gslots_ * ik::NKV * opt_.max_ctx * ik::HD);
+            }
+            cst_k_ = dalloc<float>(48 * 3 * 1024);
+            cst_v_ = dalloc<float>(48 * 3 * 1024);
+            cst_a_ = dalloc<float>((size_t)48 * 3 * H);
+            cst_m_ = dalloc<float>((size_t)48 * 3 * H);
+            logits_ = dalloc<float>(cfg_.vocab);
+            d_tok_ = dalloc<int>(2);
+            d_pos_ = d_tok_ + 1;
+            d_gen_ = dalloc<int>(opt_.max_ctx + 1);
+            g_fwd_ = g_dec_ = nullptr;
+            seqs_[i] = snapshot();
+            if (i == 0) seq_bytes_ = state_bytes_ - b0;
         }
-        cst_k_ = dalloc<float>(48 * 3 * 1024);
-        cst_v_ = dalloc<float>(48 * 3 * 1024);
-        cst_a_ = dalloc<float>((size_t)48 * 3 * H);
-        cst_m_ = dalloc<float>((size_t)48 * 3 * H);
+        cur_seq_ = opt_.n_seq - 1;
+        select_seq(0);
         h_ = dalloc<float>(H);
         pre_h_ = dalloc<float>(H);
         blocks_ = dalloc<float>(4 * H);
@@ -436,14 +487,10 @@ class InklingEngine final : public Engine {
         qs_ = dalloc<float>(ik::NH * ik::HD);
         rl_ = dalloc<float>(ik::NH * 1024);
         part_ = dalloc<float>((size_t)ik::NKV * std::max(NSPLIT_L, NSPLIT_G) * 3 * ik::PART_STRIDE);
-        logits_ = dalloc<float>(cfg_.vocab);
         q8x_ = q8alloc(3 * ik::HC);
         q8m_ = q8alloc(ik::HC);
         q8act_ = q8alloc(8 * 36);
         q8o_ = q8alloc(96);
-        d_tok_ = dalloc<int>(2);
-        d_pos_ = d_tok_ + 1;
-        d_gen_ = dalloc<int>(opt_.max_ctx + 1);
         d_arg_ = dalloc<int>(1);
         QV_CUDA_CHECK(cudaMallocHost(&h_tp_, 2 * TP_SLOTS * sizeof(int)));
         if (opt_.dump_hidden) {

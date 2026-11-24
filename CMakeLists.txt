@@ -77,6 +77,8 @@ target_link_libraries(qv_cuda PUBLIC qv_core CUDA::cublas)
 target_compile_options(qv_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${QV_CUDA_FLAGS}>)
 
 
+add_executable(test_multiseq tests/test_multiseq.cpp)
+target_link_libraries(test_multiseq PRIVATE qv_cuda CUDA::cudart)
 add_executable(qv_ink tools/ink_run.cpp)
 target_link_libraries(qv_ink PRIVATE qv_cuda CUDA::cudart)
 add_executable(qv_run tools/qv_run.cpp)
@@ -133,6 +135,8 @@ if(QV_CPU)
   if(QV_CUDA)
     target_link_libraries(qv_run PRIVATE qv_cpu_engine)
     target_compile_definitions(qv_run PRIVATE QV_HAVE_CPU)
+    target_link_libraries(test_multiseq PRIVATE qv_cpu_engine)
+    target_compile_definitions(test_multiseq PRIVATE QV_HAVE_CPU)
   endif()
 endif()
 

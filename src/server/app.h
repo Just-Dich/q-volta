@@ -76,6 +76,9 @@ struct Task {
     bool include_usage = false, thinking_open = false;
     std::string reasoning_format = "none";  // none | deepseek | deepseek-legacy (resolved)
     std::string think_start = "<think>", think_end = "</think>";
+    int reasoning_budget = -1;  // --reasoning-budget N (N > 0): after N reasoning tokens the thinking block is closed by the server
+    std::string reasoning_budget_msg;
+    bool inkling_msgs = false;  // Inkling message stream (<|content_thinking|> ... <|end_message|>)
     std::string model_echo;
     bool logprobs_oai = false;
     // streaming extras (llama-server: return_progress, sse_ping_interval, X-Conversation-Id)
@@ -142,6 +145,27 @@ class StreamSession {
 };
 using StreamSessionPtr = std::shared_ptr<StreamSession>;
 
+// FIFO (ticket) mutex: threads get the engine in arrival order, so concurrent sequences interleave their engine operations round-robin
+// (one decode step or one prefill chunk each) and a long prefill cannot starve the others.
+class FairMutex {
+   public:
+    void lock() {
+        std::unique_lock<std::mutex> lk(m_);
+        const unsigned long t = next_++;
+        cv_.wait(lk, [&] { return serving_ == t; });
+    }
+    void unlock() {
+        { std::lock_guard<std::mutex> lk(m_); ++serving_; }
+        cv_.notify_all();
+    }
+    int waiting() { std::lock_guard<std::mutex> lk(m_); return (int)(next_ - serving_); }
+
+   private:
+    std::mutex m_;
+    std::condition_variable cv_;
+    unsigned long next_ = 0, serving_ = 0;
+};
+
 class App {
    public:
     Options o;
@@ -165,6 +189,11 @@ class App {
     int fim_pre = -1, fim_suf = -1, fim_mid = -1, fim_rep = -1, fim_sep = -1;
 
     void init_slots();
+    void set_sequences(bool multi);  // call with mu_ held (or from init_slots)
+    int shared_chunk = 512;  // prefill chunk (tokens) used while other slots are running, so their decode steps are not stalled by one huge chunk
+    std::mutex venc_mu_;
+    int slot_ctx = 4096;  // context of each slot / sequence (== n_ctx reported to clients): --ctx-size / n_slots when the engine holds one sequence per slot
+    bool multi_seq = false;  // engine holds n_slots sequences and runs requests concurrently; false: one sequence, requests run one at a time
     // ---- model presets / routing (--models-preset)
     Options base_opts;
     std::vector<ModelPreset> presets;
@@ -191,14 +220,38 @@ class App {
     std::atomic<long long> last_task_ms_{0};
     void ensure_engine();  // under the engine lease: wake from sleep
     // ---- engine queue + slots
+    // Admission is a single FIFO of waiters (slot requests, model users and exclusive admin leases) served by dispatch_locked():
+    //  - a slot waiter gets a free slot (its id_slot, else the idle slot with the longest cached prompt prefix, else an empty/least recently used one);
+    //    at most `conc_limit_` slots run at once (n_slots when the engine holds one sequence per slot, else 1);
+    //  - an exclusive waiter (model load/unload, sleep, slot actions on single-sequence engines) waits until no slot runs and no model user is
+    //    registered, and blocks everything queued behind it.
+    struct Waiter { long ticket; int kind; int want; const std::vector<int>* prompt; bool user; bool granted; int sid; };  // kind: 0 slot, 1 exclusive, 2 shared (model user)
     std::mutex mu_;
     mutable std::mutex state_mu_;  // guards active model metadata/tokenizer/template during hot-swap vs /models and /props reads
     std::condition_variable cv_;
-    long next_ticket_ = 0, serving_ = 0;
-    int waiting_ = 0;
-    std::set<long> skipped_;
+    long next_ticket_ = 0;
+    std::deque<Waiter> waiters_;
+    std::vector<char> slot_busy_;
+    std::atomic<int> n_busy_{0};
+    int n_users_ = 0, conc_limit_ = 1;
+    bool excl_held_ = false;
+    std::vector<long long> slot_used_;  // last use (monotonic counter) per slot, for LRU
+    long long use_clock_ = 0;
+    void dispatch_locked();
+    int pick_slot_locked(const Waiter& w) const;
+    long wait_granted(int kind, int want, const std::vector<int>* prompt, bool user, const std::function<bool()>& alive, int* sid_out);
+    long user_acquire(const std::function<bool()>& alive);
+    void user_release();
+    void lease_downgrade();  // exclusive -> model user
+    int slot_acquire(const Task& t, bool user, const std::function<bool()>& alive);  // slot id, or -1 if the client left while waiting
+    void slot_release(int sid);
+    bool engine_idle_locked() const { return waiters_.empty() && n_busy_ == 0 && n_users_ == 0 && !excl_held_; }
+    std::mutex reload_mu_;
+    FairMutex eng_mu_;  // engine operations (prefill chunk / decode step) of the concurrently running sequences
     std::vector<SlotInfo> slots_;
-    std::vector<int> cached_;  // tokens inside the engine (logits valid for exactly this context)
+    std::vector<std::vector<int>> slot_cached_;  // per sequence: tokens inside the engine (logits valid for exactly this context)
+    int seq_of(int sid) const { return multi_seq ? sid : 0; }
+    std::vector<int>& cached_of(int sid) { return slot_cached_[seq_of(sid)]; }
     int owner_slot_ = 0;
     long task_counter_ = 0;
     // metrics
@@ -239,7 +292,7 @@ class App {
     std::map<std::string, std::shared_ptr<grammar::Matcher>> matchers_;
 
     // ---- generation
-    long lease_acquire(const std::function<bool()>& alive);  // FIFO turn on the engine; -1 if the client left while waiting
+    long lease_acquire(const std::function<bool()>& alive);  // exclusive FIFO lease (waits for all slots to go idle); -1 if the client left while waiting
     void lease_release(long ticket);
     struct Admission;
     void prefill_with_images(const Task& t, int off, int n, const std::vector<std::vector<float>>& emb);
