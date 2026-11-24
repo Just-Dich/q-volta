@@ -803,24 +803,37 @@ void attn_part_rows(const AttnArgs& a, cudaStream_t s) { k_attn_part<<<dim3(NKV,
 
 // merge split partials + sink logit (value 0), multiply by sigmoid(gate), quantize to int8 for wo. grid 24 heads, 128 threads
 __global__ void __launch_bounds__(128) k_attn_combine(AttnArgs a) {
+    // the per-split maxima / sums are staged in shared memory by threads 0..nsp-1 (one parallel round of loads instead of a dependent load chain per
+    // split); the arithmetic and the order of the split loop are unchanged
+    __shared__ float sml[2 * 128];
     const int h = blockIdx.x, g = h / 3, hh = h % 3, d = threadIdx.x, nsp = a.nsplit, row = blockIdx.y;
     const float sink = a.sink[row * a.ss_rs + h];
     const float* partr = a.part + (size_t)row * (NKV * nsp * 3 * PART_STRIDE);
-    float M = sink;
-    for (int s = 0; s < nsp; ++s) {
-        const float* p = partr + ((size_t)(g * nsp + s) * 3 + hh) * PART_STRIDE;
-        if (p[1] > 0.f) M = fmaxf(M, p[0]);
-    }
-    float L = __expf(sink - M), o = 0.f;
-    for (int s = 0; s < nsp; ++s) {
-        const float* p = partr + ((size_t)(g * nsp + s) * 3 + hh) * PART_STRIDE;
-        if (p[1] > 0.f) {
-            const float e = __expf(p[0] - M);
-            L += e * p[1];
-            o += e * p[2 + d];
-        }
+    if (d < nsp) {
+        const float* p = partr + ((size_t)(g * nsp + d) * 3 + hh) * PART_STRIDE;
+        sml[d] = p[0];
+        sml[128 + d] = p[1];
     }
     const float gt = a.gate[row * a.gate_rs + h * HD + d];
+    __syncthreads();
+    float M = sink;
+    for (int s = 0; s < nsp; ++s)
+        if (sml[128 + s] > 0.f) M = fmaxf(M, sml[s]);
+    float L = __expf(sink - M), o = 0.f;
+    for (int s0 = 0; s0 < nsp; s0 += 8) {
+        float v[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) v[k] = (s0 + k < nsp) ? partr[((size_t)(g * nsp + s0 + k) * 3 + hh) * PART_STRIDE + 2 + d] : 0.f;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int s = s0 + k;
+            if (s < nsp && sml[128 + s] > 0.f) {
+                const float e = __expf(sml[s] - M);
+                L += e * sml[128 + s];
+                o += e * v[k];
+            }
+        }
+    }
     const float v = o / L * (1.f / (1.f + __expf(-gt)));
     Q8Buf ob = a.out;
     ob.q += (size_t)row * a.q8_rs * 8; ob.d += row * a.q8_rs; ob.sum += row * a.q8_rs; ob.qsum += row * a.q8_rs;
