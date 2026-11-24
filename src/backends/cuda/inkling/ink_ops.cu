@@ -9,7 +9,35 @@
 namespace qv::cuda::ink {
 
 namespace {
-
+#define QV_STR_(x) #x
+#define UNROLL_N(n) _Pragma(QV_STR_(unroll n))
+#ifndef MB_MG
+#define MB_MG 1
+#endif
+#ifndef MB_W13
+#define MB_W13 1
+#endif
+#ifndef MB_W2
+#define MB_W2 1
+#endif
+#ifndef UNG
+#define UNG 6
+#endif
+#ifndef UNP
+#define UNP 9
+#endif
+#ifndef UNQ
+#define UNQ 1
+#endif
+#ifndef UNF
+#define UNF 3
+#endif
+#ifndef UNW
+#define UNW 1
+#endif
+#ifndef UNR
+#define UNR 9
+#endif
 constexpr int NT = 768;      // threads of the hidden-size kernels: 3 elements per thread, element = t + 768 j
 constexpr int NW = NT / 32;  // 24 warps = 24 chunks per j
 
@@ -374,17 +402,36 @@ void norm_q8(const NormArgs& a, cudaStream_t s) { k_norm<<<a.T > 1 ? dim3(a.Tg ?
 // loop message gates: g = down @ [rms_u(h), rms_u(msg)] ; out = (1 - tanh(F g)) h + tanh(G g) msg
 __global__ void __launch_bounds__(256) k_gate_down(GateArgs a) {
     __shared__ float xs[2 * H];
-    __shared__ float red[32];
+    __shared__ float red[64];
     const int s = blockIdx.y / a.R, r = blockIdx.y % a.R, tid = threadIdx.x;
     const float* h = a.h[s] + r * a.hrs;
     const float* m = a.msg[s] + r * a.mrs;
     float s1 = 0.f, s2 = 0.f;
+UNROLL_N(UNP)
     for (int i = tid; i < H; i += 256) {
         s1 += h[i] * h[i];
         s2 += m[i] * m[i];
     }
-    const float r1 = rsqrtf(block_sum(s1, red) / H + 1e-6f);
-    const float r2 = rsqrtf(block_sum(s2, red) / H + 1e-6f);
+    // two block sums sharing one set of barriers (each is the same warp-tree + warp-0 tree as block_sum)
+    {
+        const int lane0 = tid & 31, w0 = tid >> 5;
+        s1 = warp_sum(s1);
+        s2 = warp_sum(s2);
+        __syncthreads();
+        if (lane0 == 0) { red[w0] = s1; red[32 + w0] = s2; }
+        __syncthreads();
+        float t1 = (tid < 8) ? red[tid] : 0.f, t2 = (tid < 8) ? red[32 + tid] : 0.f;
+        if (w0 == 0) {
+            t1 = warp_sum(t1);
+            t2 = warp_sum(t2);
+            if (lane0 == 0) { red[0] = t1; red[32] = t2; }
+        }
+        __syncthreads();
+        s1 = red[0];
+        s2 = red[32];
+    }
+    const float r1 = rsqrtf(s1 / H + 1e-6f);
+    const float r2 = rsqrtf(s2 / H + 1e-6f);
     for (int i = tid; i < H; i += 256) {
         xs[i] = h[i] * r1;
         xs[H + i] = m[i] * r2;
@@ -393,6 +440,7 @@ __global__ void __launch_bounds__(256) k_gate_down(GateArgs a) {
     const int warp = tid >> 5, lane = tid & 31, row = blockIdx.x * 8 + warp;
     const uint4* wp = reinterpret_cast<const uint4*>(a.down[s] + (size_t)row * 2 * H);
     float acc = 0.f;
+UNROLL_N(UNG)
     for (int i = lane; i < 2 * H / 8; i += 32) {
         const uint4 u = __ldg(wp + i);
         const __half2* hh = reinterpret_cast<const __half2*>(&u);
@@ -437,7 +485,7 @@ void gate(const GateArgs& a, cudaStream_t s) {
 // ------------------------------------------------------------------------------------------------------------------
 // multi-matrix GEMV: 4 warps per block, R rows per warp, each warp owns whole rows (lanes loop over 32-element chunks)
 template <int BITS, int R>
-__global__ void __launch_bounds__(128) k_mgemv(GDs D) {
+__global__ void __launch_bounds__(128, MB_MG) k_mgemv(GDs D) {
     int b = blockIdx.x, di = 0;
 #pragma unroll 1
     while (di < D.n - 1 && b >= D.d[di].nblk) {
@@ -456,6 +504,7 @@ __global__ void __launch_bounds__(128) k_mgemv(GDs D) {
         float rsc[R];
 #pragma unroll
         for (int r = 0; r < R; ++r) rsc[r] = __half2float(g.rs[min(row0 + r, g.N - 1)]) / 255.0f;
+UNROLL_N(UNQ)
         for (int c = lane; c < C; c += 32) {
             int xw[8], qs;
             float dx, xs;
@@ -472,6 +521,7 @@ __global__ void __launch_bounds__(128) k_mgemv(GDs D) {
         }
     } else {
         const int K8 = g.K >> 3;
+UNROLL_N(UNF)
         for (int i = lane; i < K8; i += 32) {
             const float4 x0 = *reinterpret_cast<const float4*>(g.xf + i * 8), x1 = *reinterpret_cast<const float4*>(g.xf + i * 8 + 4);
 #pragma unroll
@@ -762,6 +812,7 @@ __global__ void __launch_bounds__(64) k_router(const __half* W, const float* bia
     }
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, row = blockIdx.x * 2 + warp;
     float acc = 0.f;
+UNROLL_N(UNR)
     for (int i = lane; i < H / 8; i += 32) {
         const float4 x0 = *reinterpret_cast<const float4*>(x + i * 8), x1 = *reinterpret_cast<const float4*>(x + i * 8 + 4);
         const uint4 u = __ldg(reinterpret_cast<const uint4*>(W + (size_t)row * H) + i);
@@ -837,7 +888,7 @@ void router_rows(const __half* W, const float* bias, const float* x, float* logi
 
 // grouped expert GEMV 1: rows of w13 are interleaved (even = gate, odd = up). block = 64 rows = 32 activations, 16 warps x 4 rows.
 template <int BITS>
-__global__ void __launch_bounds__(512) k_w13(ExpertW W, Q8Vec x, const int* ids, Q8Buf act, float gcap, float ucap) {
+__global__ void __launch_bounds__(512, MB_W13) k_w13(ExpertW W, Q8Vec x, const int* ids, Q8Buf act, float gcap, float ucap) {
     __shared__ float actv[32];
     const int rb = blockIdx.x, slot = blockIdx.y, e = ids[slot];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -850,6 +901,7 @@ __global__ void __launch_bounds__(512) k_w13(ExpertW W, Q8Vec x, const int* ids,
     float acc[4] = {0.f, 0.f, 0.f, 0.f}, rsc[4];
 #pragma unroll
     for (int r = 0; r < 4; ++r) rsc[r] = __half2float(rsb[row0 + r]) / 255.0f;
+UNROLL_N(UNW)
     for (size_t c = lane; c < C; c += 32) {
         int xw[8], qs;
         float dx, xs;
@@ -889,7 +941,7 @@ void moe_w13(const ExpertW& W, const Q8Vec& x, const int* ids, Q8Buf act, float 
 
 // grouped expert GEMV 2: block = R rows of w2 for all 8 expert slots (warp = slot); the 8 slots are summed in slot order.
 template <int BITS, int R>
-__global__ void __launch_bounds__(256) k_w2(ExpertW W, Q8Vec act, const int* ids, const float* wts, float* y) {
+__global__ void __launch_bounds__(256, MB_W2) k_w2(ExpertW W, Q8Vec act, const int* ids, const float* wts, float* y) {
     __shared__ float ys[TOPK][R];
     const int slot = threadIdx.x >> 5, lane = threadIdx.x & 31, row0 = blockIdx.x * R, e = ids[slot];
     const size_t C = W.K >> 5, G = W.K >> W.gshift;
@@ -900,6 +952,7 @@ __global__ void __launch_bounds__(256) k_w2(ExpertW W, Q8Vec act, const int* ids
     float acc[R], rsc[R];
 #pragma unroll
     for (int r = 0; r < R; ++r) { acc[r] = 0.f; rsc[r] = __half2float(rsb[row0 + r]) / 255.0f; }
+UNROLL_N(UNW)
     for (size_t c = lane; c < C; c += 32) {
         int xw[8], qs;
         float dx, xs;
