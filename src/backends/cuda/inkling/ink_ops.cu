@@ -439,11 +439,22 @@ __global__ void __launch_bounds__(256) k_gate_down(GateArgs a) {
     const int s = blockIdx.y / a.R, r = blockIdx.y % a.R, tid = threadIdx.x;
     const float* h = a.h[s] + r * a.hrs;
     const float* m = a.msg[s] + r * a.mrs;
+    const int warp = tid >> 5, lane = tid & 31, row = blockIdx.x * GD_RPB + (warp % GD_RPB);
+    // the weight row (4608 halves = 18 uint4 per lane) and both input vectors are loaded up front: nothing below waits for a second memory round trip
+    uint4 wv[18];
+    if (warp < GD_RPB) {
+        const uint4* wp = reinterpret_cast<const uint4*>(a.down[s] + (size_t)row * 2 * H);
+#pragma unroll
+        for (int k = 0; k < 18; ++k) wv[k] = __ldg(wp + lane + 32 * k);
+    }
+    float hv[9], mv[9];
+#pragma unroll
+    for (int j = 0; j < 9; ++j) { hv[j] = h[tid + 256 * j]; mv[j] = m[tid + 256 * j]; }
     float s1 = 0.f, s2 = 0.f;
-UNROLL_N(UNP)
-    for (int i = tid; i < H; i += 256) {
-        s1 += h[i] * h[i];
-        s2 += m[i] * m[i];
+#pragma unroll
+    for (int j = 0; j < 9; ++j) {
+        s1 += hv[j] * hv[j];
+        s2 += mv[j] * mv[j];
     }
     // two block sums sharing one set of barriers (each is the same warp-tree + warp-0 tree as block_sum)
     {
@@ -465,23 +476,22 @@ UNROLL_N(UNP)
     }
     const float r1 = rsqrtf(s1 / H + 1e-6f);
     const float r2 = rsqrtf(s2 / H + 1e-6f);
-    for (int i = tid; i < H; i += 256) {
-        xs[i] = h[i] * r1;
-        xs[H + i] = m[i] * r2;
+#pragma unroll
+    for (int j = 0; j < 9; ++j) {
+        xs[tid + 256 * j] = hv[j] * r1;
+        xs[H + tid + 256 * j] = mv[j] * r2;
     }
     __syncthreads();
-    const int warp = tid >> 5, lane = tid & 31, row = blockIdx.x * GD_RPB + (warp % GD_RPB);
     if (warp >= GD_RPB) return;
-    const uint4* wp = reinterpret_cast<const uint4*>(a.down[s] + (size_t)row * 2 * H);
     float acc = 0.f;
-UNROLL_N(UNG)
-    for (int i = lane; i < 2 * H / 8; i += 32) {
-        const uint4 u = __ldg(wp + i);
-        const __half2* hh = reinterpret_cast<const __half2*>(&u);
 #pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            const float2 f = __half22float2(hh[k]);
-            acc = fmaf(f.x, xs[i * 8 + 2 * k], fmaf(f.y, xs[i * 8 + 2 * k + 1], acc));
+    for (int k = 0; k < 18; ++k) {
+        const int i = lane + 32 * k;
+        const __half2* hh = reinterpret_cast<const __half2*>(&wv[k]);
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const float2 f = __half22float2(hh[e]);
+            acc = fmaf(f.x, xs[i * 8 + 2 * e], fmaf(f.y, xs[i * 8 + 2 * e + 1], acc));
         }
     }
     acc = warp_sum(acc);
@@ -490,18 +500,27 @@ UNROLL_N(UNG)
 __global__ void __launch_bounds__(256) k_gate_apply(GateArgs a) {
     __shared__ float g[64];
     const int s = blockIdx.y / a.R, r = blockIdx.y % a.R;
+    const int i = blockIdx.x * 256 + threadIdx.x;
+    const bool act = i < H;
+    // weights and residual inputs first (they do not depend on the gate vector)
+    uint4 fu[8], gu[8];
+    float hi = 0.f, mi = 0.f;
+    if (act) {
+        const uint4* fp = reinterpret_cast<const uint4*>(a.forget[s] + (size_t)i * 64);
+        const uint4* gp = reinterpret_cast<const uint4*>(a.gain[s] + (size_t)i * 64);
+#pragma unroll
+        for (int k = 0; k < 8; ++k) { fu[k] = __ldg(fp + k); gu[k] = __ldg(gp + k); }
+        hi = a.h[s][r * a.hrs + i];
+        mi = a.msg[s][r * a.mrs + i];
+    }
     if (threadIdx.x < 64) g[threadIdx.x] = a.g[(s * a.R + r) * 64 + threadIdx.x];
     __syncthreads();
-    const int i = blockIdx.x * 256 + threadIdx.x;
-    if (i >= H) return;
-    const uint4* fp = reinterpret_cast<const uint4*>(a.forget[s] + (size_t)i * 64);
-    const uint4* gp = reinterpret_cast<const uint4*>(a.gain[s] + (size_t)i * 64);
+    if (!act) return;
     float f = 0.f, gn = 0.f;
 #pragma unroll
     for (int k = 0; k < 8; ++k) {
-        const uint4 u = __ldg(fp + k), w = __ldg(gp + k);
-        const __half2* hu = reinterpret_cast<const __half2*>(&u);
-        const __half2* hw = reinterpret_cast<const __half2*>(&w);
+        const __half2* hu = reinterpret_cast<const __half2*>(&fu[k]);
+        const __half2* hw = reinterpret_cast<const __half2*>(&gu[k]);
 #pragma unroll
         for (int e = 0; e < 4; ++e) {
             const float2 a1 = __half22float2(hu[e]), b1 = __half22float2(hw[e]);
@@ -509,7 +528,7 @@ __global__ void __launch_bounds__(256) k_gate_apply(GateArgs a) {
             gn = fmaf(b1.x, g[k * 8 + 2 * e], fmaf(b1.y, g[k * 8 + 2 * e + 1], gn));
         }
     }
-    a.out[s][r * a.ors + i] = (1.f - tanhf(f)) * a.h[s][r * a.hrs + i] + tanhf(gn) * a.msg[s][r * a.mrs + i];
+    a.out[s][r * a.ors + i] = (1.f - tanhf(f)) * hi + tanhf(gn) * mi;
 }
 void gate(const GateArgs& a, cudaStream_t s) {
     k_gate_down<<<dim3(64 / GD_RPB, a.S * a.R), 256, 0, s>>>(a);
