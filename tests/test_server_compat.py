@@ -1308,6 +1308,7 @@ def test_webui_in_browser():
         assert calls[("GET", "props")] == 200 and calls[("GET", "v1/models")] == 200 and calls[("POST", "v1/chat/completions")] == 200 and calls[("POST", "v1/streams/lookup")] == 200
         assert calls[("GET", "tools")] == 403            # server tools are disabled by default, the UI copes
         assert "Settings" in res["settings_text"] and "API Key" in res["settings_text"]
+        assert "Based on the llama.cpp web UI" in res["settings_text"] and "Q-Volta" in res["text"] + res["settings_text"]   # themed UI keeps the upstream credit
         for f in ("webui_home.png", "webui_streaming.png", "webui_chat.png", "webui_settings.png"): assert os.path.getsize(os.path.join(out, f)) > 5000
     finally:
         s.stop()

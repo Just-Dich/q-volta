@@ -1,15 +1,22 @@
 #!/bin/sh
 # Rebuild the vendored llama.cpp web UI (src/server/webui/gzip) from a llama.cpp checkout.
-# usage: scripts/vendor_webui.sh /path/to/llama.cpp [workdir]     (needs node/npm and network for `npm ci`)
+# usage: scripts/vendor_webui.sh /path/to/llama.cpp [workdir] [--no-theme]     (needs node/npm and network for `npm ci`)
+# The Q-Volta theme (src/server/webui-theme: q-volta-theme.patch + files/) is applied to the upstream sources before the build;
+# --no-theme builds the pristine upstream UI instead. After an upstream update, re-theme by refreshing the patch (see webui-theme/README.md).
 set -eu
 L=${1:?llama.cpp checkout}
 W=${2:-/tmp/qv_webui_build}
+THEME=1; [ "${3:-}" = "--no-theme" ] && THEME=0
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 rm -rf "$W" && mkdir -p "$W"
 cp -r "$L/ui" "$W/ui"
+if [ "$THEME" = 1 ]; then
+  (cd "$W/ui" && patch -p1 --no-backup-if-mismatch < "$HERE/src/server/webui-theme/q-volta-theme.patch" && cp -r "$HERE/src/server/webui-theme/files/." .)
+fi
 cd "$W/ui/apps/chat"
 npm ci
 npm run build                      # SvelteKit static adapter -> dist/ (same command llama.cpp's CMake runs)
+cp "$HERE/src/server/webui/LICENSE" dist/LICENSE-llama.cpp-webui.txt   # the MIT licence text, linked from the Settings credit
 OUT="$HERE/src/server/webui"
 python3 -I - "$W/ui/apps/chat/dist" "$OUT" <<'PY'
 import os, sys, gzip, hashlib, shutil
