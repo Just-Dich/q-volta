@@ -38,12 +38,13 @@
 | | |
 |---|---|
 | **Fast decode** | Qwen3.8-27B on one V100-16GB: **52-58 tok/s** plain, up to **130-138 tok/s** with exact MTP speculative decoding (output identical to plain greedy) |
-| **Small file** | one `.qv` file, **10.4 - 12.6 GiB**, 2-8 bit bit-plane quantization (GPTQ-style) |
+| **Small, self-contained file** | one `.qv` file with weights **and** tokenizer, chat template and metadata, **10.4 - 12.6 GiB**, 2-8 bit bit-plane quantization (GPTQ-style); see [docs/QV_FORMAT.md](docs/QV_FORMAT.md) |
 | **Long context** | **256K tokens on a 16 GB card** (10.4 GiB weights + int4 KV cache), tensor-core flash prefill |
 | **CPU too** | native AVX2 backend with exact MTP: 3.8-4.5 tok/s for the 27B on one old Xeon (1.4-1.6x over plain) |
-| **Drop-in server** | `qv_server`: llama-server flags, OpenAI chat/completions, tools, grammars, jinja templates |
-| **Second model** | [Inkling-2-Mini](docs/INKLING_RUN.md) (26B MoE, looped): ~120 tok/s on the V100 |
-| **Honest** | every claim has raw data; losses are listed ([caveats](#honest-caveats-read-before-comparing)) |
+| **Drop-in server + web UI** | `qv_server`: llama-server flags, OpenAI chat/completions, Anthropic `/v1/messages`, `/v1/responses`, tools, grammars, jinja templates, the embedded llama.cpp web UI, multi-model routing (`--models-preset`) |
+| **Second model: Inkling-2-Mini** | 26B MoE, looped layers: ~120 tok/s on the V100 through the server, **image input** (vision sidecar), optional exact MTP (0.55-1.73x, text dependent), see [docs/INKLING_RUN.md](docs/INKLING_RUN.md) |
+| **Weights** | [Qwen3.8-27B-QVolta](https://huggingface.co/q-project/Qwen3.8-27B-QVolta), [Inkling-2-Mini-QVolta](https://huggingface.co/q-project/Inkling-2-Mini-QVolta) (with vision and MTP sidecars) |
+| **Honest** | every claim has raw data; losses are listed: at equal size llama.cpp's quants are better in quality, see [caveats](#honest-caveats-read-before-comparing) |
 
 ## Quick start
 
@@ -135,7 +136,7 @@ Reading: at about equal bytes Q-Volta decodes and prefills faster and fits a lon
 - Tests: 12/12 ctest on the GPU build; full-model golden test passes (KL 6.5e-4 vs the simulated-quantization reference).
 
 ## Roadmap
-Better quantization (smaller file at equal quality), runtime LoRA inside the model file, 256K context (int4 KV), adaptive MTP depth and a restricted draft vocabulary, server MTP, CPU prefill (fp32 scale overhead), ARM/NEON.
+Done recently: 256K context with int4 KV, exact MTP in the server, single-file `.qv` with tokenizer, web UI, Inkling vision and MTP, act-order GPTQ recipe e1b1 (measured, not yet published). Next: quantization quality at equal size (the gap to llama.cpp), concurrent requests in the server (multi-sequence decoding, in development), runtime LoRA inside the model file, faster Inkling MTP verification, CPU prefill (fp32 scale overhead), ARM/NEON.
 
 ## Inkling-2-Mini
 The engine also runs thinkingmachines/Inkling-2-Mini (MoE, looped layers) on the V100 and the CPU backend: ~120 tok/s decode on the V100 through the server; exact MTP speculative decoding (sidecar drafter) gives about 1.25x on code at short context and 0.55-1.73x over the measured matrix (docs/INKLING_MTP.md). How to run it and what was measured: [docs/INKLING_RUN.md](docs/INKLING_RUN.md); design and parity with the Hugging Face implementation: [docs/INKLING_SPEC.md](docs/INKLING_SPEC.md), [docs/INKLING_ENGINE.md](docs/INKLING_ENGINE.md).
@@ -167,6 +168,9 @@ Full-model golden and benchmarks need the converted model (not included): see `C
 | CPU engine | [docs/CPU_OPTIMIZATION.md](docs/CPU_OPTIMIZATION.md) |
 | Inkling-2-Mini | [docs/INKLING_RUN.md](docs/INKLING_RUN.md), [spec](docs/INKLING_SPEC.md), [format](docs/INKLING_FORMAT.md), [engine](docs/INKLING_ENGINE.md) |
 | comparison with llama.cpp | [benchmarks/compare/README.md](benchmarks/compare/README.md) |
+| self-contained `.qv` format | [docs/QV_FORMAT.md](docs/QV_FORMAT.md) |
+| Inkling MTP and vision | [docs/INKLING_MTP.md](docs/INKLING_MTP.md), [docs/INKLING_VISION.md](docs/INKLING_VISION.md) |
+| multi-model routing | [docs/ROUTING.md](docs/ROUTING.md) |
 | Docker | [docs/DOCKER.md](docs/DOCKER.md) |
 | progress log | [docs/PROGRESS.md](docs/PROGRESS.md) |
 
