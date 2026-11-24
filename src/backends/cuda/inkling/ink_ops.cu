@@ -867,57 +867,48 @@ UNROLL_N(UNR)
     __syncthreads();
     if (threadIdx.x == 0) s_last = (atomicAdd(ticket, 1) == (int)gridDim.x - 1);
     __syncthreads();
-    if (!s_last || warp != 0) return;
+    if (!s_last) return;
     __threadfence();
-    float sv[4], sb[4];
+    // top-8 by (sigmoid + bias) with ties to the lower index, by rank: element i is selected at slot r iff exactly r elements precede it in the order
+    // (score descending, index ascending) -- the same selection and the same order as 8 rounds of warp argmax. 64 threads, 2 elements each.
+    __shared__ float s_sb[NE], s_sv[NE], s_w[TOPK];
+    __shared__ int s_id[TOPK];
+    {
+        const int tid = threadIdx.x;
 #pragma unroll
-    for (int k = 0; k < 4; ++k) {
-        const float l = __ldcg(logits + lane + 32 * k);
-        sv[k] = 1.f / (1.f + __expf(-l));
-        sb[k] = sv[k] + bias[lane + 32 * k];
-    }
-    float chosen_w = 0.f;
-    int chosen_i = 0;
-    float wsum = 0.f;
-    float wsel[TOPK];
-    for (int r = 0; r < TOPK; ++r) {
-        float best = -1e30f;
-        int bi = 1 << 30, bk = 0;
-#pragma unroll
-        for (int k = 0; k < 4; ++k)
-            if (sb[k] > best) { best = sb[k]; bi = lane + 32 * k; bk = k; }
-        float ob = best;
-        int oi = bi;
-#pragma unroll
-        for (int o = 16; o > 0; o >>= 1) {
-            const float vb = __shfl_xor_sync(0xffffffffu, ob, o);
-            const int vi = __shfl_xor_sync(0xffffffffu, oi, o);
-            if (vb > ob || (vb == ob && vi < oi)) { ob = vb; oi = vi; }
+        for (int k = 0; k < 2; ++k) {
+            const int i = tid + 64 * k;
+            const float l = __ldcg(logits + i);
+            const float sv = 1.f / (1.f + __expf(-l));
+            s_sv[i] = sv;
+            s_sb[i] = sv + bias[i];
         }
-        // owner lane = oi & 31, k = oi >> 5
-        const int kk = oi >> 5;
-        float w = 0.f;
-        if (lane == (oi & 31)) {
+    }
+    __syncthreads();
+    {
+        const int tid = threadIdx.x;
 #pragma unroll
-            for (int k = 0; k < 4; ++k)
-                if (k == kk) { w = sv[k]; sb[k] = -1e30f; }
+        for (int k = 0; k < 2; ++k) {
+            const int i = tid + 64 * k;
+            const float me = s_sb[i];
+            int rank = 0;
+#pragma unroll 16
+            for (int j = 0; j < NE; ++j) {
+                const float o = s_sb[j];
+                rank += (o > me) || (o == me && j < i);
+            }
+            if (rank < TOPK) { s_id[rank] = i; s_w[rank] = s_sv[i]; }
         }
-        w = __shfl_sync(0xffffffffu, w, oi & 31);
-        wsel[r] = w;
-        wsum += w;
-        if (lane == r) { chosen_i = oi; }
-        (void)bk;
     }
-    if (lane < TOPK) {
-        float w = 0.f;
+    __syncthreads();
+    if (threadIdx.x < TOPK) {
+        float wsum = 0.f;
 #pragma unroll
-        for (int r = 0; r < TOPK; ++r)
-            if (r == lane) w = wsel[r];
-        ids[lane] = chosen_i;
-        wts[lane] = w / (wsum + 1e-20f) * route_scale;
+        for (int r = 0; r < TOPK; ++r) wsum += s_w[r];
+        ids[threadIdx.x] = s_id[threadIdx.x];
+        wts[threadIdx.x] = s_w[threadIdx.x] / (wsum + 1e-20f) * route_scale;
     }
-    if (lane == 0) *ticket = 0;
-    (void)chosen_w;
+    if (threadIdx.x == 0) *ticket = 0;
 }
 void router(const __half* W, const float* bias, const float* x, float* logits, int* ids, float* wts, int* ticket, float route_scale, cudaStream_t s) {
     k_router<<<NE / 2, 64, 0, s>>>(W, bias, x, logits, ids, wts, ticket, route_scale);
