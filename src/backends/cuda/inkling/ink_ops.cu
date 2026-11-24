@@ -197,64 +197,87 @@ __global__ void __launch_bounds__(NT) k_ar(ArArgs a) {
     for (int b = 0; b < 5; ++b)
 #pragma unroll
         for (int j = 0; j < 3; ++j) v[b][j] = 0.f;
+    // all global loads of the kernel that do not depend on earlier results are issued first (the stores below may alias them, which would make the
+    // compiler serialize load -> store -> load chains: one memory round trip per j): block states, queries, norm weights, and the mode inputs.
+    float qpre[QM][3], npre[QM][3];
+#pragma unroll
+    for (int q = 0; q < QM; ++q)
+#pragma unroll
+        for (int j = 0; j < 3; ++j) {
+            qpre[q][j] = (a.mix && q < a.Q) ? queries[(long)q * H + t + NT * j] : 0.f;
+            npre[q][j] = (a.epi != 0 && q < a.Q) ? a.nw[q][t + NT * j] : 0.f;
+        }
+#pragma unroll
+    for (int b = 0; b < 4; ++b)
+#pragma unroll
+        for (int j = 0; j < 3; ++j) v[b][j] = (b < a.B) ? a.blocks[((long)b * NTK + tok) * H + t + NT * j] : 0.f;
     int NB;
     if (a.mode == 0) {
         NB = a.B + 1;
+        float hvv[3];
+        if (a.fin_y) {  // fused k_finish (one token): identical expressions
+            float x[3], c0[3], c1[3], c2[3], fr[3];
+            float4 w[3];
 #pragma unroll
-        for (int b = 0; b < 4; ++b)
+            for (int j = 0; j < 3; ++j) {
+                const int c = t + NT * j;
+                x[j] = a.fin_y[c]; c0[j] = a.fin_cst[c]; c1[j] = a.fin_cst[H + c]; c2[j] = a.fin_cst[2 * H + c];
+                w[j] = *reinterpret_cast<const float4*>(a.fin_cw + 4 * c);
+                fr[j] = a.fin_res[c];
+            }
 #pragma unroll
-            for (int j = 0; j < 3; ++j) v[b][j] = (b < a.B) ? a.blocks[((long)b * NTK + tok) * H + t + NT * j] : 0.f;
+            for (int j = 0; j < 3; ++j) {
+                const int c = t + NT * j;
+                const float yy = w[j].x * c0[j] + w[j].y * c1[j] + w[j].z * c2[j] + w[j].w * x[j];
+                a.fin_cst[c] = c1[j];
+                a.fin_cst[H + c] = c2[j];
+                a.fin_cst[2 * H + c] = x[j];
+                hvv[j] = fr[j] + (yy + x[j]) * 0.44721359549995794f;
+                a.fin_h_out[c] = hvv[j];
+                if (a.fin_copy) a.fin_copy[c] = hvv[j];
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 3; ++j) hvv[j] = a.h[tok * H + t + NT * j];
+        }
 #pragma unroll
         for (int j = 0; j < 3; ++j) {
-            float hv;
-            if (a.fin_y) {  // fused k_finish (one token): identical expressions
-                const int c = t + NT * j;
-                const float x = a.fin_y[c];
-                const float s0 = a.fin_cst[c], s1 = a.fin_cst[H + c], s2 = a.fin_cst[2 * H + c];
-                const float4 w = *reinterpret_cast<const float4*>(a.fin_cw + 4 * c);
-                const float yy = w.x * s0 + w.y * s1 + w.z * s2 + w.w * x;
-                a.fin_cst[c] = s1;
-                a.fin_cst[H + c] = s2;
-                a.fin_cst[2 * H + c] = x;
-                hv = a.fin_res[c] + (yy + x) * 0.44721359549995794f;
-                a.fin_h_out[c] = hv;
-                if (a.fin_copy) a.fin_copy[c] = hv;
-            } else {
-                hv = a.h[tok * H + t + NT * j];
-            }
+            const float hv = hvv[j];
             for (int b = 0; b < 5; ++b)
                 if (b == a.B) v[b][j] = hv;
         }
     } else {
         float res[3], hin[3];
+        float xr[3], q0[3], q1[3], q2[3];
+        float4 w[3];
 #pragma unroll
         for (int j = 0; j < 3; ++j) {
             const int c = t + NT * j;
-            const float x = a.araw[tok * H + c];
-            float s0, s1, s2;
+            xr[j] = a.araw[tok * H + c];
             {
                 const long i3 = tok - 3, i2 = tok - 2, i1 = tok - 1;
-                s0 = i3 >= 0 ? a.araw[i3 * H + c] : a.cst[(3 + i3) * H + c];
-                s1 = i2 >= 0 ? a.araw[i2 * H + c] : a.cst[(3 + i2) * H + c];
-                s2 = i1 >= 0 ? a.araw[i1 * H + c] : a.cst[(3 + i1) * H + c];
+                q0[j] = i3 >= 0 ? a.araw[i3 * H + c] : a.cst[(3 + i3) * H + c];
+                q1[j] = i2 >= 0 ? a.araw[i2 * H + c] : a.cst[(3 + i2) * H + c];
+                q2[j] = i1 >= 0 ? a.araw[i1 * H + c] : a.cst[(3 + i1) * H + c];
             }
-            const float4 w = *reinterpret_cast<const float4*>(a.cw + 4 * c);
-            const float y = w.x * s0 + w.y * s1 + w.z * s2 + w.w * x;
+            w[j] = *reinterpret_cast<const float4*>(a.cw + 4 * c);
+            hin[j] = a.h[tok * H + c];
+        }
+#pragma unroll
+        for (int j = 0; j < 3; ++j) {
+            const int c = t + NT * j;
+            const float x = xr[j], s0 = q0[j], s1 = q1[j], s2 = q2[j];
+            const float y = w[j].x * s0 + w[j].y * s1 + w[j].z * s2 + w[j].w * x;
             const float av = (y + x) * 0.44721359549995794f;  // 1/sqrt(5)
             if (NTK == 1) {
                 a.cst[c] = s1;
                 a.cst[H + c] = s2;
                 a.cst[2 * H + c] = x;
             }
-            hin[j] = a.h[tok * H + c];
             res[j] = a.boundary ? av : av + hin[j];
             a.res_out[tok * H + c] = res[j];
         }
         NB = a.B + 1 + (a.boundary ? 1 : 0);
-#pragma unroll
-        for (int b = 0; b < 4; ++b)
-#pragma unroll
-            for (int j = 0; j < 3; ++j) v[b][j] = (b < a.B) ? a.blocks[((long)b * NTK + tok) * H + t + NT * j] : 0.f;
 #pragma unroll
         for (int j = 0; j < 3; ++j) {
             for (int b = 0; b < 5; ++b) {
@@ -283,9 +306,7 @@ __global__ void __launch_bounds__(NT) k_ar(ArArgs a) {
         for (int b = 0; b < 5; ++b) red[b] = (b < NB) ? v[b][0] * v[b][0] + v[b][1] * v[b][1] + v[b][2] * v[b][2] : 0.f;
 #pragma unroll
         for (int q = 0; q < QM; ++q) {
-            float qv[3];
-#pragma unroll
-            for (int j = 0; j < 3; ++j) qv[j] = q < a.Q ? queries[(long)q * H + t + NT * j] : 0.f;
+            const float* qv = qpre[q];
 #pragma unroll
             for (int b = 0; b < 5; ++b) red[5 + q * 5 + b] = (b < NB && q < a.Q) ? v[b][0] * qv[0] + v[b][1] * qv[1] + v[b][2] * qv[2] : 0.f;
         }
@@ -336,7 +357,7 @@ __global__ void __launch_bounds__(NT) k_ar(ArArgs a) {
             const float f = rsqrtf(ssq[q] / H + 1e-6f);
 #pragma unroll
             for (int j = 0; j < 3; ++j) {
-                const float xv = a.nw[q][t + NT * j] * (out[q][j] * f);
+                const float xv = npre[q][j] * (out[q][j] * f);
                 a.xh_out[((long)q * NTK + tok) * H + t + NT * j] = __float2half(xv);
                 if (a.xn_out) a.xn_out[((long)q * NTK + tok) * H + t + NT * j] = xv;
             }
@@ -353,7 +374,7 @@ __global__ void __launch_bounds__(NT) k_ar(ArArgs a) {
             const Q8Buf o = q8_stream(a.q8, (int)(q * NTK + tok));
 #pragma unroll
             for (int j = 0; j < 3; ++j) {
-                const float xn = a.nw[q][t + NT * j] * (out[q][j] * f);
+                const float xn = npre[q][j] * (out[q][j] * f);
                 a.xn_out[((long)q * NTK + tok) * H + t + NT * j] = xn;
                 q8_store_chunk(xn, warp + NW * j, o);
             }
