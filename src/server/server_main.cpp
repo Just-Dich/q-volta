@@ -134,8 +134,9 @@ int main(int argc, char** argv) {
     if (tpath.empty()) return fail("no tokenizer: the model file has no embedded tokenizer.json (embed one with tools/qv_embed.py) and none was found next to it; pass --tokenizer PATH");
     if (!tok_embedded) { try { app->tok = qv::Tokenizer::load(tpath); } catch (const std::exception& e) { return fail(std::string("tokenizer: ") + e.what()); } }
     app->tokenizer_path = tpath;
-    for (const char* s : {"<|im_end|>", "<|endoftext|>"}) { int id = app->tok.token_id(s); if (id >= 0) app->stop_ids.push_back(id); }
+    for (const char* s : {"<|im_end|>", "<|endoftext|>", "<|content_model_end_sampling|>"}) { int id = app->tok.token_id(s); if (id >= 0) app->stop_ids.push_back(id); }
     app->eos_id = app->tok.token_id("<|im_end|>");
+    if (app->eos_id < 0) app->eos_id = app->tok.token_id("<|content_model_end_sampling|>");
     app->bos_id = app->tok.token_id("<|endoftext|>");
     // generation_config.json of the model: eos ids join the stop set, bos id; sampling defaults only where the flag was not given
     if (emb && emb->has_blob("generation_config.json")) {
@@ -253,6 +254,14 @@ int main(int argc, char** argv) {
     try {
         app->eng = make_engine();
         app->model_arch = backend == "mock" ? "mock" : app->eng->config().arch;
+        if (backend != "mock") {
+            if (int ceos = app->eng->config().eos; ceos >= 0) {
+                bool found = false;
+                for (int id : app->stop_ids) if (id == ceos) { found = true; break; }
+                if (!found) app->stop_ids.push_back(ceos);
+                if (app->eos_id < 0) app->eos_id = ceos;
+            }
+        }
         app->cached_n_embd = backend == "mock" ? 0 : app->eng->config().hidden;
         app->cached_weight_bytes = backend == "mock" ? 0 : (long long)app->eng->device_bytes_weights();
         app->eng->sync();

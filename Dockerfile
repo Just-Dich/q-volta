@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends cmake ninja-bui
 WORKDIR /src
 COPY . .
 # kernels are compiled for sm_70 (set in CMakeLists.txt); no GPU is needed at build time
-RUN cmake -S . -B /out -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+RUN cmake -S . -B /out -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DQV_CPU=OFF \
  && cmake --build /out --target qv_server qv_run qv_tok
 
 # ---------------------------------------------------------------- build (CPU only)
@@ -30,11 +30,12 @@ RUN cmake -S . -B /out -G Ninja -DCMAKE_BUILD_TYPE=Release -DQV_CUDA=OFF \
 
 # ---------------------------------------------------------------- runtime: CPU only
 FROM ubuntu:24.04 AS cpu
-RUN apt-get update && apt-get install -y --no-install-recommends libstdc++6 curl ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends libstdc++6 libgomp1 curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build-cpu /out/qv_server /out/qv_tok /usr/local/bin/
 COPY --from=build-cpu /out/src/backends/cpu/qv_run_cpu /usr/local/bin/qv_run
 COPY docker/entrypoint.sh /usr/local/bin/qv-entrypoint
+RUN chmod +x /usr/local/bin/qv-entrypoint
 VOLUME /models
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=300s --retries=3 CMD curl -fsS http://127.0.0.1:8080/health || exit 1
@@ -43,10 +44,11 @@ CMD ["--backend", "cpu", "--threads", "32"]
 
 # ---------------------------------------------------------------- runtime: CUDA (default target)
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-${UBUNTU} AS cuda
-RUN apt-get update && apt-get install -y --no-install-recommends libstdc++6 curl \
+RUN apt-get update && apt-get install -y --no-install-recommends libstdc++6 libgomp1 curl \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build-cuda /out/qv_server /out/qv_run /out/qv_tok /usr/local/bin/
 COPY docker/entrypoint.sh /usr/local/bin/qv-entrypoint
+RUN chmod +x /usr/local/bin/qv-entrypoint
 ENV NVIDIA_VISIBLE_DEVICES=all NVIDIA_DRIVER_CAPABILITIES=compute,utility
 VOLUME /models
 EXPOSE 8080
