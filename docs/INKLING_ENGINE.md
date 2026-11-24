@@ -12,11 +12,29 @@ sigmoid gate -> o-proj -> post-attention conv+residual -> router (device-side to
 in one launch) -> conv + residual. Loop passes >0 add the message gates (cat/down/forget/gain). Local layers keep a 1024-slot ring; global layers keep the full cache.
 Logits: gemv_q8 on the unembedding, softcap 30, argmax fused in the graph (`--bench` replays it).
 
-Decode result (Q3A5, V100, ctx ~25): 122.4 tok/s. At 4K real context: 113.8 tok/s. That is about 33 % of the HBM2 bound at the stored precision, so the engine is NOT
+Decode result before p26 (Q3A5, V100, ctx ~25, fp16 KV): 122.4 tok/s. At 4K real context: 113.8 tok/s. After p26 (int4 KV): see below. That is about 33 % of the HBM2 bound at the stored precision, so the engine is NOT
 bandwidth bound: nsys (`--cuda-graph-trace=node`) shows many short latency-bound kernels (mean 7-33 us each, 20-25 launches per application). Largest decode kernels per token:
 multi-GEMV 1.04 ms, w13 0.93 ms, attention-residual 0.63 ms, w2 0.56 ms, router 0.39 ms, attention split 0.36 ms (ctx 4K), gate-down 0.29 ms, prep 0.24 ms, norm 0.23 ms, finish 0.22 ms.
 Remaining headroom is kernel fusion / fewer launches (e.g. fuse norm into the preceding reduction, persistent MoE), not a faster GEMV.
 Profile: `benchmarks/results/inkling_gpu_20261121.json` (summary); raw report `/tmp/ink/prof_decode.nsys-rep` (not committed).
+
+### Decode latency work (p26/ink-fuse, 2026-11-24)
+Plain decode, int4 KV, same session, 3 runs each: ctx 25 118.65 -> 135.4 tok/s (+14.1 %), ctx 4K (real) 111.4 -> 126.7 (+13.7 %), ctx 32K (synthetic KV) 99.8 -> 111.6 (+11.9 %).
+Every step is bit-exact (logits hash of every step and ids identical to the f0645bd binary on the four golden prompts incl. the 4K one, 64 steps, via `tests/test_ink_exact.cpp`;
+`test_ink_mtp` depth 3/7 PASS, `test_multiseq` int4 + fp16 PASS), because no reduction order was changed: only loads were issued earlier, loops unrolled, work split into more
+(blocks / warps) and barriers shared. The profile found that the inter-kernel gap inside the graph is only ~0.47 us (3 % of the step); the time is each small kernel's own
+dependent latency chain, so the wins came from shortening those chains, not from fewer launches (the one launch removal, folding k_finish into the next attn_res, gave +1.9 %).
+What worked: finish folded into the next attention-input attn_res; GEMV rows one per warp and one warp per block (more, smaller blocks beat 4 warps x 2 rows: +2.7 %); all independent
+global loads of attn_res / gate_down / gate_apply / norm issued before the first store or barrier (the compiler cannot hoist loads over stores that may alias); the 128-byte local copy of
+the argument struct in k_norm removed (+2.0 %); router top-8 by rank instead of 8 serial warp argmax rounds; attn_combine stages the split maxima in shared memory; the five l2 norms
+of attn_prep share one reduction round; the two gate_down sums share one barrier set.
+What did not (measured, reverted): merging attn_part+combine or gate_apply+norm with a last-block ticket (-3 %: the serial tail in one block costs more than the launch), a side-stream
+graph branch for wg/sink (-6 %: fork/join nodes cost ~10 us each on this driver), `prefetch.global.L2` of the next kernel's weights (-12 %), forcing occupancy with `__launch_bounds__` min blocks
+(spills, -3..-47 %), unrolling the quantised GEMV lane loop (-3 %), more rows per warp in w13, moving finish into the w2 epilogue (-1.3 % vs folding it into attn_res).
+Not possible on sm_70: programmatic dependent launch (needs sm_90). Cooperative persistent kernels were not tried: a grid barrier (~2-4 us) is about the cost of a graph kernel boundary (0.47 us gap + the kernel's own tail).
+Remaining time per token (nsys, ctx 25, 9.06 ms under the profiler vs 7.4 ms without): w13 1.58 ms (33 us x 48, 0.5 TB/s), multi-GEMV 1.60, attn_res 1.26 (99 calls, one block each, ~4.9 us of
+loads per call: one SM cannot stream the ~150 KB it reads), w2 0.92, attn_part 0.66, router 0.55, prep 0.42, gate 0.82, combine 0.33, norm 0.28, lm_head 0.31: still ~35-40 % of the HBM2 bound.
+MTP verify (`QV_MTP_PROF=1`, ctx ~35): plain step 8.34 -> 7.30 ms, verify R=2/3/4/8 13.48/15.58/18.27/28.79 -> 12.82/15.01/17.80/28.53 ms, so the MTP-3 gain over plain shrank (code 1.14x -> 1.02x, absolute 135.3 -> 137.7 tok/s; prose 94.3 -> 96.4): the rows kernels (w13_u / w2_u / part_rows) still have the old structure and are the next target.
 
 ## Batched prefill (step 2)
 Per chunk (default 2048 tokens, token-parallel): attention-residual and norms emit fp16 rows; projections = dequantise the weight to an fp16 slab + cuBLAS tensor-op GEMM

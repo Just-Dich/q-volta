@@ -113,3 +113,9 @@ Update: e1b1 (10.40 GiB) measured: ppl 8x512 9.112, KL to Q8_0 0.0750, top-1 89.
 - Phase 2 (batched decode over several sequences) NOT done; no speedup claimed beyond the above.
 - Tests: tests/test_multiseq.cpp (exactness), tests/test_server_compat.py (+concurrent interleave / per-slot cache / reasoning budget; ctx expectations changed to the per-slot value), tests/test_server_concurrent_real.py (4 simultaneous real chats equal to sequential greedy). Known pre-existing flake: test_models_preset_routing (first request of a freshly loaded mock preset sometimes returns garbage tokens; also on 98324e0: 4 of 40 runs).
 - NOT RUN / open: CPU multi-sequence tests (Inkling CPU: 18-step interleaved case bit-identical, 6-step case with a late-joining 104-token prompt differed from the alone run, unresolved; CPU Qwen untested); Qwen server-level concurrency smoke; llama.cpp comparison. Treat CPU `--parallel N` concurrency as experimental.
+
+## p26/ink-fuse (2026-11-24) - Inkling decode latency (branch p26/ink-fuse, not merged)
+- Plain decode (int4 KV, V100): ctx 25 118.65 -> 135.4 tok/s (+14.1 %), 4K 111.4 -> 126.6, 32K synthetic 99.75 -> 111.6; all steps bit-exact (per-step logits hash + ids, 4 golden prompts x 64 steps incl. 4K, test_ink_mtp depth 3/7, test_multiseq int4/fp16). The modeled 206 tok/s was NOT reached (~65 %).
+- Finding: inter-kernel gaps in the graph are 0.47 us (3 %); the time is per-kernel dependent latency chains. Wins: load hoisting, finer GEMV decomposition, removing a hidden local copy of a kernel argument struct, shared barriers, rank-based top-8, finish folded into attn_res. Ticket-merged kernels, side-stream branches, L2 prefetch and forced occupancy were slower (docs/INKLING_ENGINE.md).
+- MTP: absolute speed +1.7 % (code) but the gain over plain shrank 1.14x -> 1.02x because the verify rows kernels were not restructured (open item).
+- New: tests/test_ink_exact.cpp (per-step logits hash regression).

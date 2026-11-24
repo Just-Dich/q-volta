@@ -183,7 +183,18 @@ Correctness: greedy 32/32 vs the Q3A5 reference goldens on all four prompts (ste
 | 256K (synthetic) | int4 | 57.4 |
 Prefill (4K prompt): chunk 2048 2118 tok/s, chunk 4096 2764 tok/s (target 2500 met at chunk 4096). 8K 2005 tok/s, 32K 1830, 128K 1164, 256K 766 (int4, chunk 2048, includes quadratic attention; 256K = 334 s).
 Passkey (chat template via HF tokenizers, key at 50 % depth, greedy 200 tokens): found at 8K, 32K, 128K and 256K with int4 KV; also 32K fp16.
-Decode is ~33 % of the HBM bound: latency-bound small kernels (see INKLING_ENGINE.md). "Synthetic" = decode over unwritten KV at that position (speed only).
+Decode is ~33 % of the HBM bound: latency-bound small kernels (see INKLING_ENGINE.md).
+
+### Inkling decode latency work (p26/ink-fuse, 2026-11-24)
+Same-session A/B (baseline f0645bd vs p26/ink-fuse, int4 KV, `qv_ink --bench --n 256 --runs 3`, under `flock /tmp/qv_bench.lock`, spread < 0.1 %):
+| ctx | before | after |
+|---|---:|---:|
+| 25 | 118.65 | 135.4 |
+| 4K (real) | 111.4 | 126.6 |
+| 32K (synthetic KV) | 99.75 | 111.6 |
+MTP-3 (qv_ink --mtp-depth 3, 256 tokens): code 135.3 -> 137.7, prose 94.3 -> 96.4 tok/s (ids identical to plain). Per-step history (ctx 25, tok/s): fold finish 120.4; unroll lane loops 123.0;
+attn_res load hoisting 124.3; 1 row per warp GEMV 127.7; gate_down blocks 128.3; combine in smem 129.5; router rank top-8 130.3; reduction barriers 130.6; prep one reduction 131.5; k_norm 134.1; gate loads 135.4.
+All steps bit-exact (per-step logits hash + ids vs the old binary; test_ink_mtp, test_multiseq pass). Details and negative results: docs/INKLING_ENGINE.md "Decode latency work". "Synthetic" = decode over unwritten KV at that position (speed only).
 
 ## Comparison with llama.cpp on the same V100 (p18/compare, 2026-11-21..23)
 Protocol, commands, caveats and the full table: benchmarks/compare/README.md; data: benchmarks/compare/results.json and raw/. llama.cpp 9d6f04f CUDA sm_70, `-fa 1 -ngl 99`, 3 interleaved rounds under /tmp/qv_bench.lock, SM clock 1530 MHz. Quality reference: llama.cpp Q8_0 GGUF (proxy: ppl 8.467 vs BF16 8.468 on 8x512), same 4088-token wikitext window for ppl/KL on both engines.

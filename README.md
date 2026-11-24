@@ -42,7 +42,7 @@
 | **Long context** | **256K tokens on a 16 GB card** (10.4 GiB weights + int4 KV cache), tensor-core flash prefill |
 | **CPU too** | native AVX2 backend with exact MTP: 3.8-4.5 tok/s for the 27B on one old Xeon (1.4-1.6x over plain) |
 | **Drop-in server + web UI** | `qv_server`: llama-server flags, OpenAI chat/completions, Anthropic `/v1/messages`, `/v1/responses`, tools, grammars, jinja templates, the embedded llama.cpp web UI, multi-model routing (`--models-preset`) |
-| **Second model: Inkling-2-Mini** | 26B MoE, looped layers: ~120 tok/s on the V100 through the server, **image input** (vision sidecar), optional exact MTP (0.55-1.73x, text dependent), see [docs/INKLING_RUN.md](docs/INKLING_RUN.md) |
+| **Second model: Inkling-2-Mini** | 26B MoE, looped layers: ~135 tok/s plain decode on the V100 at short context (qv_ink bench, branch p26/ink-fuse; ~120 measured through the server before it), **image input** (vision sidecar), optional exact MTP (0.55-1.73x, text dependent), see [docs/INKLING_RUN.md](docs/INKLING_RUN.md) |
 | **Weights** | [Qwen3.8-27B-QVolta](https://huggingface.co/q-project/Qwen3.8-27B-QVolta), [Inkling-2-Mini-QVolta](https://huggingface.co/q-project/Inkling-2-Mini-QVolta) (with vision and MTP sidecars) |
 | **Honest** | every claim has raw data; losses are listed: at equal size llama.cpp's quants are better in quality, see [caveats](#honest-caveats-read-before-comparing) |
 
