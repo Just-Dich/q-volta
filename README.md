@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="docs/img/banner.svg" alt="Q-Volta: fast LLM inference on one Tesla V100 and on CPUs" width="100%">
+  <img src="docs/img/banner.png" alt="Q-Volta: fast LLM inference on one Tesla V100 and on CPUs" width="100%">
   <br><br>
   <img src="docs/img/Q_Logo.svg" width="56" alt="Q Project logo">
   <p>
