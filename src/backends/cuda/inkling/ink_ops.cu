@@ -397,10 +397,16 @@ void attn_res(const ArArgs& a, int nblocks, cudaStream_t s, int rows) {
 __global__ void __launch_bounds__(NT) k_norm(NormArgs a) {
     __shared__ float sm[NW * 32];
     const int t = threadIdx.x, s = a.T > 1 ? blockIdx.y : blockIdx.x, warp = t >> 5, tk = a.T > 1 ? blockIdx.x : 0;
-    float v[3], ss = 0.f;
+    // select the stream's pointers without a dynamically indexed kernel-parameter array (that forced a 128-byte local copy of the arguments)
+    const float* inp = a.in[0];
+    const float* nwp = a.nw[0];
+    if (s == 1) { inp = a.in[1]; nwp = a.nw[1]; } else if (s == 2) { inp = a.in[2]; nwp = a.nw[2]; } else if (s == 3) { inp = a.in[3]; nwp = a.nw[3]; }
+    float v[3], ss = 0.f, wv[3];
+#pragma unroll
+    for (int j = 0; j < 3; ++j) wv[j] = nwp[t + NT * j];
 #pragma unroll
     for (int j = 0; j < 3; ++j) {
-        v[j] = a.in[s][(long)tk * H + t + NT * j];
+        v[j] = inp[(long)tk * H + t + NT * j];
         ss += v[j] * v[j];
     }
     float r[1] = {ss};
@@ -409,7 +415,7 @@ __global__ void __launch_bounds__(NT) k_norm(NormArgs a) {
     if (a.xh_out) {
 #pragma unroll
         for (int j = 0; j < 3; ++j) {
-            const float xv = a.nw[s][t + NT * j] * (v[j] * f);
+            const float xv = wv[j] * (v[j] * f);
             a.xh_out[((long)s * a.T + tk) * H + t + NT * j] = __float2half(xv);
             if (a.xn_out) a.xn_out[((long)s * a.T + tk) * H + t + NT * j] = xv;
         }
@@ -418,7 +424,7 @@ __global__ void __launch_bounds__(NT) k_norm(NormArgs a) {
     const Q8Buf o = q8_stream(a.q8, s * a.T + tk);
 #pragma unroll
     for (int j = 0; j < 3; ++j) {
-        const float xn = a.nw[s][t + NT * j] * (v[j] * f);
+        const float xn = wv[j] * (v[j] * f);
         a.xn_out[((long)s * a.T + tk) * H + t + NT * j] = xn;
         q8_store_chunk(xn, warp + NW * j, o);
     }
