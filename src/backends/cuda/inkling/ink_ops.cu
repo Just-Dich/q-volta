@@ -587,11 +587,39 @@ void mgemv(GDs& g, int bits, cudaStream_t s) {
     }
 }
 
+// K and V int4 stores of one token / kv head with one barrier (the per-64-channel-group min / max are order independent: same values as two kv4_store).
+// sh: >= 16 floats, written once (fresh memory).
+__device__ __forceinline__ void kv4_store2(float kval, float vval, int c, uint8_t* kq, __half2* ks, uint8_t* vq, __half2* vs, float* sh) {
+    float mnk = kval, mxk = kval, mnv = vval, mxv = vval;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        mnk = fminf(mnk, __shfl_xor_sync(0xffffffffu, mnk, o)); mxk = fmaxf(mxk, __shfl_xor_sync(0xffffffffu, mxk, o));
+        mnv = fminf(mnv, __shfl_xor_sync(0xffffffffu, mnv, o)); mxv = fmaxf(mxv, __shfl_xor_sync(0xffffffffu, mxv, o));
+    }
+    const int w = c >> 5;
+    if ((c & 31) == 0) { sh[w * 4] = mnk; sh[w * 4 + 1] = mxk; sh[w * 4 + 2] = mnv; sh[w * 4 + 3] = mxv; }
+    __syncthreads();
+    const int g = c >> 6;
+    mnk = fminf(sh[g * 8], sh[g * 8 + 4]);
+    mxk = fmaxf(sh[g * 8 + 1], sh[g * 8 + 5]);
+    mnv = fminf(sh[g * 8 + 2], sh[g * 8 + 6]);
+    mxv = fmaxf(sh[g * 8 + 3], sh[g * 8 + 7]);
+    const __half shk = __float2half(fmaxf((mxk - mnk) * (1.f / 15.f), 1e-5f)), mhk = __float2half(mnk);
+    const __half shv = __float2half(fmaxf((mxv - mnv) * (1.f / 15.f), 1e-5f)), mhv = __float2half(mnv);
+    const float sck = __half2float(shk), mfk = __half2float(mhk), scv = __half2float(shv), mfv = __half2float(mhv);
+    int qk = __float2int_rn((kval - mfk) / sck), qvv = __float2int_rn((vval - mfv) / scv);
+    qk = max(0, min(15, qk));
+    qvv = max(0, min(15, qvv));
+    const int qkn = __shfl_xor_sync(0xffffffffu, qk, 1), qvn = __shfl_xor_sync(0xffffffffu, qvv, 1);
+    if ((c & 1) == 0) { kq[c >> 1] = (uint8_t)(qk | (qkn << 4)); vq[c >> 1] = (uint8_t)(qvv | (qvn << 4)); }
+    if ((c & 63) == 0) { ks[g] = __halves2half2(shk, mhk); vs[g] = __halves2half2(shv, mhv); }
+}
+
 // ------------------------------------------------------------------------------------------------------------------
 // attention prep: q/k/v/rel post-processing, short convs, KV write, relative bias table. grid = 8 kv heads, 128 threads
 __global__ void __launch_bounds__(128) k_prep(PrepArgs a) {
     __shared__ float rv[48], rv0[48];
-    __shared__ float red[32];
+    __shared__ float red5[48];
     const int g = blockIdx.x, c = threadIdx.x, ch = g * HD + c;
     const int row = blockIdx.z;
     const int pos0 = *a.pos, pos = pos0 + row;
@@ -638,14 +666,37 @@ __global__ void __launch_bounds__(128) k_prep(PrepArgs a) {
         if (a.khist) { a.khist[row * 1024 + ch] = kx; a.vhist[row * 1024 + ch] = vx; }
     }
     {
-        const float nk = block_sum(ko * ko, red);
-        const float fk = fminf(1.f, 22.627416997969522f / (sqrtf(nk) + 1e-6f));
-        const float nv = block_sum(vo * vo, red);
-        const float fv = rsqrtf(nv / HD + 1e-6f);
+        // the five block sums (|k|^2, |v|^2, |q_h|^2 for the 3 heads) share one set of barriers; each value is reduced exactly like block_sum
+        float qv[3];
+#pragma unroll
+        for (int hh = 0; hh < 3; ++hh) qv[hh] = a.qraw[row * a.prs + (g * 3 + hh) * HD + c] * a.qscale[(g * 3 + hh) * HD + c];
+        float r5[5] = {ko * ko, vo * vo, qv[0] * qv[0], qv[1] * qv[1], qv[2] * qv[2]};
+        {
+            const int lane = c & 31, w = c >> 5;
+#pragma unroll
+            for (int i = 0; i < 5; ++i) r5[i] = warp_sum(r5[i]);
+            if (lane == 0) {
+#pragma unroll
+                for (int i = 0; i < 5; ++i) red5[i * 4 + w] = r5[i];
+            }
+            __syncthreads();
+            if (w == 0) {
+#pragma unroll
+                for (int i = 0; i < 5; ++i) {
+                    float t = lane < 4 ? red5[i * 4 + lane] : 0.f;
+                    t = warp_sum(t);
+                    if (lane == 0) red5[20 + i] = t;
+                }
+            }
+            __syncthreads();
+#pragma unroll
+            for (int i = 0; i < 5; ++i) r5[i] = red5[20 + i];
+        }
+        const float fk = fminf(1.f, 22.627416997969522f / (sqrtf(r5[0]) + 1e-6f));
+        const float fv = rsqrtf(r5[1] / HD + 1e-6f);
         if (a.kq) {
             const size_t r = (size_t)g * a.cap + slot;
-            kv4_store(ko * fk, c, a.kq + r * 64, a.ks + r * 2, red);
-            kv4_store(vo * fv, c, a.vq + r * 64, a.vs + r * 2, red);
+            kv4_store2(ko * fk, vo * fv, c, a.kq + r * 64, a.ks + r * 2, a.vq + r * 64, a.vs + r * 2, red5 + 28);
         } else if (a.ktail) {
             a.ktail[((size_t)g * a.tail_rows + row) * HD + c] = __float2half(ko * fk);
             a.vtail[((size_t)g * a.tail_rows + row) * HD + c] = __float2half(vo * fv);
@@ -653,14 +704,12 @@ __global__ void __launch_bounds__(128) k_prep(PrepArgs a) {
             a.kc[((size_t)g * a.cap + slot) * HD + c] = __float2half(ko * fk);
             a.vc[((size_t)g * a.cap + slot) * HD + c] = __float2half(vo * fv);
         }
-    }
-    // ---- q of the 3 heads sharing this kv head: scale, l2 clip, tau, softmax scale
-    for (int hh = 0; hh < 3; ++hh) {
-        const int h = g * 3 + hh;
-        const float qv = a.qraw[row * a.prs + h * HD + c] * a.qscale[h * HD + c];
-        const float n2 = block_sum(qv * qv, red);
-        const float f = fminf(1.f, 22.627416997969522f / (sqrtf(n2) + 1e-6f));
-        a.qs[row * (NH * HD) + h * HD + c] = qv * f * tau * 0.08838834764831845f;  // 128^-0.5
+        // ---- q of the 3 heads sharing this kv head: l2 clip, tau, softmax scale
+#pragma unroll
+        for (int hh = 0; hh < 3; ++hh) {
+            const float f = fminf(1.f, 22.627416997969522f / (sqrtf(r5[2 + hh]) + 1e-6f));
+            a.qs[row * (NH * HD) + (g * 3 + hh) * HD + c] = qv[hh] * f * tau * 0.08838834764831845f;  // 128^-0.5
+        }
     }
     }
     // ---- rel: scale, l2 clip (8.0), tau
