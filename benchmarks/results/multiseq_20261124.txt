@@ -1,0 +1,52 @@
+##### OLD binary (single sequence, FIFO)
+--- 100-token prompt, 128 new
+{"conc": 1, "wall": 1.572, "agg_e2e": 81.419, "per_req": 93.331, "ttft": 0.21, "n_prompt": 99, "agg_decode": 93.331}
+{"conc": 1, "wall": 1.574, "agg_e2e": 81.321, "per_req": 92.906, "ttft": 0.206, "n_prompt": 98, "agg_decode": 92.906}
+{"conc": 1, "wall": 1.561, "agg_e2e": 81.983, "per_req": 93.618, "ttft": 0.204, "n_prompt": 98, "agg_decode": 93.618}
+{"conc": 2, "wall": 3.14, "agg_e2e": 81.516, "per_req": 92.923, "ttft": 0.99, "n_prompt": 100, "agg_decode": 185.846}
+{"conc": 2, "wall": 3.111, "agg_e2e": 82.28, "per_req": 93.686, "ttft": 0.985, "n_prompt": 100, "agg_decode": 187.373}
+{"conc": 2, "wall": 3.115, "agg_e2e": 82.178, "per_req": 93.949, "ttft": 0.979, "n_prompt": 99, "agg_decode": 187.897}
+{"conc": 4, "wall": 6.192, "agg_e2e": 82.686, "per_req": 94.354, "ttft": 2.519, "n_prompt": 98, "agg_decode": 377.417}
+{"conc": 4, "wall": 6.244, "agg_e2e": 81.994, "per_req": 93.454, "ttft": 2.531, "n_prompt": 98, "agg_decode": 373.815}
+{"conc": 4, "wall": 6.277, "agg_e2e": 81.574, "per_req": 93.169, "ttft": 2.577, "n_prompt": 103, "agg_decode": 372.678}
+--- 4K prompt, 128 new
+{"conc": 1, "wall": 2.86, "agg_e2e": 44.757, "per_req": 89.758, "ttft": 1.444, "n_prompt": 3975, "agg_decode": 89.758}
+{"conc": 1, "wall": 2.866, "agg_e2e": 44.665, "per_req": 89.532, "ttft": 1.446, "n_prompt": 3969, "agg_decode": 89.532}
+{"conc": 1, "wall": 2.891, "agg_e2e": 44.279, "per_req": 88.452, "ttft": 1.454, "n_prompt": 4000, "agg_decode": 88.452}
+{"conc": 2, "wall": 5.774, "agg_e2e": 44.337, "per_req": 88.425, "ttft": 2.889, "n_prompt": 3989, "agg_decode": 176.849}
+{"conc": 2, "wall": 5.742, "agg_e2e": 44.586, "per_req": 88.875, "ttft": 2.881, "n_prompt": 4006, "agg_decode": 177.75}
+{"conc": 2, "wall": 5.723, "agg_e2e": 44.731, "per_req": 89.757, "ttft": 2.876, "n_prompt": 4006, "agg_decode": 179.513}
+{"conc": 4, "wall": 11.49, "agg_e2e": 44.562, "per_req": 89.102, "ttft": 5.763, "n_prompt": 4017, "agg_decode": 356.409}
+{"conc": 4, "wall": 11.461, "agg_e2e": 44.672, "per_req": 89.097, "ttft": 5.729, "n_prompt": 3959, "agg_decode": 356.387}
+{"conc": 4, "wall": 11.442, "agg_e2e": 44.748, "per_req": 89.511, "ttft": 5.736, "n_prompt": 3995, "agg_decode": 358.044}
+--- 30K long + short
+{"run": 0, "long_prompt_tokens": 29987, "long_total_s": 13.24, "short_ttft_s": 12.427, "short_total_s": 12.58}
+{"run": 1, "long_prompt_tokens": 29922, "long_total_s": 13.19, "short_ttft_s": 12.391, "short_total_s": 12.55}
+{"run": 2, "long_prompt_tokens": 29863, "long_total_s": 13.18, "short_ttft_s": 12.384, "short_total_s": 12.54}
+##### NEW binary, --parallel 4 (ctx 163840 total = 40960/slot)
+13157 MiB
+--- 100-token prompt, 128 new
+{"conc": 1, "wall": 1.583, "agg_e2e": 80.873, "per_req": 92.76, "ttft": 0.212, "n_prompt": 99, "agg_decode": 92.76}
+{"conc": 1, "wall": 1.57, "agg_e2e": 81.508, "per_req": 93.068, "ttft": 0.205, "n_prompt": 98, "agg_decode": 93.068}
+{"conc": 1, "wall": 1.575, "agg_e2e": 81.261, "per_req": 92.576, "ttft": 0.203, "n_prompt": 98, "agg_decode": 92.576}
+{"conc": 2, "wall": 2.623, "agg_e2e": 97.612, "per_req": 55.188, "ttft": 0.307, "n_prompt": 100, "agg_decode": 110.375}
+{"conc": 2, "wall": 2.619, "agg_e2e": 97.735, "per_req": 57.22, "ttft": 0.394, "n_prompt": 100, "agg_decode": 114.44}
+{"conc": 2, "wall": 2.628, "agg_e2e": 97.408, "per_req": 57.268, "ttft": 0.405, "n_prompt": 99, "agg_decode": 114.537}
+{"conc": 4, "wall": 5.231, "agg_e2e": 97.879, "per_req": 27.921, "ttft": 0.65, "n_prompt": 98, "agg_decode": 111.686}
+{"conc": 4, "wall": 5.242, "agg_e2e": 97.665, "per_req": 27.855, "ttft": 0.654, "n_prompt": 98, "agg_decode": 111.419}
+{"conc": 4, "wall": 5.259, "agg_e2e": 97.362, "per_req": 27.837, "ttft": 0.663, "n_prompt": 103, "agg_decode": 111.35}
+--- 4K prompt, 128 new
+{"conc": 1, "wall": 2.854, "agg_e2e": 44.845, "per_req": 89.888, "ttft": 1.44, "n_prompt": 3975, "agg_decode": 89.888}
+{"conc": 1, "wall": 2.857, "agg_e2e": 44.803, "per_req": 89.91, "ttft": 1.444, "n_prompt": 3969, "agg_decode": 89.91}
+{"conc": 1, "wall": 2.887, "agg_e2e": 44.338, "per_req": 88.438, "ttft": 1.45, "n_prompt": 4000, "agg_decode": 88.438}
+{"conc": 2, "wall": 5.89, "agg_e2e": 43.463, "per_req": 46.744, "ttft": 3.082, "n_prompt": 3989, "agg_decode": 93.488}
+{"conc": 2, "wall": 5.868, "agg_e2e": 43.625, "per_req": 46.769, "ttft": 3.061, "n_prompt": 4006, "agg_decode": 93.538}
+{"conc": 2, "wall": 6.078, "agg_e2e": 42.117, "per_req": 54.186, "ttft": 3.728, "n_prompt": 4006, "agg_decode": 108.373}
+{"conc": 4, "wall": 11.95, "agg_e2e": 42.844, "per_req": 24.691, "ttft": 6.57, "n_prompt": 4017, "agg_decode": 98.763}
+{"conc": 4, "wall": 11.927, "agg_e2e": 42.927, "per_req": 24.668, "ttft": 6.54, "n_prompt": 3959, "agg_decode": 98.672}
+{"conc": 4, "wall": 11.932, "agg_e2e": 42.91, "per_req": 24.692, "ttft": 6.553, "n_prompt": 3995, "agg_decode": 98.768}
+--- 30K long + short
+{"run": 0, "long_prompt_tokens": 29987, "long_total_s": 15.83, "short_ttft_s": 1.642, "short_total_s": 10.25}
+{"run": 1, "long_prompt_tokens": 29922, "long_total_s": 15.79, "short_ttft_s": 1.67, "short_total_s": 10.25}
+{"run": 2, "long_prompt_tokens": 29863, "long_total_s": 15.76, "short_ttft_s": 1.68, "short_total_s": 10.27}
+FINAL-DONE

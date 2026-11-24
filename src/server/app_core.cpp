@@ -49,7 +49,20 @@ void App::init_slots() {
     slots_.assign(n_slots, SlotInfo());
     for (int i = 0; i < n_slots; ++i) slots_[i].id = i;
     owner_slot_ = 0;
+    set_sequences(false);
     if (m_.t_start == 0) m_.t_start = (long long)std::time(nullptr);
+}
+
+// Slot <-> sequence layout: with a multi-sequence engine every slot is an engine sequence with its own `--ctx-size / n_slots` tokens of context
+// and requests run concurrently; otherwise the slots are logical (one sequence of `--ctx-size` tokens, requests run one at a time).
+void App::set_sequences(bool multi) {
+    multi_seq = multi && n_slots > 1;
+    slot_ctx = multi_seq ? std::max(1, o.ctx / n_slots) : o.ctx;
+    n_ctx = slot_ctx;
+    conc_limit_ = multi_seq ? n_slots : 1;
+    slot_busy_.assign(n_slots, 0);
+    slot_used_.assign(n_slots, 0);
+    slot_cached_.assign(multi_seq ? n_slots : 1, std::vector<int>());
 }
 
 Value App::model_json() const {
@@ -316,17 +329,21 @@ void App::handle_slot_action(const http::Request& req, http::Conn& c, int id) {
         const std::string& fn = f->as_string();
         if (fn.empty() || fn.find('/') != std::string::npos || fn.find('\\') != std::string::npos || fn.find("..") != std::string::npos) throw_error(400, "Invalid filename");
     }
-    long ticket = lease_acquire(alive);
-    if (ticket < 0) return;
-    struct Rel { App& a; long t; ~Rel() { a.lease_release(t); } } rel{*this, ticket};
+    Task st;  // slot action = a (non-generating) task pinned to this slot: waits until the slot is idle
+    st.id_slot = id;
+    const int sid = slot_acquire(st, false, alive);
+    if (sid < 0) return;
+    struct Rel { App& a; int s; ~Rel() { a.slot_release(s); } } rel{*this, sid};
     auto t0 = Clock::now();
     auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
     Value r = Value::object();
     r.set("id_slot", id);
     ensure_engine();
+    std::vector<int>& cached_ = cached_of(id);
+    struct EngTurn { std::unique_lock<FairMutex> lk; EngTurn(App& a, int sl) : lk(a.eng_mu_) { a.eng->select_seq(a.seq_of(sl)); } };
     if (action == "erase") {
         long n = (long)cached_.size();
-        eng->reset();
+        { EngTurn tn(*this, id); eng->reset(); }
         cached_.clear();
         r.set("n_erased", n);
     } else if (action == "save") {
@@ -358,11 +375,11 @@ void App::handle_slot_action(const http::Request& req, http::Conn& c, int id) {
         std::vector<int> toks(n);
         if (n && std::fread(toks.data(), 4, n, f) != (size_t)n) { std::fclose(f); throw_error(400, "Unable to restore slot, no available space in KV cache or invalid slot save file"); }
         std::fclose(f);
-        eng->reset();
+        { EngTurn tn(*this, id); eng->reset(); }
         cached_.clear();
         for (size_t off = 0; off < toks.size(); off += chunk) {
             int k = (int)std::min<size_t>(chunk, toks.size() - off);
-            eng->prefill(toks.data() + off, k, (int)off);
+            { EngTurn tn(*this, id); eng->prefill(toks.data() + off, k, (int)off); }
             cached_.insert(cached_.end(), toks.begin() + off, toks.begin() + off + k);
         }
         r.set("filename", fn);
@@ -384,7 +401,8 @@ void App::handle_metrics(http::Conn& c) {
         std::lock_guard<std::mutex> lk(mu_);
         m = m_;
         for (auto& s : slots_) processing += s.processing;
-        deferred = waiting_;
+        deferred = 0;
+        for (auto& w : waiters_) deferred += (!w.granted && w.kind == 0);
         m_.b_prompt_tokens = m_.b_prompt_s = m_.b_pred_tokens = m_.b_pred_s = m_.b_busy_sum = m_.b_decode = 0;  // gauges: window between scrapes
     }
     auto metric = [&](const char* type, const char* name, const char* help, double v) {
@@ -602,12 +620,13 @@ static long long mono_ms() { return std::chrono::duration_cast<std::chrono::mill
 
 void App::ensure_engine() {
     last_task_ms_ = mono_ms();
+    std::lock_guard<std::mutex> rl(reload_mu_);
     if (eng) return;
     auto t0 = Clock::now();
     std::fprintf(stderr, "[qv_server] server is exiting sleeping state (reloading the model)\n");
     eng = reload_engine();
     eng->sync();
-    cached_.clear();
+    for (auto& c : slot_cached_) c.clear();
     sleeping = false;
     std::fprintf(stderr, "[qv_server] model reloaded in %.1fs\n", std::chrono::duration<double>(Clock::now() - t0).count());
 }
@@ -623,15 +642,16 @@ void App::start_sleep_watcher() {
             long ticket;
             {
                 std::unique_lock<std::mutex> lk(mu_);
-                if (waiting_ != 0 || serving_ != next_ticket_) continue;  // busy
-                ticket = next_ticket_++;                                 // engine lease: nothing else can start while we unload
+                if (!engine_idle_locked()) continue;  // busy
             }
+            ticket = lease_acquire([] { return true; });  // exclusive lease: nothing else can start while we unload
+            if (ticket < 0) continue;
             {
                 struct Rel { App& a; long t; ~Rel() { a.lease_release(t); } } rel{*this, ticket};
                 if (mono_ms() - last_task_ms_ >= 1000LL * o.sleep_idle_seconds && eng) {
                     std::fprintf(stderr, "[qv_server] server is entering sleeping state (idle for %d s): model unloaded\n", o.sleep_idle_seconds);
                     eng.reset();
-                    cached_.clear();
+                    for (auto& c : slot_cached_) c.clear();
                     sleeping = true;
                 }
             }
@@ -665,7 +685,7 @@ void App::unload_model() {
         vocab_.reset();
         matchers_.clear();
     }
-    cached_.clear();
+    for (auto& c : slot_cached_) c.clear();
     tok = Tokenizer();
     model_id.clear();
     model_template.clear();
@@ -691,7 +711,7 @@ void App::load_model(const Options& mo_in, const std::string& forced_id) {
         std::unique_lock<std::mutex> slk(state_mu_);
         o = mo_in;
         if (o.ctx <= 0) o.ctx = 4096;
-        n_ctx = o.ctx;
+        n_ctx = o.ctx;  // refined by set_sequences() once the backend is known
         model_id = !forced_id.empty() ? forced_id : (!o.alias.empty() ? o.alias[0] : (o.model.empty() ? std::string("qv-mock") : o.model));
         slk.unlock();
         init_slots();
@@ -803,8 +823,15 @@ void App::load_model(const Options& mo_in, const std::string& forced_id) {
 #endif
         if (backend != "cpu" && backend != "cuda" && backend != "mock") throw std::runtime_error("--backend must be cuda, cpu, auto or mock");
 
+        {  // sequences: all engines hold one sequence per slot (except with --mtp: one sequence, requests are serialised)
+            const bool can_multi = true;  // every engine (CUDA, CPU, mock) holds one sequence per slot
+            if (o.mtp && o.n_parallel > 1) std::fprintf(stderr, "warning: --mtp supports one sequence: --parallel %d slots share it and requests run one at a time\n", o.n_parallel);
+            std::lock_guard<std::mutex> lk(mu_);
+            set_sequences(can_multi && !o.mtp);
+        }
         qv::EngineOptions eo;
-        eo.max_ctx = o.ctx;
+        eo.max_ctx = slot_ctx;
+        eo.n_seq = multi_seq ? n_slots : 1;
         eo.kv_mode = o.kv_mode;
         eo.kv4_kmode = o.kv4_kmode;
         eo.mtp = o.mtp;
@@ -813,6 +840,7 @@ void App::load_model(const Options& mo_in, const std::string& forced_id) {
         chunk = o.prefill_chunk > 0 ? o.prefill_chunk : (o.ubatch > 0 ? o.ubatch : (backend == "cuda" ? 2048 : 256));
         eo.prefill_chunk = chunk;
         mtp_chunk = 8;
+        if (const char* e = std::getenv("QV_SHARED_CHUNK")) shared_chunk = std::max(1, std::atoi(e));
 
         Options mo = o;
         auto make_engine = [this, backend, stem, eo, mo]() mutable -> std::unique_ptr<qv::Engine> {
@@ -820,7 +848,7 @@ void App::load_model(const Options& mo_in, const std::string& forced_id) {
             if (backend == "mock") {
                 if (const char* ms = std::getenv("QV_MOCK_LOAD_MS")) std::this_thread::sleep_for(std::chrono::milliseconds(std::atoi(ms)));
                 auto script = tok.encode(mo.mock_text, false);
-                e = std::make_unique<qv::MockEngine>(tok.vocab_size(), script, eos_id, mo.mock_loop, mo.mock_delay_us);
+                e = std::make_unique<qv::MockEngine>(tok.vocab_size(), script, eos_id, mo.mock_loop, mo.mock_delay_us, eo.n_seq);
             } else {
                 if (mo.model.empty()) throw std::runtime_error("no model: pass -m MODEL (or set LLAMA_ARG_MODEL)");
                 qv::ModelFile mf = qv::ModelFile::open(stem);
@@ -911,19 +939,25 @@ void App::load_model(const Options& mo_in, const std::string& forced_id) {
     }
 }
 
+// Model lease: requests of the active model run concurrently (each registers as a "model user"); a model switch needs the engine to itself.
 long App::acquire_model_lease(const std::string& requested_model, const std::function<bool()>& alive) {
     if (!has_presets()) return -1;
     const ModelPreset* p = find_preset(requested_model);
     if (!p) throw_error(404, "The model '" + requested_model + "' does not exist", "model_not_found");
-    long ticket = lease_acquire(alive);
-    if (ticket < 0) return -2;
-    if (active_preset_id != p->id || !eng) {
+    for (;;) {
+        long ticket = user_acquire(alive);
+        if (ticket < 0) return -2;
+        if (active_preset_id == p->id && eng) return ticket;
+        user_release();
+        ticket = lease_acquire(alive);
+        if (ticket < 0) return -2;
+        if (active_preset_id == p->id && eng) { lease_downgrade(); return ticket; }
         auto t0 = Clock::now();
         std::string prev = active_preset_id;
         try {
             load_model(p->opts, p->id);
         } catch (const std::exception& e) {
-            release_model_lease(ticket);
+            lease_release(ticket);
             throw_error(503, std::string("failed to load model '") + p->id + "': " + e.what(), "unavailable_error");
         }
         if (o.verbosity >= 3 && !o.log_disable) {
@@ -934,14 +968,15 @@ long App::acquire_model_lease(const std::string& requested_model, const std::fun
                 std::fprintf(stderr, "[qv_server] switched model '%s' -> '%s' in %.1fs (backend=%s, n_ctx=%d, mtp=%d)\n",
                              prev.c_str(), p->id.c_str(), std::chrono::duration<double>(Clock::now() - t0).count(), backend_name.c_str(), n_ctx, (int)o.mtp);
         }
+        lease_downgrade();
+        return ticket;
     }
-    return ticket;
 }
 
 void App::release_model_lease(long ticket) {
     if (ticket < 0) return;
     last_task_ms_ = mono_ms();
-    lease_release(ticket);
+    user_release();
 }
 
 }  // namespace qv::server

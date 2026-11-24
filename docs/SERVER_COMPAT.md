@@ -17,7 +17,7 @@ fails to evaluate and no tools were requested), `tools` / `tool_choice` / `paral
 | `GET /health`, `GET /v1/health` | implemented | `{"status":"ok"}`; **503 `Loading model`** (`unavailable_error`) on every route while the model loads (the port is opened first); public even with an API key; `HEAD` works |
 | `GET /props` | implemented | same keys as llama-server (`default_generation_settings`, `total_slots`, `model_alias`, `model_path`, `modalities`, `endpoint_*`, `chat_template`, `chat_template_caps`, `bos_token`, `eos_token`, `build_info`, `is_sleeping`, ...). `chat_template` is the model's `chat_template.jinja`, `build_info` is `qv-<git rev>` |
 | `POST /props` | implemented | 501 `not_supported_error` unless `--props`, then `{"success":true}` |
-| `GET /slots` | implemented | `--parallel N` logical slots, `is_processing`, `id_task`, `params`, `next_token`; `?fail_on_no_slot` -> 503 |
+| `GET /slots` | implemented | `--parallel N` slots (engine sequences), `is_processing`, `id_task`, `params`, `next_token`; `?fail_on_no_slot` -> 503 |
 | `POST /slots/:id?action=save\|restore\|erase` | partial | needs `--slot-save-path` (501 otherwise, like llama). Save stores the token list; restore re-evaluates it (no KV/state snapshot in the file; files are not interchangeable with llama.cpp). Filename validation and error messages as llama |
 | `GET /metrics` | implemented | needs `--metrics` (501 otherwise); same 15 metric names/HELP/TYPE (`llamacpp:*`), `Process-Start-Time-Unix` header, `text/plain; version=0.0.4`. Gauges are windowed between scrapes like llama |
 | `GET /models`, `GET /v1/models` | implemented | llama's merged shape (`models[]` Ollama-style + `data[]` OpenAI-style). `meta.n_params` is 0 (not read from the container) |
@@ -70,13 +70,14 @@ Control tokens (`<|...|>`) are not printed unless `--special`.
 
 ## 4. Slots, parallelism, prompt cache
 
-`--parallel N` (default 4, llama's auto) creates N logical slots. The CPU and CUDA engines hold **one** sequence state, so generation is serialized:
-the running request is the only slot with `is_processing: true`; other requests wait in a FIFO (`llamacpp:requests_deferred` counts them) and are served in arrival order;
-nothing is rejected unless `--max-queue N` is given (then 503 `unavailable_error`, a Q-Volta addition; llama-server itself queues without bound). A request whose client disconnects while queued or running is dropped and
-the engine keeps exactly the tokens it processed. `id_slot` is honoured for reporting only (`id_slot` in the response, `/slots` entry that records the task); all slots share one prefix cache.
-Prefix reuse (`cache_prompt`, default on): the new prompt must start with the exact token sequence in the engine (recurrent state cannot be rewound), then only the suffix is evaluated; `timings.cache_n`,
+`--parallel N` (default 4, llama's auto) creates N slots; every engine (CUDA Inkling / Qwen, CPU Inkling / Qwen, mock) holds one sequence per slot, so up to N requests generate concurrently. Their engine operations (a prefill chunk, a decode step) are interleaved
+round-robin through a FIFO lock, not batched into one forward. `/slots` shows one `is_processing` per running request; further requests wait in a FIFO (`llamacpp:requests_deferred`) and are served in arrival order; nothing is rejected unless `--max-queue N` is given
+(then 503 `unavailable_error`, a Q-Volta addition). A request whose client disconnects while queued or running is dropped and its slot is freed; the slot keeps exactly the tokens it processed.
+`id_slot` pins the slot (waits if busy); otherwise the idle slot with the longest matching cached prefix is used. **`--ctx-size` is the total context: each slot has `N / parallel` tokens** (`n_ctx` in `/props`, `/slots`, errors is the per-slot value).
+llama-server's default shares one unified KV pool, so a single slot there can use the whole context; Q-Volta allocates each sequence's KV up front, use `--parallel 1` for one long context. With `--mtp` the engine holds one sequence: the slots share it and requests run one at a time.
+Prefix reuse (`cache_prompt`, default on): per slot, the new prompt must start with the exact token sequence in the slot (recurrent state cannot be rewound), then only the suffix is evaluated; `timings.cache_n`,
 `usage.prompt_tokens_details.cached_tokens` and `/metrics` `prompt_tokens_cached_total` report it. A repeated identical prompt re-evaluates the whole prompt, because the state has advanced past it by the generated tokens (llama.cpp rewinds its KV cache; a state snapshot after prefill would be the engine-level fix).
-True concurrent multi-slot decoding (batched sequences) needs per-slot recurrent/KV state in the engines and is a later engine-level feature.
+Not done: one batched forward over several sequences (llama.cpp's continuous batching); aggregate throughput of concurrent requests is therefore close to one stream's (docs/PERFORMANCE.md).
 
 ## 5. Known differences (intentional or unavoidable)
 
@@ -87,7 +88,7 @@ True concurrent multi-slot decoding (batched sequences) needs per-slot recurrent
 | Tool-call wire format | the Qwen3.8 template makes the model emit `<tool_call><function=..><parameter=..>` (QwenXml); llama-server + Qwen2.5 uses Hermes JSON. The OpenAI `tool_calls` output has the same shape; the model-specific text format follows the loaded model's template | model/template |
 | Grammar speed | allowed-token masks are cached per grammar state; first use of a new state costs one trie walk over the 248K-token vocabulary (docs/GRAMMAR.md) | different implementation |
 | `--reasoning-budget N>0`, grammar for `<think>` text | not enforced | |
-| Slot concurrency | one decoding sequence | engine design, see section 4 |
+| Slot concurrency | N sequences, interleaved (not batched); `--ctx-size` split per slot | see section 4 |
 | `/slots` save/restore | token-list files, restore = re-prefill | no KV snapshot API in the engines |
 | `meta.n_params`, `model_ftype` | 0 / `Q-Volta` | not recorded in the `.qv` header |
 | audio / realtime / router / `/tools` / `/cors-proxy` | 501 / 404 / 403 | out of scope (see section 1) |
@@ -125,7 +126,7 @@ Not in llama-server (Q-Volta flags): `--backend cuda|cpu|auto|mock`, `--kv fp32|
 | `--cpu-strict-batch` `<0\|1>` |  | n/a | thread placement / priority is not configurable |
 | `--prio-batch` `N` |  | n/a | thread placement / priority is not configurable |
 | `--poll-batch` `<0\|1>` |  | n/a | thread placement / priority is not configurable |
-| `-c`, `--ctx-size` `N` | `LLAMA_ARG_CTX_SIZE` | implemented | 0 = 4096 (default). All slots share one engine context: `n_ctx` per slot = the full context (llama-server's unified-KV layout) |
+| `-c`, `--ctx-size` `N` | `LLAMA_ARG_CTX_SIZE` | implemented | 0 = 4096 (default). Total context, divided among the slots (`n_ctx` per slot = N / `--parallel`; llama-server's non-unified layout; `--parallel 1` = whole context) |
 | `-n`, `--predict`, `--n-predict` `N` | `LLAMA_ARG_N_PREDICT` | implemented | default `n_predict` (-1 = until EOS / context end) |
 | `-b`, `--batch-size` `N` | `LLAMA_ARG_BATCH` | partial | only used as the infill batch size; prefill chunk comes from `-ub` / `--prefill-chunk` |
 | `-ub`, `--ubatch-size` `N` | `LLAMA_ARG_UBATCH` | partial | prefill chunk size (also the granularity at which a client disconnect is noticed during prefill) |

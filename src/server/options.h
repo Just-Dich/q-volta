@@ -59,6 +59,7 @@ struct Options {
     std::string reasoning_format = "auto";  // auto | none | deepseek | deepseek-legacy
     int reasoning = -1;                     // -1 auto, 0 off, 1 on
     int reasoning_budget = -1;
+    std::string reasoning_budget_message;  // injected before the end-of-thinking marker when the budget is exhausted
     std::string reasoning_effort;
     int max_queue = -1;                // Q-Volta: -1 = unbounded (llama behaviour), N>=0 = 503 beyond N waiting requests
     bool log_disable = false;

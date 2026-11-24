@@ -125,7 +125,7 @@ class CpuEngine final : public Engine {
         bind(mf);
         alloc_state();
         research_init();
-        reset();
+        for (int i = opt_.n_seq - 1; i >= 0; --i) { select_seq(i); reset(); }
     }
     ~CpuEngine() override {
 #ifdef QV_CPU_PROF
@@ -149,6 +149,17 @@ class CpuEngine final : public Engine {
         if (map_) { if (owned_) std::free(map_); else munmap(map_, map_len_); }
         std::free(k_cache_);
         std::free(v_cache_);
+        for (SeqSt& q : seqs_) { std::free(q.k_cache); std::free(q.v_cache); }
+    }
+
+    // ---- sequences: the current one lives in the members; the others are parked in seqs_ (the holder of the current sequence is empty)
+    int n_seq() const override { return opt_.n_seq; }
+    void select_seq(int i) override {
+        if (i < 0 || i >= opt_.n_seq) throw std::runtime_error("sequence index out of range");
+        if (i == cur_seq_) return;
+        swap_state(seqs_[cur_seq_]);
+        swap_state(seqs_[i]);
+        cur_seq_ = i;
     }
 
     void step(int token, int pos) override {
@@ -242,6 +253,10 @@ class CpuEngine final : public Engine {
     int n_gdn_ = 0, n_attn_ = 0;
     // state
     std::vector<float> conv_state_, gdn_state_;
+    struct SeqSt { std::vector<float> conv, gdn, logits; float *k_cache = nullptr, *v_cache = nullptr; };
+    std::vector<SeqSt> seqs_;
+    int cur_seq_ = 0;
+    void swap_state(SeqSt& q) { std::swap(conv_state_, q.conv); std::swap(gdn_state_, q.gdn); std::swap(logits_, q.logits); std::swap(k_cache_, q.k_cache); std::swap(v_cache_, q.v_cache); }
     float *k_cache_ = nullptr, *v_cache_ = nullptr;
     size_t state_bytes_ = 0;
     // scratch
@@ -586,6 +601,16 @@ class CpuEngine final : public Engine {
         v_cache_ = (float*)std::calloc(kv, 4);
         if (!k_cache_ || !v_cache_) throw std::runtime_error("KV cache allocation failed");
         state_bytes_ = (conv_state_.size() + gdn_state_.size()) * 4 + kv * 8;
+        if (opt_.n_seq < 1) opt_.n_seq = 1;
+        if (opt_.n_seq > 1 && opt_.mtp) throw std::runtime_error("MTP supports one sequence (use n_seq = 1)");
+        seqs_.assign(opt_.n_seq, SeqSt());
+        for (int i = 1; i < opt_.n_seq; ++i) {
+            SeqSt& q = seqs_[i];
+            q.conv.assign(conv_state_.size(), 0.f); q.gdn.assign(gdn_state_.size(), 0.f); q.logits.assign(c.vocab, 0.f);
+            q.k_cache = (float*)std::calloc(kv, 4); q.v_cache = (float*)std::calloc(kv, 4);
+            if (!q.k_cache || !q.v_cache) throw std::runtime_error("KV cache allocation failed");
+            state_bytes_ += (conv_state_.size() + gdn_state_.size() + c.vocab) * 4 + kv * 8;
+        }
         x_.assign(c.hidden, 0.f); xn_.assign(c.hidden, 0.f);
         qkv_.assign(conv_C, 0.f); conv_out_.assign(conv_C, 0.f);
         z_.assign(VD, 0.f); alpha_.assign(c.lin_v_heads, 0.f); beta_.assign(c.lin_v_heads, 0.f);

@@ -84,7 +84,8 @@ def hdrs(hd): return {k.lower(): v for k, v in hd}
 
 
 def qv_cmd(*extra, backend="mock"):
-    return [QV_SERVER, "--backend", backend, "--tokenizer", TOKJSON, "--port", "@PORT@", "-c", "4096"] + list(extra)
+    base = [QV_SERVER, "--backend", backend, "--tokenizer", TOKJSON, "--port", "@PORT@", "-c", "16384"]  # 16384 total = 4 slots x 4096 (--ctx-size is divided among the slots)
+    return base + list(extra)
 
 
 @pytest.fixture(scope="module")
@@ -583,7 +584,7 @@ def test_api_key():
 
 
 def test_queue_slots_and_disconnect():
-    s = Srv(qv_cmd("--metrics", "-np", "2", "--mock-loop", "--mock-delay-us", "20000"), name="queue")
+    s = Srv(qv_cmd("--metrics", "-np", "1", "--mock-loop", "--mock-delay-us", "20000"), name="queue")
     try:
         res = {}
         def long_req(name, n):
@@ -591,7 +592,7 @@ def test_queue_slots_and_disconnect():
         t1 = threading.Thread(target=long_req, args=("first", 25)); t1.start(); time.sleep(0.2)
         t2 = threading.Thread(target=long_req, args=("second", 3)); t2.start(); time.sleep(0.2)
         sl = s.req("GET", "/slots")[2]
-        assert len(sl) == 2 and sum(1 for x in sl if x["is_processing"]) == 1
+        assert len(sl) == 1 and sum(1 for x in sl if x["is_processing"]) == 1
         m = s.req("GET", "/metrics", raw=True)[2].decode()
         assert re.search(r"^llamacpp:requests_processing 1$", m, re.M) and re.search(r"^llamacpp:requests_deferred 1$", m, re.M), m
         t1.join(); t2.join()
@@ -609,8 +610,68 @@ def test_queue_slots_and_disconnect():
         s.stop()
 
 
+def test_concurrent_requests_interleave():
+    """-np 3: three requests run at the same time (one engine sequence each); a fourth waits in the queue; aborting one frees its slot."""
+    s = Srv(qv_cmd("--metrics", "-np", "3", "--mock-loop", "--mock-text", "alpha beta gamma delta", "--mock-delay-us", "20000"), name="conc")
+    try:
+        res, t_first = {}, {}
+        def stream(name, n):
+            c = http.client.HTTPConnection("127.0.0.1", s.port, timeout=60)
+            c.request("POST", "/v1/chat/completions", json.dumps({"messages": [{"role": "user", "content": name}], "max_tokens": n, "stream": True, "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}}), {"Content-Type": "application/json"})
+            r = c.getresponse(); t0 = time.time(); evs = []
+            for line in r.read().decode().split("\n\n"):
+                if line.startswith("data: ") and "[DONE]" not in line: evs.append(json.loads(line[6:]))
+            res[name] = (time.time() - t0, evs)
+        names = ["a", "b", "c", "d"]
+        ths = [threading.Thread(target=stream, args=(n, 30)) for n in names[:3]]
+        for t in ths: t.start()
+        time.sleep(0.3)
+        sl = s.req("GET", "/slots")[2]
+        assert sum(1 for x in sl if x["is_processing"]) == 3, sl
+        t4 = threading.Thread(target=stream, args=("d", 5)); t4.start(); time.sleep(0.2)
+        m = s.req("GET", "/metrics", raw=True)[2].decode()
+        assert re.search(r"^llamacpp:requests_processing 3$", m, re.M) and re.search(r"^llamacpp:requests_deferred 1$", m, re.M), m
+        for t in ths + [t4]: t.join()
+        # three 30-token streams run concurrently: wall time ~ 30 steps of 20 ms (+ prefill), NOT 3x; each got its full, ordered content
+        tmax = max(res[n][0] for n in "abc")
+        assert tmax < 30 * 0.020 * 2.2 + 1.0, res
+        for n in "abc":
+            txt = "".join((e["choices"][0]["delta"].get("content") or "") for e in res[n][1] if e["choices"])
+            assert txt.startswith("alpha beta gamma delta"), (n, txt)
+            assert sum(1 for e in res[n][1] if e["choices"] and e["choices"][0]["delta"].get("content")) >= 20
+        assert res["d"][1]
+        # abort one stream: its slot frees while the others finish
+        done = {}
+        def victim():
+            c = socket.create_connection(("127.0.0.1", s.port))
+            body = json.dumps({"prompt": "v", "n_predict": 500, "temperature": 0, "stream": True}).encode()
+            c.sendall(b"POST /completion HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+            c.recv(200); c.close()
+        other = threading.Thread(target=stream, args=("e", 25)); other.start(); victim(); other.join()
+        t0 = time.time()
+        while time.time() - t0 < 10 and any(x["is_processing"] for x in s.req("GET", "/slots")[2]): time.sleep(0.1)
+        assert not any(x["is_processing"] for x in s.req("GET", "/slots")[2])
+        assert len(res["e"][1]) > 20
+    finally:
+        s.stop()
+
+
+def test_slots_cache_prompt_per_slot():
+    """Two conversations alternate: each keeps its own slot and KV prefix (cache_prompt), the server does not re-prefill either."""
+    s = Srv(qv_cmd("-np", "2", "--mock-loop"), name="cache")
+    try:
+        def go(p):
+            return s.req("POST", "/completion", {"prompt": p, "n_predict": 2, "temperature": 0, "cache_prompt": True})[2]
+        a1 = go("conversation A first turn"); b1 = go("something else entirely B")
+        assert a1["id_slot"] != b1["id_slot"]
+        a2 = go("conversation A first turn" + a1["content"] + " and a second turn")   # continues A: its cached tokens are a prefix
+        assert a2["id_slot"] == a1["id_slot"] and a2["timings"]["cache_n"] > 0, a2
+    finally:
+        s.stop()
+
+
 def test_max_queue_503():
-    s = Srv(qv_cmd("--max-queue", "0", "--mock-loop", "--mock-delay-us", "30000"), name="mq")
+    s = Srv(qv_cmd("--max-queue", "0", "-np", "1", "--mock-loop", "--mock-delay-us", "30000"), name="mq")
     try:
         r = {}
         t = threading.Thread(target=lambda: r.update(a=s.req("POST", "/completion", {"prompt": "x", "n_predict": 20, "temperature": 0}))); t.start(); time.sleep(0.2)
@@ -623,7 +684,7 @@ def test_max_queue_503():
 
 
 def test_context_limit_truncated():
-    s = Srv(qv_cmd("-c", "64", "--mock-loop", "--mock-text", "a b c d"), name="ctx")
+    s = Srv(qv_cmd("-c", "64", "-np", "1", "--mock-loop", "--mock-text", "a b c d"), name="ctx")
     try:
         r = s.req("POST", "/completion", {"prompt": "x", "n_predict": -1, "temperature": 0})[2]
         assert r["stop_type"] == "limit" and r["truncated"] is True and r["tokens_predicted"] + r["tokens_evaluated"] >= 62
@@ -693,7 +754,7 @@ def test_cli_environment_variables():
                 c = http.client.HTTPConnection("127.0.0.1", port, timeout=2); c.request("GET", "/props", headers={"Authorization": "Bearer envkey"}); r = c.getresponse(); b = json.loads(r.read()); ok = r.status == 200
             except (OSError, ValueError): time.sleep(0.2)
         assert ok and b["total_slots"] == 3 and b["model_alias"] == "envmodel" and b["endpoint_slots"] is False and b["endpoint_metrics"] is True
-        assert b["default_generation_settings"]["n_ctx"] == 1234
+        assert b["default_generation_settings"]["n_ctx"] == 1234 // 3  # --ctx-size is shared by the slots
     finally:
         p.send_signal(signal.SIGTERM); p.wait(10)
 
@@ -1082,7 +1143,7 @@ def test_models_preset_routing(tmp_path):
 
         st, _, r2 = s.req("POST", "/v1/chat/completions", {"model": "m2", "messages": [{"role": "user", "content": "hi"}], "chat_template_kwargs": {"enable_thinking": False}})
         assert st == 200 and r2["model"] == "m2" and "beta" in r2["choices"][0]["message"]["content"]
-        assert s.req("GET", "/props")[2]["default_generation_settings"]["n_ctx"] == 8192
+        assert s.req("GET", "/props")[2]["default_generation_settings"]["n_ctx"] == 8192 // 2  # max-context is shared by the 2 slots (max-concurrency)
 
         by_id = {d["id"]: d for d in s.req("GET", "/v1/models")[2]["data"]}
         assert by_id["m1"]["status"]["value"] == "unloaded" and by_id["m2"]["status"]["value"] == "loaded"
@@ -1427,3 +1488,19 @@ def test_anthropic_and_responses_match_llama(pair, path, body, stream):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"] + sys.argv[1:]))
+
+
+def test_reasoning_budget_and_length_inside_reasoning():
+    """finish_reason=length inside the thinking block: content "" + reasoning_content (as llama-server); --reasoning-budget closes the block."""
+    s = Srv(qv_cmd("--mock-loop", "--mock-text", "alpha beta gamma delta"), name="rlen")
+    try:
+        r = s.req("POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "a"}], "max_tokens": 5})[2]["choices"][0]
+        assert r["finish_reason"] == "length" and r["message"]["content"] == "" and r["message"]["reasoning_content"].startswith("alpha beta")
+    finally:
+        s.stop()
+    s = Srv(qv_cmd("--mock-loop", "--mock-text", "alpha beta gamma delta", "--reasoning-budget", "6", "--reasoning-budget-message", "Time is up."), name="rbud")
+    try:
+        r = s.req("POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "a"}], "max_tokens": 40})[2]["choices"][0]["message"]
+        assert r["reasoning_content"].endswith("Time is up.") and r["content"].strip() != ""
+    finally:
+        s.stop()

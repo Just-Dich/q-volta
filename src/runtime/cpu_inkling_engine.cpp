@@ -114,16 +114,26 @@ class InkCpuEngine final : public Engine, public InklingCpuInfo {
         if (cfg_.hidden != H || ik.n_experts != NE || ik.topk != TOPK || ik.expert_ff != FF || ik.window != WIN || ik.rel_extent != REXT)
             throw std::runtime_error("InkCpuEngine: unsupported Inkling shape");
         V_ = ik.unpadded_vocab;
+        if (opt_.n_seq < 1) opt_.n_seq = 1;
         Tc_ = std::max(1, std::min(opt.prefill_chunk, 1024));
         prof_ = std::getenv("QV_INK_PROF") != nullptr;
         map_weights(mf);
         bind(mf);
         build_apps();
         alloc();
-        reset();
+        for (int i = opt_.n_seq - 1; i >= 0; --i) { select_seq(i); reset(); }
     }
     ~InkCpuEngine() override {
         if (owned_) std::free(map_);
+    }
+    // sequences: the current one lives in the members, the others are parked in seqs_ (the holder of the current sequence is empty)
+    int n_seq() const override { return opt_.n_seq; }
+    void select_seq(int i) override {
+        if (i < 0 || i >= opt_.n_seq) throw std::runtime_error("sequence index out of range");
+        if (i == cur_seq_) return;
+        swap_state(seqs_[cur_seq_]);
+        swap_state(seqs_[i]);
+        cur_seq_ = i;
     }
 
     // ------------------------------------------------------------------------------------------------ Engine interface
@@ -429,6 +439,18 @@ class InkCpuEngine final : public Engine, public InklingCpuInfo {
         for (auto& v : kg_) v.reset((uint16_t*)std::calloc(gsz, 2));
         for (auto& v : vg_) v.reset((uint16_t*)std::calloc(gsz, 2));
         state_bytes_ = (size_t)n_local_ * lsz * 4 + (size_t)n_global_ * gsz * 4 + cstate_.size() * 4;
+        seqs_.clear(); seqs_.resize(opt_.n_seq);
+        for (int i = 1; i < opt_.n_seq; ++i) {
+            SeqSt& q = seqs_[i];
+            q.kl.resize(n_local_); q.vl.resize(n_local_); q.kg.resize(n_global_); q.vg.resize(n_global_);
+            for (auto& v : q.kl) v.reset((uint16_t*)std::calloc(lsz, 2));
+            for (auto& v : q.vl) v.reset((uint16_t*)std::calloc(lsz, 2));
+            for (auto& v : q.kg) v.reset((uint16_t*)std::calloc(gsz, 2));
+            for (auto& v : q.vg) v.reset((uint16_t*)std::calloc(gsz, 2));
+            q.cstate.assign(cstate_.size(), 0.f);
+            q.logits.assign(V_, 0.f);
+            state_bytes_ += (size_t)n_local_ * lsz * 4 + (size_t)n_global_ * gsz * 4 + cstate_.size() * 4;
+        }
         // bytes touched per decode token
         double b = 0;
         for (const auto& ap : apps_) {
@@ -1065,6 +1087,10 @@ class InkCpuEngine final : public Engine, public InklingCpuInfo {
     struct FreeDel { void operator()(uint16_t* p) const { std::free(p); } };
     std::vector<std::unique_ptr<uint16_t, FreeDel>> kl_, vl_, kg_, vg_;
     std::vector<float> hid_dump_, logits_dump_;
+    struct SeqSt { std::vector<std::unique_ptr<uint16_t, FreeDel>> kl, vl, kg, vg; std::vector<float> cstate, logits; };
+    std::vector<SeqSt> seqs_;
+    int cur_seq_ = 0;
+    void swap_state(SeqSt& q) { std::swap(kl_, q.kl); std::swap(vl_, q.vl); std::swap(kg_, q.kg); std::swap(vg_, q.vg); std::swap(cstate_, q.cstate); std::swap(logits_, q.logits); }
     std::vector<int8_t> router_dump_;
     double ph_ms_[NPH] = {};
     long ph_calls_[NPH] = {};

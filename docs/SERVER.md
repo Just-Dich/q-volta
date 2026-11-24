@@ -7,7 +7,7 @@ status (implemented / partial / n/a / unsupported) is in [SERVER_COMPAT.md](SERV
 
 Chat templates run through the Jinja interpreter (`src/jinja`): the model's own `chat_template.jinja`, `--chat-template chatml|TEXT`, `--chat-template-file`. Tools (`tools`, `tool_choice`,
 `parallel_tool_calls`, tool-call history) produce OpenAI `tool_calls`, also as streaming deltas; `grammar`, `json_schema`, `response_format` and forced tool choices are enforced by the GBNF sampler (`src/grammar`)
-on host logits. Anthropic `/v1/messages` and OpenAI `/v1/responses` are translated onto the chat path. Still unavailable: embeddings, rerank, audio, runtime LoRA, router mode, `/tools`, `/cors-proxy`. Generation is serialized: `--parallel N` reports N logical slots, requests queue FIFO.
+on host logits. Anthropic `/v1/messages` and OpenAI `/v1/responses` are translated onto the chat path. Still unavailable: embeddings, rerank, audio, runtime LoRA, router mode, `/tools`, `/cors-proxy`. Requests run concurrently: `--parallel N` creates N slots = N engine sequences (own KV / recurrent state) over one copy of the weights; the server interleaves their prefill chunks and decode steps (no batched forward yet, see Slots and concurrency).
 
 ## Web UI
 
@@ -20,7 +20,7 @@ Screenshots from headless Chromium: `docs/img/webui_*.png`; the browser check is
 
 * `--sleep-idle-seconds N`: after N idle seconds the engine is destroyed (weights and KV freed) and rebuilt on the next generation (`is_sleeping` in `/props`; `/health`, `/props`, `/models`, `/metrics` do not wake it).
 * Streams with `X-Conversation-Id` survive client disconnects; see SERVER_COMPAT.md.
-* `--parallel N` is honest queueing: one engine sequence, FIFO, no concurrent decoding (SERVER_COMPAT.md section 4).
+* `--parallel N` slots are real engine sequences that run concurrently (interleaved, FIFO fair); requests beyond N wait FIFO (SERVER_COMPAT.md section 4).
 * Logging is a single line per request in Q-Volta's own format, not llama's.
 
 ## Build
@@ -55,11 +55,23 @@ Disable with `"chat_template_kwargs":{"enable_thinking":false}` or `--reasoning 
 
 `tool_choice` auto uses a lazy grammar (unconstrained text until the tool-call marker appears), `required` / a named function constrain the whole answer. Constrained requests skip the engine argmax and MTP fast paths.
 
-## Slots and queueing
+## Slots and concurrency
 
-`--parallel N` creates N logical slots (default 4). The engine holds one sequence, so one request decodes at a time; others wait FIFO (`/slots` shows one `is_processing`, `/metrics` `requests_deferred`).
-Prefix reuse (`cache_prompt`): if the new prompt starts with the tokens already in the engine only the suffix is evaluated (`timings.cache_n`, `usage.prompt_tokens_details.cached_tokens`, `tokens_cached`).
-The recurrent state cannot be rewound, so an identical repeated prompt is re-evaluated. Context end stops generation (`stop_type: limit`, `truncated: true`). True multi-slot batched decoding is a later engine-level feature.
+`--parallel N` (default 4) creates N slots; slot i is engine sequence i (KV cache incl. int4 KV, GDN / conv / sconv states, Inkling loop-pass state, position, logits), all sharing one copy of the weights, kernels and scratch.
+Up to N requests generate at the same time; the N+1th waits FIFO (`/metrics` `requests_deferred`, `--max-queue N` -> 503). A slot is chosen per request: `id_slot` if given, else the idle slot whose cached context is a prefix of the prompt
+(longest wins), else an empty slot, else the least recently used. `cache_prompt` therefore works per slot: two conversations alternating keep their own prefixes.
+**`--ctx-size N` is the TOTAL context shared by the slots**: every slot gets `N / parallel` tokens (llama-server splits the same way without `--kv-unified`); `n_ctx` in `/props` and `/slots` is that per-slot value, a prompt longer than it is rejected.
+`--parallel 1` gives the whole context to one request. Memory: weights + N x (KV of its context + fixed per-sequence state; Inkling 0.19 GiB, Qwen3.8-27B ~0.07 GiB + KV) + one shared scratch / prefill buffer set.
+Scheduling: every engine operation (one prefill chunk, or one decode step plus the fetch of its argmax / logits) takes the engine through a FIFO ticket mutex, so running requests interleave round-robin; host work (sampling, detokenization, SSE writes) runs outside the lock and overlaps other slots' GPU work.
+A long prompt is prefilled in `--prefill-chunk` pieces; while another slot is decoding, chunks shrink to 1024 tokens (`QV_SHARED_CHUNK`) so decode steps are not stalled for a whole 2048-token chunk. Abort / disconnect frees the slot immediately.
+Limits: decode steps of different slots are interleaved, not batched (the GPU does one sequence's step at a time; aggregate throughput gain comes from overlapping host work, see docs/PERFORMANCE.md "Concurrent requests"); `--mtp` supports one sequence (the slots then share it and requests run one at a time).
+`/slots/:id?action=save|restore|erase` waits for that slot to be idle and acts on its own sequence. Model switching (`--models-preset`) waits for all running requests and blocks new ones while it loads; requests of the active model run concurrently.
+Prefix reuse (`cache_prompt`): if the new prompt starts with the tokens already in the slot only the suffix is evaluated (`timings.cache_n`, `usage.prompt_tokens_details.cached_tokens`, `tokens_cached`).
+The recurrent state cannot be rewound, so an identical repeated prompt is re-evaluated. Context end stops generation (`stop_type: limit`, `truncated: true`).
+
+### Reasoning budget and length inside the thinking block
+A request that hits `max_tokens` (or the context) while still inside the thinking block returns `finish_reason: "length"`, `content: ""` and the text so far in `reasoning_content` (streaming: `reasoning_content` deltas then a final chunk with `finish_reason: "length"`), the same shape as llama-server with `--reasoning-format deepseek`. Clients that only read `content` (some agent UIs show "the model ended its turn without producing any output") must handle that case or raise `max_tokens`.
+`--reasoning-budget N` (llama-server flag, `LLAMA_ARG_THINK_BUDGET`) with N > 0 closes the thinking block after N reasoning tokens by forcing the end marker (`\n</think>\n\n`; Inkling: `<|end_message|><|message_model|><|content_text|>`), optionally preceded by `--reasoning-budget-message`; 0 disables thinking, -1 (default) is unlimited. The Inkling closing sequence is built from the message grammar in docs/INKLING_SPEC.md and was tested on the mock backend only.
 
 ## Tokenizer and chat template fidelity
 

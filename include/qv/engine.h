@@ -12,7 +12,8 @@
 namespace qv {
 
 struct EngineOptions {
-    int max_ctx = 4096;
+    int max_ctx = 4096;        // context of EACH sequence (the server divides --ctx-size by the number of slots)
+    int n_seq = 1;             // independent sequences sharing the weights (Inkling CUDA / Qwen CUDA / CPU engines); see Engine::select_seq
     int prefill_chunk = 2048;  // tokens per batched prefill chunk
     int threads = 32;          // CPU backend: worker threads incl. the caller (RAM bandwidth saturates near 32 here)
     bool mtp = false;          // load the MTP head and use it for exact speculative greedy decoding (CPU and CUDA backends)
@@ -66,6 +67,13 @@ class Engine {
     // Inkling engines: integer debug output of the last step (router expert ids [48 applications][8]) when EngineOptions::dump_hidden.
     // For arch inkling2_loop, hidden_dump() holds the LAST step only: [50][2304] = embedding, 48 layer-application outputs, final-norm output.
     virtual const std::vector<int>& aux_dump() const { static const std::vector<int> none; return none; }
+    // Multi-sequence contract: an engine built with EngineOptions::n_seq = N owns N independent sequences (KV cache, recurrent/conv states, last
+    // logits, token/position state) over one copy of the weights. All other calls (step / prefill / argmax / logits / reset / state_*) act on
+    // the CURRENT sequence, chosen by select_seq(i) (0 <= i < n_seq(); initially 0). Switching is host-side bookkeeping (no device sync, no
+    // copy) and the results of a sequence are bit-identical to running it alone. Calls must come from one thread at a time (the server
+    // serialises them with its engine turn lock). Engines that cannot hold more than one sequence return 1 and ignore select_seq.
+    virtual int n_seq() const { return 1; }
+    virtual void select_seq(int) {}
     virtual size_t device_bytes_weights() const = 0;
     virtual size_t device_bytes_state() const = 0;
     const Config& config() const { return cfg_; }
