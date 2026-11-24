@@ -1,0 +1,206 @@
+/*
+ * Q-Volta theme for the vendored llama.cpp web UI (MIT, see THIRD_PARTY.md). Only design tokens are
+ * overridden here (the UI is built on semantic tokens, see lib/ui/src/lib/styles/tokens), plus a few
+ * rules for what a token cannot express (the gradient primary button, the wordmark, scrollbars).
+ * Palette: the Q Project site (dark navy #0b1020 / indigo #16103a, accent #7c5cff -> #22d3ee).
+ * Contrast (WCAG AA): fg-default on page >= 13:1, fg-muted >= 6.2:1 on every surface in both themes,
+ * button text #fff on the #6d4aff -> #0e7490 gradient >= 5.1:1.
+ */
+
+@theme inline {
+	--font-sans: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+}
+
+:root {
+	--font-mono: ui-monospace, SFMono-Regular, 'SF Mono', 'Cascadia Code', 'JetBrains Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+	--radius: 0.75rem;
+
+	--q-gradient: linear-gradient(135deg, #6d4aff 0%, #0e7490 100%);
+
+	/* Light: the site's light palette */
+	--surface-page: #f7f8fc;
+	--surface-muted: #eef0f8;
+	--surface-emphasis: #e5e8f4;
+	--surface-selected: #ebe6ff;
+	--surface-raised: #ffffff;
+	--surface-lifted: #ffffff;
+	--surface-pressed: #ffffff;
+	--surface-glass: color-mix(in oklab, #ffffff 82%, transparent);
+	--surface-code: #f1f3fb;
+	--surface-overlay: rgb(11 16 32 / 0.45);
+
+	--fg-default: #0f172a;
+	--fg-muted: #475569;
+	--fg-on-action: #ffffff;
+	--fg-code: #0f172a;
+	--fg-danger: #b91c1c;
+	--fg-success: #15803d;
+	--fg-warning: #a16207;
+	--fg-info: #0e7490;
+
+	--line-default: #dfe3f0;
+	--line-field: #cdd3e6;
+	--line-control: #cdd3e6;
+	--line-focus: #6d4aff;
+
+	--edge-rest-side: #dde1f0;
+	--edge-rest-mid: #e8ebf5;
+	--edge-focus-side: #6d4aff;
+	--edge-focus-mid: #8d78ff;
+	--edge-ambient-side: #e3e6f2;
+	--edge-ambient-mid: #edeff8;
+	--edge-faint: #e3e6f2;
+	--edge-raised: #dde1f0;
+
+	--action-primary: #6d4aff;
+	--action-primary-hover: #5b38f0;
+	--action-quiet: color-mix(in oklch, #6d4aff 6%, transparent);
+	--action-quiet-hover: color-mix(in oklch, #6d4aff 12%, transparent);
+	--action-ghost-hover: color-mix(in oklch, #6d4aff 9%, transparent);
+
+	--field-background: #ffffff;
+	--button-secondary-background: color-mix(in oklab, #6d4aff 6%, #ffffff);
+	--button-secondary-background-hover: color-mix(in oklab, #6d4aff 11%, #ffffff);
+	--button-secondary-border: #d6daec;
+	--button-tertiary-background: color-mix(in oklab, #6d4aff 3%, #ffffff);
+	--button-tertiary-background-hover: color-mix(in oklab, #6d4aff 8%, #ffffff);
+	--button-tertiary-border: #e1e4f1;
+	--button-primary-edge: #4f2fd8;
+
+	--user-bubble-background: #ece8ff;
+	--user-bubble-edge: #d9d1ff;
+
+	--elevation-surface: 0 1px 2px rgb(15 23 42 / 0.04), 0 4px 10px -2px rgb(15 23 42 / 0.06), 0 12px 24px -8px rgb(76 56 180 / 0.10);
+	--elevation-soft: 0 1px 2px rgb(15 23 42 / 0.05), 0 4px 14px -4px rgb(76 56 180 / 0.14);
+	--elevation-ring: rgb(15 23 42 / 0.06);
+	--sidebar-background: color-mix(in oklab, #eef0f8 70%, transparent);
+}
+
+.dark {
+	/* Dark (default): the site's dark palette; cards #131a33, hairlines #25305a, accent #9b84ff / #22d3ee */
+	--surface-page: #0b1020;
+	--surface-muted: #131a33;
+	--surface-emphasis: #1b2447;
+	--surface-selected: #1d2650;
+	--surface-raised: #131a33;
+	--surface-lifted: #1b2447;
+	--surface-pressed: color-mix(in oklab, #9b84ff 18%, transparent);
+	--surface-glass: color-mix(in oklab, #131a33 82%, transparent);
+	--surface-code: #0f1733;
+	--surface-overlay: rgb(4 7 18 / 0.66);
+
+	--fg-default: #e2e8f0;
+	--fg-muted: #9aa8c0;
+	--fg-on-action: #ffffff;
+	--fg-code: #d3dcf0;
+	--fg-danger: #f87171;
+	--fg-success: #4ade80;
+	--fg-warning: #fbbf24;
+	--fg-info: #22d3ee;
+
+	--line-default: #25305a;
+	--line-field: #2c3868;
+	--line-control: #2c3868;
+	--line-focus: #9b84ff;
+
+	--edge-rest-side: #25305a;
+	--edge-rest-mid: #1d2650;
+	--edge-focus-side: #9b84ff;
+	--edge-focus-mid: #6d4aff;
+	--edge-ambient-side: #1d2650;
+	--edge-ambient-mid: #161e3d;
+	--edge-faint: #1d2650;
+	--edge-raised: #2c3868;
+
+	--action-primary: #6d4aff;
+	--action-primary-hover: #7c5cff;
+	--action-quiet: color-mix(in oklch, #9b84ff 10%, transparent);
+	--action-quiet-hover: color-mix(in oklch, #9b84ff 18%, transparent);
+	--action-ghost-hover: color-mix(in oklch, #9b84ff 14%, transparent);
+
+	--field-background: #0f1630;
+	--button-secondary-background: color-mix(in oklab, #9b84ff 12%, #131a33);
+	--button-secondary-background-hover: color-mix(in oklab, #9b84ff 20%, #131a33);
+	--button-secondary-border: #2c3868;
+	--button-tertiary-background: color-mix(in oklab, #9b84ff 6%, #131a33);
+	--button-tertiary-background-hover: color-mix(in oklab, #9b84ff 14%, #131a33);
+	--button-tertiary-border: #25305a;
+	--button-primary-edge: #4f2fd8;
+
+	--user-bubble-background: color-mix(in oklab, #6d4aff 26%, #131a33);
+	--user-bubble-edge: #4a3aa8;
+
+	--elevation-surface: 0 1px 2px rgb(0 0 0 / 0.3), 0 6px 14px -4px rgb(0 0 0 / 0.4), 0 16px 32px -10px rgb(0 0 0 / 0.5);
+	--elevation-soft: 0 1px 2px rgb(0 0 0 / 0.3), 0 6px 18px -6px rgb(109 74 255 / 0.28);
+	--elevation-ring: #25305a;
+	--sidebar-background: color-mix(in oklab, #131a33 70%, transparent);
+}
+
+/* a faint indigo glow in the page corner, like the Q Project banner (dark only) */
+.dark body {
+	background-image:
+		radial-gradient(60rem 36rem at 92% -8%, rgb(124 92 255 / 0.16), transparent 70%),
+		radial-gradient(50rem 30rem at -8% 108%, rgb(34 211 238 / 0.07), transparent 70%);
+	background-attachment: fixed;
+}
+
+/* primary buttons: the Q gradient (a token cannot hold a gradient, so it rides on the key's background-image) */
+[data-slot='button'][data-variant='default'],
+[data-slot='button'][data-variant='default']:hover {
+	background-image: var(--q-gradient);
+	color: #fff;
+	border-color: transparent;
+}
+[data-slot='button'][data-variant='default']:hover {
+	filter: brightness(1.12) saturate(1.05);
+}
+
+/* the Q-Volta wordmark and chips (see ChatScreenGreeting, SidebarNavigation); the gradient stops are the
+   AA-safe variants per theme: light text on the page needs the deeper stops */
+.q-wordmark {
+	background: linear-gradient(90deg, #5b38f0, #0e7490);
+	-webkit-background-clip: text;
+	background-clip: text;
+	color: transparent;
+}
+.dark .q-wordmark {
+	background: linear-gradient(90deg, #9b84ff, #22d3ee);
+	-webkit-background-clip: text;
+	background-clip: text;
+}
+.q-chip {
+	display: inline-flex;
+	align-items: center;
+	gap: 0.375rem;
+	border: 1px solid var(--line-default);
+	background: var(--surface-glass);
+	color: var(--fg-muted);
+	border-radius: 999px;
+	padding: 0.125rem 0.625rem;
+	font-size: 0.75rem;
+	line-height: 1.25rem;
+}
+.q-chip > i {
+	width: 0.4rem;
+	height: 0.4rem;
+	border-radius: 999px;
+	background: #22c55e;
+	box-shadow: 0 0 0 3px color-mix(in oklab, #22c55e 25%, transparent);
+}
+
+/* text selection and links follow the accent */
+::selection {
+	background: color-mix(in oklab, #7c5cff 40%, transparent);
+}
+:root {
+	accent-color: #6d4aff;
+	color-scheme: light;
+}
+.dark {
+	color-scheme: dark;
+}
+
+/* a visible keyboard focus ring in the accent */
+:focus-visible {
+	outline-color: #7c5cff;
+}

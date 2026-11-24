@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Drives the real llama.cpp web UI (embedded in qv_server) in headless Chromium. Needs the `playwright` package and a Chromium build:
+"""Drives the real web UI (the Q-Volta-themed llama.cpp web UI embedded in qv_server) in headless Chromium. Needs the `playwright` package and a Chromium build:
 
     python3 -m venv /tmp/pwenv && /tmp/pwenv/bin/pip install playwright && PLAYWRIGHT_BROWSERS_PATH=/tmp/pwbrowsers /tmp/pwenv/bin/playwright install chromium
     PLAYWRIGHT_BROWSERS_PATH=/tmp/pwbrowsers /tmp/pwenv/bin/python tests/webui_browser_check.py http://127.0.0.1:9931/ OUTDIR [--stop] [--tool] [--prompt TEXT] [--wait SECONDS]
@@ -40,6 +40,6 @@ with sync_playwright() as p:
     pg.locator("button[aria-label=\"Expand navigation\"]").first.click(); pg.wait_for_timeout(700)
     pg.get_by_text("Settings", exact=True).first.click(); pg.wait_for_timeout(1000)
     pg.screenshot(path=f"{outdir}/webui_settings.png")
-    res["settings_text"] = pg.inner_text("body")[:3000]
+    res["settings_text"] = pg.inner_text("body")[:12000]
     b.close()
 print(json.dumps(res))

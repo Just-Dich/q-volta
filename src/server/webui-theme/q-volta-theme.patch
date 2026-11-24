@@ -1,0 +1,330 @@
+diff --git a/apps/chat/scripts/brand-favicons.ts b/apps/chat/scripts/brand-favicons.ts
+index 4a15cd1..4684da9 100644
+--- a/apps/chat/scripts/brand-favicons.ts
++++ b/apps/chat/scripts/brand-favicons.ts
+@@ -10,8 +10,8 @@ const require = createRequire(import.meta.url);
+ 
+ /** The web favicons llama-brand draws for the UI, optically centred, keyed by the file they become. */
+ export const BRAND_FAVICONS = {
+-	[FAVICON_PATHS.SVG_DARK]: '@ggml-org/llama-brand/logo/svg/app/web/favicon-dark.svg',
+-	[FAVICON_PATHS.SVG_LIGHT]: '@ggml-org/llama-brand/logo/svg/app/web/favicon.svg'
++	[FAVICON_PATHS.SVG_DARK]: './q-brand/favicon-dark.svg',
++	[FAVICON_PATHS.SVG_LIGHT]: './q-brand/favicon.svg'
+ } as const;
+ 
+ /**
+@@ -22,6 +22,6 @@ export function writeBrandFavicons(outDir: string = DEFAULT_OUT_DIR): void {
+ 	mkdirSync(outDir, { recursive: true });
+ 
+ 	for (const [fileName, specifier] of Object.entries(BRAND_FAVICONS)) {
+-		copyFileSync(require.resolve(specifier), resolve(outDir, fileName));
++		copyFileSync(resolve(HERE, specifier), resolve(outDir, fileName)); // Q-Volta: the Q mark instead of llama-brand's
+ 	}
+ }
+diff --git a/apps/chat/src/app.css b/apps/chat/src/app.css
+index cca4408..fd81b19 100644
+--- a/apps/chat/src/app.css
++++ b/apps/chat/src/app.css
+@@ -14,6 +14,8 @@
+    plugin reads this file too, and it knows no aliases */
+ @import '../../../lib/ui/src/lib/styles/theme.css';
+ @import './lib/styles/safe-area.css';
++/* Q-Volta theme: token overrides on top of the Llama UI theme (see scripts/webui-theme/README) */
++@import './q-theme.css';
+ 
+ :root {
+ 	/* the page runs under the status bar and over the home indicator
+diff --git a/apps/chat/src/lib/components/app/chat/ChatForm/ChatFormActions/ChatFormActionAdd/ChatFormActionAddToolsSubmenu.svelte b/apps/chat/src/lib/components/app/chat/ChatForm/ChatFormActions/ChatFormActionAdd/ChatFormActionAddToolsSubmenu.svelte
+index ce32bdf..8267009 100644
+--- a/apps/chat/src/lib/components/app/chat/ChatForm/ChatFormActions/ChatFormActionAdd/ChatFormActionAddToolsSubmenu.svelte
++++ b/apps/chat/src/lib/components/app/chat/ChatForm/ChatFormActions/ChatFormActionAdd/ChatFormActionAddToolsSubmenu.svelte
+@@ -34,7 +34,7 @@
+ 						<Info class="mt-0.5 {ICON_CLASS_DEFAULT} shrink-0" />
+ 
+ 						<span>
+-							Run llama-server with <code>{CLI_FLAGS.TOOLS}</code> flag to enable
++							Run qv_server with <code>{CLI_FLAGS.TOOLS}</code> flag to enable
+ 
+ 							<strong>Server Tools</strong>.
+ 						</span>
+diff --git a/apps/chat/src/lib/components/app/chat/ChatScreen/ChatScreenGreeting.svelte b/apps/chat/src/lib/components/app/chat/ChatScreen/ChatScreenGreeting.svelte
+index 22bde59..e7cb6cf 100644
+--- a/apps/chat/src/lib/components/app/chat/ChatScreen/ChatScreenGreeting.svelte
++++ b/apps/chat/src/lib/components/app/chat/ChatScreen/ChatScreenGreeting.svelte
+@@ -1,6 +1,7 @@
+ <script lang="ts">
+ 	import { CHAT_FORM_RESIZE_MS, CHAT_GREETING_ENTER_DELAY_MS } from '#lib/constants/index.ts';
+ 	import { serverStore } from '#lib/stores/index.ts';
++	import { Logo } from '@ggml-org/llama-ui/app/misc';
+ 
+ 	interface Props {
+ 		/** Transparent but still in place, e.g. behind the expanded chat form. */
+@@ -60,7 +61,30 @@
+ 	]}
+ >
+ 	<div style:transition-delay="{CHAT_GREETING_ENTER_DELAY_MS}ms" class={enterClass}>
+-		<h1 class="mb-2 text-2xl font-semibold tracking-tight md:text-3xl">Hello there</h1>
++		<div class="mb-3 flex items-center justify-center gap-3">
++			<Logo style="--size: 2.5rem" />
++
++			<h1 class="q-wordmark text-3xl font-extrabold tracking-tight md:text-4xl">Q-Volta</h1>
++		</div>
++
++		<!-- what /props tells: the model, its context window and the modalities it takes -->
++		{#if serverStore.props}
++			<div class="mb-4 flex flex-wrap items-center justify-center gap-2">
++				<span class="q-chip"><i></i>{serverStore.props.model_alias || 'model ready'}</span>
++
++				{#if serverStore.contextSize}
++					<span class="q-chip">{Math.round(serverStore.contextSize / 1024)}K context</span>
++				{/if}
++
++				{#if serverStore.props.modalities?.vision}
++					<span class="q-chip">vision</span>
++				{/if}
++
++				{#if serverStore.props.modalities?.audio}
++					<span class="q-chip">audio</span>
++				{/if}
++			</div>
++		{/if}
+ 
+ 		<p class="text-muted-foreground md:text-lg">
+ 			{serverStore.props?.modalities?.audio ? 'Record audio, type a message ' : 'Type a message'} or upload
+diff --git a/apps/chat/src/lib/components/app/mcp/McpServerForm.svelte b/apps/chat/src/lib/components/app/mcp/McpServerForm.svelte
+index c0dd254..75e0ebe 100644
+--- a/apps/chat/src/lib/components/app/mcp/McpServerForm.svelte
++++ b/apps/chat/src/lib/components/app/mcp/McpServerForm.svelte
+@@ -241,13 +241,13 @@
+ 			/>
+ 
+ 			<span>
+-				<span class="text-xs text-muted-foreground">Use llama-server proxy</span>
++				<span class="text-xs text-muted-foreground">Use server proxy</span>
+ 
+ 				<br />
+ 
+ 				{#if !mcpStore.isProxyAvailable}
+ 					<span class="inline-flex gap-0.75 text-xs text-muted-foreground/60"
+-						>(Run <pre>llama-server</pre>
++						>(Run <pre>qv_server</pre>
+ 						with
+ 						<pre>{CLI_FLAGS.MCP_PROXY}</pre>
+ 						flag)</span
+diff --git a/apps/chat/src/lib/components/app/navigation/SidebarNavigation/SidebarNavigation.svelte b/apps/chat/src/lib/components/app/navigation/SidebarNavigation/SidebarNavigation.svelte
+index 52c9903..a67b630 100644
+--- a/apps/chat/src/lib/components/app/navigation/SidebarNavigation/SidebarNavigation.svelte
++++ b/apps/chat/src/lib/components/app/navigation/SidebarNavigation/SidebarNavigation.svelte
+@@ -640,6 +640,10 @@
+ 					/>
+ 				</div>
+ 
++				{#if uiStore.isSidebarExpanded}
++					<span class="q-wordmark mr-auto ml-2.5 text-base font-extrabold tracking-tight">Q-Volta</span>
++				{/if}
++
+ 				<!-- a phone reaches search from a round key across from the logo, in place of the
+ 				     Search row among the sidebar's actions -->
+ 				{#if isOnMobile}
+diff --git a/apps/chat/src/lib/components/app/servers/ServerErrorSplash.svelte b/apps/chat/src/lib/components/app/servers/ServerErrorSplash.svelte
+index fab3edb..2e37c96 100644
+--- a/apps/chat/src/lib/components/app/servers/ServerErrorSplash.svelte
++++ b/apps/chat/src/lib/components/app/servers/ServerErrorSplash.svelte
+@@ -264,16 +264,16 @@
+ 
+ 					<div class="mt-2 space-y-3 text-xs text-muted-foreground">
+ 						<div class="space-y-2">
+-							<p class="mb-4 font-medium">Start the llama-server:</p>
++							<p class="mb-4 font-medium">Start the Q-Volta server:</p>
+ 
+ 							<div class="rounded bg-muted/50 px-2 py-1 font-mono text-xs">
+-								<p>llama-server -hf ggml-org/gemma-3-4b-it-GGUF</p>
++								<p>qv_server -m /path/to/model --port 8080</p>
+ 							</div>
+ 
+ 							<p>or</p>
+ 
+ 							<div class="rounded bg-muted/50 px-2 py-1 font-mono text-xs">
+-								<p class="mt-1">llama-server -m locally-stored-model.gguf</p>
++								<p class="mt-1">qv_server --help</p>
+ 							</div>
+ 						</div>
+ 
+diff --git a/apps/chat/src/lib/components/app/settings/SettingsChat/SettingsChat.svelte b/apps/chat/src/lib/components/app/settings/SettingsChat/SettingsChat.svelte
+index 38452cb..95f47cc 100644
+--- a/apps/chat/src/lib/components/app/settings/SettingsChat/SettingsChat.svelte
++++ b/apps/chat/src/lib/components/app/settings/SettingsChat/SettingsChat.svelte
+@@ -7,6 +7,7 @@
+ 		SettingsChatImportExportTab,
+ 		SettingsChatMobileHeader,
+ 		SettingsChatToolsTab,
++		QAbout,
+ 		SettingsFooter,
+ 		SettingsResetButton
+ 	} from '#lib/components/app/settings/index.ts';
+@@ -209,7 +210,9 @@
+ 				</div>
+ 
+ 				<div class="mt-8 border-t border-border/30 pt-6 pb-6">
+-					<p class="text-xs text-muted-foreground">Settings are saved in browser's localStorage</p>
++					<p class="mb-3 text-xs text-muted-foreground">Settings are saved in browser's localStorage</p>
++
++					<QAbout />
+ 				</div>
+ 			</div>
+ 
+diff --git a/apps/chat/src/lib/components/app/settings/index.ts b/apps/chat/src/lib/components/app/settings/index.ts
+index 2d2aca5..b9447d8 100644
+--- a/apps/chat/src/lib/components/app/settings/index.ts
++++ b/apps/chat/src/lib/components/app/settings/index.ts
+@@ -5,6 +5,9 @@
+  */
+ export { default as SettingsChat } from './SettingsChat/SettingsChat.svelte';
+ 
++/** Q-Volta credit: "Based on the llama.cpp web UI (MIT)" with a link to the bundled licence text. */
++export { default as QAbout } from './QAbout.svelte';
++
+ /**
+  * Desktop sidebar navigation for chat settings.
+  * Displays a list of settings sections with icons and titles.
+diff --git a/apps/chat/src/lib/constants/app.constants.ts b/apps/chat/src/lib/constants/app.constants.ts
+index c598f48..423f345 100644
+--- a/apps/chat/src/lib/constants/app.constants.ts
++++ b/apps/chat/src/lib/constants/app.constants.ts
+@@ -1 +1 @@
+-export const APP_NAME = import.meta.env?.VITE_PUBLIC_APP_NAME || 'llama-ui';
++export const APP_NAME = import.meta.env?.VITE_PUBLIC_APP_NAME || 'Q-Volta';
+diff --git a/apps/chat/src/lib/constants/pwa.constants.ts b/apps/chat/src/lib/constants/pwa.constants.ts
+index 734356f..a8b2cad 100644
+--- a/apps/chat/src/lib/constants/pwa.constants.ts
++++ b/apps/chat/src/lib/constants/pwa.constants.ts
+@@ -15,10 +15,10 @@ export const MEDIA_QUERIES = {
+ export const THEME_COLORS = {
+ 	ACCENT_BLUE: '#2563eb',
+ 	ACCENT_BLUE_HOVER: '#1d4ed8',
+-	BACKGROUND_DARK: '#111111',
+-	BACKGROUND_LIGHT: 'white',
+-	DARK: '#0d0d0d',
+-	LIGHT: '#ffffff',
++	BACKGROUND_DARK: '#0b1020',
++	BACKGROUND_LIGHT: '#f7f8fc',
++	DARK: '#0b1020',
++	LIGHT: '#f7f8fc',
+ 	TITLE_UPDATE_ALERT: {
+ 		BG_DARK: 'zinc-800',
+ 		BG_LIGHT: 'white',
+@@ -46,8 +46,8 @@ export const APPLE_ASSETS = {
+ } as const;
+ 
+ export const PWA_MANIFEST = {
+-	background_color: THEME_COLORS.BACKGROUND_LIGHT,
+-	description: 'Local AI chat interface powered by llama.cpp',
++	background_color: THEME_COLORS.BACKGROUND_DARK,
++	description: 'Q-Volta: local AI chat (based on the llama.cpp web UI)',
+ 	display: 'standalone' as const,
+ 	icons: [
+ 		{ sizes: '64x64', src: 'pwa-64x64.png', type: 'image/png' },
+@@ -65,7 +65,7 @@ export const PWA_MANIFEST = {
+ 	scope: './',
+ 	short_name: APP_NAME,
+ 	start_url: './',
+-	theme_color: THEME_COLORS.BACKGROUND_LIGHT
++	theme_color: THEME_COLORS.BACKGROUND_DARK
+ };
+ 
+ export const PWA_ICON_PATHS = {
+diff --git a/apps/chat/src/lib/constants/settings.constants.ts b/apps/chat/src/lib/constants/settings.constants.ts
+index 4f1f772..447d583 100644
+--- a/apps/chat/src/lib/constants/settings.constants.ts
++++ b/apps/chat/src/lib/constants/settings.constants.ts
+@@ -64,7 +64,7 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
+ 		icon: SlidersVertical,
+ 		settings: [
+ 			{
+-				defaultValue: ColorMode.SYSTEM,
++				defaultValue: ColorMode.DARK,
+ 				help: 'Choose the color theme for the interface. You can choose between System (follows your device settings), Light, or Dark.',
+ 				key: SETTINGS_KEYS.THEME,
+ 				label: 'Theme',
+diff --git a/apps/chat/src/lib/types/api.d.ts b/apps/chat/src/lib/types/api.d.ts
+index abdd1b3..a97a968 100644
+--- a/apps/chat/src/lib/types/api.d.ts
++++ b/apps/chat/src/lib/types/api.d.ts
+@@ -287,6 +287,8 @@ export interface ApiLlamaCppServerProps {
+ 	};
+ 	total_slots: number;
+ 	model_path: string;
++	/** llama-server's --alias (also sent by qv_server); shown in the Q-Volta greeting. */
++	model_alias?: string;
+ 	role: ServerRole;
+ 	modalities: {
+ 		vision: boolean;
+diff --git a/apps/chat/src/routes/+layout.svelte b/apps/chat/src/routes/+layout.svelte
+index af29c1f..4373b63 100644
+--- a/apps/chat/src/routes/+layout.svelte
++++ b/apps/chat/src/routes/+layout.svelte
+@@ -443,7 +443,7 @@
+ 		{/if}
+ 	</div>
+ 
+-	<ModeWatcher />
++	<ModeWatcher defaultMode="dark" />
+ 
+ 	<Toaster closeButton richColors />
+ 
+diff --git a/apps/chat/src/routes/search/+page.svelte b/apps/chat/src/routes/search/+page.svelte
+index eafe233..4994a80 100644
+--- a/apps/chat/src/routes/search/+page.svelte
++++ b/apps/chat/src/routes/search/+page.svelte
+@@ -88,7 +88,7 @@
+ </script>
+ 
+ <svelte:head>
+-	<title>Search · llama.cpp</title>
++	<title>Search · Q-Volta</title>
+ </svelte:head>
+ 
+ <div class="fixed top-0 z-10 left-0 right-0 p-2">
+diff --git a/lib/ui/src/lib/components/app/misc/Logo.svelte b/lib/ui/src/lib/components/app/misc/Logo.svelte
+index 0193fa5..795c9da 100644
+--- a/lib/ui/src/lib/components/app/misc/Logo.svelte
++++ b/lib/ui/src/lib/components/app/misc/Logo.svelte
+@@ -1,14 +1,19 @@
+ <script>
+-	import icon from '@ggml-org/llama-brand/logo/svg/icon/icon-light.svg?raw';
+-
+-	// llama-brand draws the icon in its ink; currentColor lets it follow the text colour.
+-	const logoMark = icon.replace(/fill="#[0-9a-f]{3,8}"/gi, 'fill="currentColor"');
+-
++	// The Q-Project mark (Q_Logo.svg), inlined so it needs no request. Replaces the llama mark of the upstream web UI.
+ 	let { class: className = '', style = '' } = $props();
+ </script>
+ 
+ <div class={className} {style}>
+-	{@html logoMark}
++	<svg xmlns="http://www.w3.org/2000/svg" viewBox="590 235 2920 3430" fill="none" aria-hidden="true">
++		<defs>
++			<linearGradient id="qvg-s" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#5277DF" /><stop offset=".55" stop-color="#438DE9" /><stop offset="1" stop-color="#35B7E4" /></linearGradient>
++			<linearGradient id="qvg-l" x1="690" y1="1160" x2="990" y2="3010" gradientUnits="userSpaceOnUse"><stop stop-color="#39AFE0" /><stop offset="1" stop-color="#376BD1" /></linearGradient>
++		</defs>
++<path fill="#385FCA" d="M3431.55,2739.45l-383.58-233.89c-37.25-22.71-59.97-63.18-59.97-106.81v-971.89c0-53.3-27.86-102.73-73.47-130.33l-797.31-482.45c-43.85-26.53-98.74-26.79-142.84-.67l-775.81,459.56c-58.57,34.7-94.35,97.85-94,165.93l4.9,956.05c.33,64.63,41.23,118.59,96.53,152.04l1318.07,807.43c19.97,12.08,19.97,41.06,0,53.14l-308.56,186.57c-100.39,60.7-226.29,60.15-326.14-1.43l-1189.9-733.77c-54.39-33.54-87.6-92.8-87.82-156.71l-5.19-1525.39c-.29-84.18,50.76-162.44,107.54-213.84L1878,285c105.27-63.87,237.07-64.92,343.34-2.74l1135.81,659.36c79.76,46.66,128.65,132.25,128.33,224.66l-5.29,1545.97c-.09,24.92-27.37,40.18-48.65,27.21Z"/>
++  <path fill="url(#qvg-l)" d="M671.21,1125.4l401.39,237.67c8.3,4.92,7.44,10.29,7.4,19.94l-5.77,1627.78c-.08,21.28-17.5,37.81-35.59,26.61l-336.64-208.4c-42.3-29.32-67.53-77.52-67.53-128.99l-4.34-1551.12c-.06-21.11,22.91-34.25,41.07-23.49Z"/>
++  <path fill="url(#qvg-s)" d="M3426,1077l-396.75,260.25c-38.25,27-2.25-4.5-77.25-50.25l-870.43-516.87c-18.3-10.85-30.39-47.72-11.57-57.63l313.5-277.5c46.72-21.58,188.14,74.4,232.5,100.5l766.5,444c56.25,47.25,54,85.5,43.5,97.5Z"/>
++  <path fill="url(#qvg-s)" d="M2336 2907Q2292 2878 2328 2851L2708 2569Q2744 2542 2788 2571L3252 2872Q3296 2901 3260 2928L2880 3210Q2844 3237 2800 3208Z"/>
++	</svg>
+ </div>
+ 
+ <style>
+diff --git a/lib/ui/src/lib/styles/theme.css b/lib/ui/src/lib/styles/theme.css
+index 6b25383..e8f7bca 100644
+--- a/lib/ui/src/lib/styles/theme.css
++++ b/lib/ui/src/lib/styles/theme.css
+@@ -13,7 +13,7 @@
+  * Dark mode is the `dark` class on <html>; the Matte light surfaces are the `theme-matte` class.
+  */
+ 
+-@import './fonts.css';
++/* Q-Volta: no bundled Llama fonts, the system font stack is used (see apps/chat/src/q-theme.css) */
+ @import './tokens.css';
+ @import './surfaces.css';
+ 

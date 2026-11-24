@@ -131,9 +131,23 @@ Reading: at about equal bytes Q-Volta decodes and prefills faster and fits a lon
 - **Converter** `tools/convert.py` (streams BF16 -> Q-Volta, optional PEFT LoRA merge, so the pi adapter works as a merged model; runtime LoRA is planned).
 - **CUDA backend**: int8-activation dp4a GEMV decode at 81-99% of HBM peak with CUDA graphs; batched prefill (dequant slab + cuBLAS HGEMM, in-kernel GDN recurrence); split-K decode attention; exact multi-token verify for MTP.
 - **CPU backend**: AVX2 int8 kernels, pinned spin-barrier thread pool, huge-page weights, batched prefill, exact MTP.
-- **llama-server compatible server** `qv_server` (llama flags and `LLAMA_ARG_*` env, `/completion`, `/infill`, OpenAI chat/completions, `/slots`, `/metrics`, `/props`, `/tokenize`; structural diff-tested against llama-server): see [docs/SERVER.md](docs/SERVER.md) and [docs/SERVER_COMPAT.md](docs/SERVER_COMPAT.md). Tool calling, JSON mode and GBNF grammars via src/jinja + src/grammar; the llama.cpp web UI is embedded (`GET /`, screenshots in docs/img/webui_*.png), plus Anthropic `/v1/messages` and `/v1/responses`; image input for Inkling-2-Mini (`image_url`, see docs/INKLING_VISION.md); no embeddings; `--parallel N` = N concurrent engine sequences (interleaved decode, per-slot prompt cache, `--ctx-size` split per slot). The CPU path is tested; the CUDA server path compiles but was not run in the server tests.
+- **llama-server compatible server** `qv_server` (llama flags and `LLAMA_ARG_*` env, `/completion`, `/infill`, OpenAI chat/completions, `/slots`, `/metrics`, `/props`, `/tokenize`; structural diff-tested against llama-server): see [docs/SERVER.md](docs/SERVER.md) and [docs/SERVER_COMPAT.md](docs/SERVER_COMPAT.md). Tool calling, JSON mode and GBNF grammars via src/jinja + src/grammar; a Q-Volta-themed build of the llama.cpp web UI is embedded (`GET /`, see "Web UI" below, screenshots in docs/img/webui_*.png), plus Anthropic `/v1/messages` and `/v1/responses`; image input for Inkling-2-Mini (`image_url`, see docs/INKLING_VISION.md); no embeddings; `--parallel N` = N concurrent engine sequences (interleaved decode, per-slot prompt cache, `--ctx-size` split per slot). The CPU path is covered by the automated tests; the CUDA server path was run by hand on the V100 with real models (single requests, image input, 4 concurrent chats), not in the automated suite.
 - Tokenizer matches the `tokenizers` library on 509/509 test strings (498/509 vs transformers `AutoTokenizer`; combining-mark cases differ, documented). Chat template matches 31/31 conversations.
 - Tests: 12/12 ctest on the GPU build; full-model golden test passes (KL 6.5e-4 vs the simulated-quantization reference).
+
+## Web UI
+
+`qv_server` serves a built-in chat UI at `GET /`: the llama.cpp web UI (MIT) rebuilt from source with a small Q-Volta theme patch (Q Project palette, Q logo and favicon, `Q-Volta` wordmark, dark by default plus a light theme, system fonts only, no network assets). Every upstream function is kept (streaming, reasoning blocks, tool calls, stop, settings, API-key screen). The theme is a reviewable patch set in `src/server/webui-theme/`, see [docs/SERVER.md](docs/SERVER.md#web-ui).
+
+| Home (dark, default) | Chat: reasoning, list, code block |
+|---|---|
+| ![home](docs/img/webui_home.png) | ![chat](docs/img/webui_reasoning.png) |
+
+| Light theme | Settings | Mobile (390 px) |
+|---|---|---|
+| ![light](docs/img/webui_light_chat.png) | ![settings](docs/img/webui_settings.png) | ![mobile](docs/img/webui_mobile_chat.png) |
+
+More: `webui_streaming.png`, `webui_code.png`, `webui_sidebar.png`, `webui_light_home.png`, `webui_mobile_home.png`, `webui_tool.png` (browser tool permission), `webui_apikey.png` in `docs/img/`.
 
 ## Roadmap
 Done recently: 256K context with int4 KV, exact MTP in the server, single-file `.qv` with tokenizer, web UI, Inkling vision and MTP, act-order GPTQ recipe e1b1 (measured, not yet published). Next: quantization quality at equal size (the gap to llama.cpp), concurrent requests in the server (multi-sequence decoding, in development), runtime LoRA inside the model file, faster Inkling MTP verification, CPU prefill (fp32 scale overhead), ARM/NEON.
