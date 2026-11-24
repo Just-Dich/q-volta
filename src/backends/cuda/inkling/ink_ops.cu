@@ -98,14 +98,14 @@ __device__ __forceinline__ void sm8_decode(unsigned v, float rsc, float zlo, flo
     mn = -(sc * z);
 }
 
-// reduce N values over the block of NT threads (all threads get the sums). sm >= NW*N floats.
+// reduce N (<= 32) values over the block of NT threads (all threads get the sums). sm >= NW*N + N floats, written once per call: successive calls in
+// one kernel must use disjoint regions (no barrier protects reuse). Per value: warp xor tree, then the NW warp partials added in warp order 0..23
+// by thread i; two barriers (no entry barrier: fresh smem).
 template <int N>
 __device__ __forceinline__ void bred(float (&v)[N], float* sm) {
-    // sm >= NW*N + N floats
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
 #pragma unroll
     for (int i = 0; i < N; ++i) v[i] = warp_sum(v[i]);
-    __syncthreads();
     if (lane == 0) {
 #pragma unroll
         for (int i = 0; i < N; ++i) sm[w * N + i] = v[i];
@@ -194,7 +194,7 @@ void softcap_inplace(float* x, int n, float cap, cudaStream_t s) { k_softcap<<<(
 // attention residual
 template <int QM>
 __global__ void __launch_bounds__(NT) k_ar(ArArgs a) {
-    __shared__ float sm[NW * 25 + 32];
+    __shared__ float sm[NW * 30 + 128];
     const int t = threadIdx.x;
     const float* queries = a.queries + (long)blockIdx.x * a.qbs;
     const long tok = a.rowy ? (long)blockIdx.y : a.allpar ? (long)blockIdx.x : (long)a.tok0, NTK = a.ntok;
@@ -357,7 +357,7 @@ __global__ void __launch_bounds__(NT) k_ar(ArArgs a) {
         float ssq[QM];
 #pragma unroll
         for (int q = 0; q < QM; ++q) ssq[q] = out[q][0] * out[q][0] + out[q][1] * out[q][1] + out[q][2] * out[q][2];
-        bred<QM>(ssq, sm);
+        bred<QM>(ssq, sm + NW * 30);
 #pragma unroll
         for (int q = 0; q < QM; ++q) {
             const float f = rsqrtf(ssq[q] / H + 1e-6f);
@@ -372,7 +372,7 @@ __global__ void __launch_bounds__(NT) k_ar(ArArgs a) {
         float ssq[QM];
 #pragma unroll
         for (int q = 0; q < QM; ++q) ssq[q] = out[q][0] * out[q][0] + out[q][1] * out[q][1] + out[q][2] * out[q][2];
-        bred<QM>(ssq, sm);
+        bred<QM>(ssq, sm + NW * 30);
         const int warp = t >> 5;
 #pragma unroll
         for (int q = 0; q < QM; ++q) {
