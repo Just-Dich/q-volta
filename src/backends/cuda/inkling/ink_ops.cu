@@ -9,6 +9,9 @@
 namespace qv::cuda::ink {
 
 namespace {
+#ifndef MG_WPB
+#define MG_WPB 1
+#endif
 #define QV_STR_(x) #x
 #define UNROLL_N(n) _Pragma(QV_STR_(unroll n))
 #ifndef MB_MG
@@ -515,7 +518,7 @@ __global__ void __launch_bounds__(128, MB_MG) k_mgemv(GDs D) {
     }
     const GD& g = D.d[di];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int row0 = (b * 4 + warp) * R;
+    const int row0 = (b * MG_WPB + warp) * R;
     if (row0 >= g.N) return;
     float acc[R];
 #pragma unroll
@@ -564,18 +567,18 @@ UNROLL_N(UNF)
     }
 }
 void mgemv(GDs& g, int bits, cudaStream_t s) {
-    constexpr int R = 2;
+    constexpr int R = 1;
     int tot = 0;
     for (int i = 0; i < g.n; ++i) {
-        g.d[i].nblk = (g.d[i].N + 4 * R - 1) / (4 * R);
+        g.d[i].nblk = (g.d[i].N + MG_WPB * R - 1) / (MG_WPB * R);
         tot += g.d[i].nblk;
     }
     switch (bits) {
-        case 3: k_mgemv<3, R><<<tot, 128, 0, s>>>(g); break;
-        case 4: k_mgemv<4, R><<<tot, 128, 0, s>>>(g); break;
-        case 5: k_mgemv<5, R><<<tot, 128, 0, s>>>(g); break;
-        case 6: k_mgemv<6, R><<<tot, 128, 0, s>>>(g); break;
-        case 8: k_mgemv<8, R><<<tot, 128, 0, s>>>(g); break;
+        case 3: k_mgemv<3, R><<<tot, MG_WPB * 32, 0, s>>>(g); break;
+        case 4: k_mgemv<4, R><<<tot, MG_WPB * 32, 0, s>>>(g); break;
+        case 5: k_mgemv<5, R><<<tot, MG_WPB * 32, 0, s>>>(g); break;
+        case 6: k_mgemv<6, R><<<tot, MG_WPB * 32, 0, s>>>(g); break;
+        case 8: k_mgemv<8, R><<<tot, MG_WPB * 32, 0, s>>>(g); break;
         default: std::fprintf(stderr, "mgemv: unsupported bits %d\n", bits); std::abort();
     }
 }
@@ -999,7 +1002,7 @@ UNROLL_N(UNW)
     }
 }
 void moe_w2(const ExpertW& W, const Q8Vec& act, const int* ids, const float* wts, float* y, cudaStream_t s) {
-    constexpr int R = 4;
+    constexpr int R = 2;
     const int grid = W.N / R;
     switch (W.bits) {
         case 3: k_w2<3, R><<<grid, 256, 0, s>>>(W, act, ids, wts, y); return;
