@@ -178,7 +178,22 @@ __global__ void __launch_bounds__(NT) k_ar(ArArgs a) {
             for (int j = 0; j < 3; ++j) v[b][j] = (b < a.B) ? a.blocks[((long)b * NTK + tok) * H + t + NT * j] : 0.f;
 #pragma unroll
         for (int j = 0; j < 3; ++j) {
-            const float hv = a.h[tok * H + t + NT * j];
+            float hv;
+            if (a.fin_y) {  // fused k_finish (one token): identical expressions
+                const int c = t + NT * j;
+                const float x = a.fin_y[c];
+                const float s0 = a.fin_cst[c], s1 = a.fin_cst[H + c], s2 = a.fin_cst[2 * H + c];
+                const float4 w = *reinterpret_cast<const float4*>(a.fin_cw + 4 * c);
+                const float yy = w.x * s0 + w.y * s1 + w.z * s2 + w.w * x;
+                a.fin_cst[c] = s1;
+                a.fin_cst[H + c] = s2;
+                a.fin_cst[2 * H + c] = x;
+                hv = a.fin_res[c] + (yy + x) * 0.44721359549995794f;
+                a.fin_h_out[c] = hv;
+                if (a.fin_copy) a.fin_copy[c] = hv;
+            } else {
+                hv = a.h[tok * H + t + NT * j];
+            }
             for (int b = 0; b < 5; ++b)
                 if (b == a.B) v[b][j] = hv;
         }

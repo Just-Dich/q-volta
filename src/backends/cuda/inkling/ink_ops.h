@@ -60,6 +60,14 @@ struct ArArgs {
     const float* nw[4] = {nullptr, nullptr, nullptr, nullptr};
     float* xn_out = nullptr;
     Q8Buf q8;                   // stream q at q + q*H/4, d/sum/qsum + q*HC
+    // fused k_finish (mode 0, one row, one block only): h = fin_res + (sconv(fin_y) + fin_y) / sqrt(5) is computed in place of reading h,
+    // written to fin_h_out (and to fin_copy when non-null) and the MLP conv state fin_cst is advanced. Same arithmetic as k_finish.
+    const float* fin_res = nullptr;
+    const float* fin_y = nullptr;
+    const float* fin_cw = nullptr;
+    float* fin_cst = nullptr;
+    float* fin_h_out = nullptr;
+    float* fin_copy = nullptr;
 };
 void attn_res(const ArArgs& a, int nblocks, cudaStream_t s, int rows = 1);
 

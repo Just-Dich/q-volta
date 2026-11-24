@@ -813,8 +813,28 @@ class InklingEngine final : public Engine {
         return g;
     }
 
+    // F1 (p26): the MLP conv + residual (k_finish) of an application is folded into the next attention-input attn_res when that kernel reads the
+    // finish output as its h (one block, one token). pend_ holds the deferred finish; flush_fin() launches it as a separate kernel.
+    struct PendFin { bool on = false; const float* res; const float* y; const float* cw; float* cst; float* hout; } pend_;
+    bool fuse_fin_ = std::getenv("QV_INK_NOFUSE_FIN") == nullptr;
+    void flush_fin() {
+        if (!pend_.on) return;
+        ik::finish(pend_.res, pend_.y, pend_.cw, pend_.cst, pend_.hout, stream_);
+        pend_.on = false;
+    }
+    // use the pending finish as the h of `a` (a.h must be its output) or launch it now
+    void attach_fin(ik::ArArgs& a) {
+        if (pend_.on && a.h == pend_.hout) {
+            a.fin_res = pend_.res; a.fin_y = pend_.y; a.fin_cw = pend_.cw; a.fin_cst = pend_.cst; a.fin_h_out = pend_.hout;
+            pend_.on = false;
+        } else {
+            flush_fin();
+        }
+    }
+
     void forward() {
         cudaStream_t s = stream_;
+        pend_.on = false;
         ik::embed_norm(embed_, d_tok_, embed_norm_, h_, blocks_, s);
         if (ovr_on_) {
             QV_CUDA_CHECK(cudaMemcpyAsync(h_, d_ovr_, ik::H * 4, cudaMemcpyDeviceToDevice, s));
@@ -823,10 +843,12 @@ class InklingEngine final : public Engine {
         if (dump_d_) QV_CUDA_CHECK(cudaMemcpyAsync(dump_d_, h_, ik::H * 4, cudaMemcpyDeviceToDevice, s));
         for (const App& A : apps_) {
             run_app(A);
+            if (mtp_ && (A.idx == 4 || A.idx == 22 || A.idx == 40)) flush_fin();
             if (mtp_ && (A.idx == 4 || A.idx == 22 || A.idx == 40))
                 QV_CUDA_CHECK(cudaMemcpyAsync(featv_ + (size_t)(A.idx == 4 ? 0 : A.idx == 22 ? 1 : 2) * ik::H, h_, ik::H * 4, cudaMemcpyDeviceToDevice, s));
             if (A.L == cfg_.ink.loop_end - 1 && A.p < cfg_.ink.loop_passes - 1) {  // messages for the next pass
                 ik::ArArgs m;
+                flush_fin();
                 m.mode = 0; m.B = 1; m.Q = 4; m.mix = 1; m.epi = 0;
                 m.h = h_; m.blocks = blocks_ + 2 * ik::H;  // the state that entered layer 12 in this pass
                 m.queries = msgq_; m.qbs = 4 * ik::H; m.raw_out = msgs_; m.rbs = 4 * ik::H;
@@ -836,6 +858,7 @@ class InklingEngine final : public Engine {
         ik::ArArgs f;
         f.mode = 0; f.B = 4; f.Q = 1; f.mix = 1; f.epi = 1;
         f.h = h_; f.blocks = blocks_; f.queries = out_query_; f.nw[0] = final_norm_; f.xn_out = xn_f_; f.q8 = q8x_;
+        attach_fin(f);
         ik::attn_res(f, 1, s);
         if (dump_d_) QV_CUDA_CHECK(cudaMemcpyAsync(dump_d_ + 49 * ik::H, xn_f_, ik::H * 4, cudaMemcpyDeviceToDevice, s));
         if (mtp_) QV_CUDA_CHECK(cudaMemcpyAsync(featv_ + (size_t)3 * ik::H, xn_f_, ik::H * 4, cudaMemcpyDeviceToDevice, s));
@@ -859,11 +882,13 @@ class InklingEngine final : public Engine {
             a.h = hin; a.blocks = blocks_; a.queries = W.attn_q;
             for (int q = 0; q < Qa; ++q) a.nw[q] = W.nw[q];
             a.xn_out = xn_f_; a.q8 = q8x_;
+            attach_fin(a);
             ik::attn_res(a, 1, s);
         } else {
             ik::ArArgs a;
             a.mode = 0; a.B = Battn; a.Q = Qa; a.mix = 1; a.epi = 0;
             a.h = hin; a.blocks = blocks_; a.queries = W.attn_q; a.raw_out = u_;
+            attach_fin(a);
             ik::attn_res(a, 1, s);
             ik::GateArgs g;
             g.S = 3; g.g = gg_;
@@ -967,7 +992,11 @@ class InklingEngine final : public Engine {
         STAGE("w2");
         // ---- 9. MLP conv + residual
         float* hout = (L == K.loop_start - 1) ? pre_h_ : h_;
-        ik::finish(res_, ymoe_, W.mlp_sconv, cst_m_ + (size_t)A.idx * 3 * H, hout, s);
+        if (fuse_fin_ && !dump_d_ && g_dbgapp < 0) {
+            pend_.on = true; pend_.res = res_; pend_.y = ymoe_; pend_.cw = W.mlp_sconv; pend_.cst = cst_m_ + (size_t)A.idx * 3 * H; pend_.hout = hout;
+        } else {
+            ik::finish(res_, ymoe_, W.mlp_sconv, cst_m_ + (size_t)A.idx * 3 * H, hout, s);
+        }
         if (g_dbgapp == A.idx) dbg_write((std::string("/tmp/ink/dbg_step") + std::to_string(dbg_n_++) + ".bin").c_str(), araw_, res_, xm_f_, ymoe_, ids_, wts_, 0);
         if (dump_d_) {
             QV_CUDA_CHECK(cudaMemcpyAsync(dump_d_ + (size_t)(A.idx + 1) * H, hout, H * 4, cudaMemcpyDeviceToDevice, s));
