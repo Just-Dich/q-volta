@@ -190,7 +190,7 @@ class App {
 
     void init_slots();
     void set_sequences(bool multi);  // call with mu_ held (or from init_slots)
-    int shared_chunk = 512;  // prefill chunk (tokens) used while other slots are running, so their decode steps are not stalled by one huge chunk
+    int shared_chunk = 1024;  // prefill chunk (tokens) used while other slots are running, so their decode steps are not stalled by one huge chunk
     std::mutex venc_mu_;
     int slot_ctx = 4096;  // context of each slot / sequence (== n_ctx reported to clients): --ctx-size / n_slots when the engine holds one sequence per slot
     bool multi_seq = false;  // engine holds n_slots sequences and runs requests concurrently; false: one sequence, requests run one at a time
@@ -233,6 +233,7 @@ class App {
     std::deque<Waiter> waiters_;
     std::vector<char> slot_busy_;
     std::atomic<int> n_busy_{0};
+    std::atomic<int> n_decoding_{0};  // running slots that are past their prompt (decoding)
     int n_users_ = 0, conc_limit_ = 1;
     bool excl_held_ = false;
     std::vector<long long> slot_used_;  // last use (monotonic counter) per slot, for LRU

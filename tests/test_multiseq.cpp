@@ -79,14 +79,14 @@ static void turn(qv::Engine& e, Seq& s, int chunk, int steps, int V) {
 int main(int argc, char** argv) {
     std::string model, kv = "fp32";
     int ctx = 4096, steps = 48, chunk = 512, nseq = 4;
-    bool cpu = false;
+    bool cpu = false, fresh = false;
     double lenscale = 1.0;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto nx = [&] { return std::string(argv[++i]); };
         if (a == "--model") model = nx(); else if (a == "--kv") kv = nx(); else if (a == "--ctx") ctx = std::stoi(nx());
         else if (a == "--steps") steps = std::stoi(nx()); else if (a == "--chunk") chunk = std::stoi(nx()); else if (a == "--seqs") nseq = std::stoi(nx());
-        else if (a == "--cpu") cpu = true; else if (a == "--lenscale") lenscale = std::stod(nx());
+        else if (a == "--cpu") cpu = true; else if (a == "--fresh") fresh = true; else if (a == "--lenscale") lenscale = std::stod(nx());
     }
     qv::ModelFile mf = qv::ModelFile::open(model);
     const int V = mf.cfg.vocab;
@@ -106,6 +106,7 @@ int main(int argc, char** argv) {
             opt.n_seq = 1;
             auto e = make(mf, opt, cpu);
             for (int p = 0; p < 5; ++p) {
+                if (fresh && p) e = make(mf, opt, cpu);   // a brand-new engine per prompt (no leftovers of earlier prompts)
                 Seq s; s.prompt = prompts[p]; s.sampled = mode == 1; s.rng.seed(100 + p);
                 e->reset();
                 while (!s.done) turn(*e, s, chunk, steps, V);

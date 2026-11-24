@@ -714,6 +714,8 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
         if (t.n_predict == 0) { r.stop_type = "limit"; r.tokens_cached = (int)cached_.size(); goto done; }
 
         {
+            n_decoding_.fetch_add(1);
+            struct DecGuard { std::atomic<int>& c; ~DecGuard() { c.fetch_sub(1); } } dec_guard{n_decoding_};
             std::vector<int> sprompt;
             for (int id : t.prompt) if (id >= 0) sprompt.push_back(id);
             Sampler sampler(t.sp, t.images.empty() ? t.prompt : sprompt);

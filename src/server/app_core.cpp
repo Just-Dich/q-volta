@@ -840,6 +840,7 @@ void App::load_model(const Options& mo_in, const std::string& forced_id) {
         chunk = o.prefill_chunk > 0 ? o.prefill_chunk : (o.ubatch > 0 ? o.ubatch : (backend == "cuda" ? 2048 : 256));
         eo.prefill_chunk = chunk;
         mtp_chunk = 8;
+        if (const char* e = std::getenv("QV_SHARED_CHUNK")) shared_chunk = std::max(1, std::atoi(e));
 
         Options mo = o;
         auto make_engine = [this, backend, stem, eo, mo]() mutable -> std::unique_ptr<qv::Engine> {

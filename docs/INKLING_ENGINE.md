@@ -43,3 +43,6 @@ dequantises into the WMMA tile. `--kv int4|fp16`.
 
 ## Correctness
 See PERFORMANCE.md. Quantised-reference goldens (`/tmp/ink/qg`, from the CPU Q3A5 reference) and the fp goldens in `tests/golden/inkling`.
+
+## Sequences (p24/multiseq)
+`EngineOptions::n_seq = N` allocates N copies of the per-sequence state: local-attention rings, global KV (fp16 or int4), conv states of k/v/attn/mlp, logits, token/position buffer, argmax history and the CUDA graphs (captured lazily per sequence, they bake in the sequence's pointers). Weights, scratch, prefill buffers and cuBLAS state are shared: every step / prefill chunk fully rewrites the scratch it reads, so a sequence switch (`select_seq`) is pointer bookkeeping only (no copy, no sync) and results are bit-identical to running alone (tests/test_multiseq.cpp). Per extra sequence: 0.19 GiB + 9216 B x max_ctx (int4 KV) (see docs/PERFORMANCE.md). MTP keeps single-sequence drafter state (n_seq > 1 with MTP throws).
