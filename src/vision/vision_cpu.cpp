@@ -1,6 +1,12 @@
-// CPU Inkling vision encoder: fp32 activations, fp16-stored weights packed into 16-column panels, AVX2/FMA micro-kernel (6x16),
-// OpenMP over output tiles. Exact same math as the HF module (docs/INKLING_VISION.md section 4-6).
+// CPU Inkling vision encoder: fp32 activations, fp16-stored weights packed into 16-column panels, AVX2/FMA micro-kernel (6x16)
+// with runtime CPUID dispatch and portable scalar fallback, OpenMP over output tiles.
+// Exact same math as the HF module (docs/INKLING_VISION.md section 4-6).
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
 #include <immintrin.h>
+#define QV_VISION_X86_SIMD 1
+#else
+#define QV_VISION_X86_SIMD 0
+#endif
 #include <omp.h>
 
 #include <algorithm>
@@ -35,7 +41,9 @@ PackedW pack_w(const std::vector<uint16_t>& w, int N, int K) {
 }
 
 // C[M][N] (ld ldc) = A[M][K] (ld lda) * W^T (+bias). 6x16 tile.
-inline void tile6x16(const float* A, int lda, const uint16_t* B, int K, int mr, float acc[6][16]) {
+#if QV_VISION_X86_SIMD
+__attribute__((target("avx2,fma,f16c")))
+inline void tile6x16_avx2(const float* A, int lda, const uint16_t* B, int K, int mr, float acc[6][16]) {
     __m256 c[6][2];
     for (int i = 0; i < 6; ++i) c[i][0] = c[i][1] = _mm256_setzero_ps();
     for (int k = 0; k < K; ++k) {
@@ -52,10 +60,96 @@ inline void tile6x16(const float* A, int lda, const uint16_t* B, int K, int mr, 
         _mm256_storeu_ps(acc[i] + 8, c[i][1]);
     }
 }
+#endif
+
+inline void tile6x16_scalar(const float* A, int lda, const uint16_t* B, int K, int mr, float acc[6][16]) {
+    for (int i = 0; i < mr; ++i)
+        for (int j = 0; j < 16; ++j) acc[i][j] = 0.f;
+    for (int k = 0; k < K; ++k) {
+        float b[16];
+        for (int j = 0; j < 16; ++j) b[j] = half_to_float(B[(size_t)k * 16 + j]);
+        for (int i = 0; i < mr; ++i) {
+            const float a = A[(size_t)i * lda + k];
+            for (int j = 0; j < 16; ++j) acc[i][j] += a * b[j];
+        }
+    }
+}
+
+inline bool has_avx2_fma_f16c() {
+#if QV_VISION_X86_SIMD
+    static const bool ok = [] {
+        __builtin_cpu_init();
+        return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("f16c");
+    }();
+    return ok;
+#else
+    return false;
+#endif
+}
+
+#if QV_VISION_X86_SIMD
+__attribute__((target("avx2,fma")))
+inline float attn_dot_avx2(const float* qp, const float* kp, int HD) {
+    __m256 a = _mm256_setzero_ps();
+    for (int d = 0; d < HD; d += 8) a = _mm256_fmadd_ps(_mm256_loadu_ps(qp + d), _mm256_loadu_ps(kp + d), a);
+    __m128 lo = _mm_add_ps(_mm256_castps256_ps128(a), _mm256_extractf128_ps(a, 1));
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    return _mm_cvtss_f32(lo);
+}
+
+__attribute__((target("avx2,fma")))
+inline void attn_v_avx2(const float* qkv, const float* sc, int N, int nq, int q0, int h, int HD, int D, const float* sum, float* out) {
+    constexpr int QB = 4;
+    // HD == 64: process two halves of 32 channels (4 ymm accumulators per query)
+    for (int half = 0; half < 2; ++half) {
+        __m256 acc[QB][4];
+        for (int i = 0; i < QB; ++i)
+            for (int j = 0; j < 4; ++j) acc[i][j] = _mm256_setzero_ps();
+        for (int k = 0; k < N; ++k) {
+            const float* vp = qkv + (size_t)k * 3 * D + 2 * D + h * HD + half * 32;
+            const __m256 v0 = _mm256_loadu_ps(vp), v1 = _mm256_loadu_ps(vp + 8), v2 = _mm256_loadu_ps(vp + 16), v3 = _mm256_loadu_ps(vp + 24);
+            for (int i = 0; i < nq; ++i) {
+                const __m256 p = _mm256_set1_ps(sc[(size_t)i * N + k]);
+                acc[i][0] = _mm256_fmadd_ps(p, v0, acc[i][0]);
+                acc[i][1] = _mm256_fmadd_ps(p, v1, acc[i][1]);
+                acc[i][2] = _mm256_fmadd_ps(p, v2, acc[i][2]);
+                acc[i][3] = _mm256_fmadd_ps(p, v3, acc[i][3]);
+            }
+        }
+        for (int i = 0; i < nq; ++i) {
+            const __m256 inv = _mm256_set1_ps(1.f / sum[i]);
+            float* op = out + (size_t)(q0 + i) * D + h * HD + half * 32;
+            for (int j = 0; j < 4; ++j) _mm256_storeu_ps(op + 8 * j, _mm256_mul_ps(acc[i][j], inv));
+        }
+    }
+}
+#endif
+
+inline float attn_dot_scalar(const float* qp, const float* kp, int HD) {
+    float a = 0.f;
+    for (int d = 0; d < HD; ++d) a += qp[d] * kp[d];
+    return a;
+}
+
+inline void attn_v_scalar(const float* qkv, const float* sc, int N, int nq, int q0, int h, int HD, int D, const float* sum, float* out) {
+    for (int i = 0; i < nq; ++i) {
+        const float inv = 1.f / sum[i];
+        float* op = out + (size_t)(q0 + i) * D + h * HD;
+        for (int d = 0; d < HD; ++d) op[d] = 0.f;
+        for (int k = 0; k < N; ++k) {
+            const float p = sc[(size_t)i * N + k];
+            const float* vp = qkv + (size_t)k * 3 * D + 2 * D + h * HD;
+            for (int d = 0; d < HD; ++d) op[d] += p * vp[d];
+        }
+        for (int d = 0; d < HD; ++d) op[d] *= inv;
+    }
+}
 
 void gemm(const float* A, int M, int lda, const PackedW& W, float* C, int ldc, bool gelu_act = false) {
     const int MB = 96;  // rows per task (keeps A tile in L2)
     const int mblocks = (M + MB - 1) / MB;
+    const bool use_avx2 = has_avx2_fma_f16c();
 #pragma omp parallel for collapse(2) schedule(dynamic, 1)
     for (int pn = 0; pn < W.NP; ++pn)
         for (int mb = 0; mb < mblocks; ++mb) {
@@ -64,7 +158,13 @@ void gemm(const float* A, int M, int lda, const PackedW& W, float* C, int ldc, b
             for (int m = m0; m < m1; m += 6) {
                 const int mr = std::min(6, m1 - m);
                 float acc[6][16];
-                tile6x16(A + (size_t)m * lda, lda, B, W.K, mr, acc);
+#if QV_VISION_X86_SIMD
+                if (use_avx2) tile6x16_avx2(A + (size_t)m * lda, lda, B, W.K, mr, acc);
+                else tile6x16_scalar(A + (size_t)m * lda, lda, B, W.K, mr, acc);
+#else
+                (void)use_avx2;
+                tile6x16_scalar(A + (size_t)m * lda, lda, B, W.K, mr, acc);
+#endif
                 for (int i = 0; i < mr; ++i)
                     for (int j = 0; j < 16; ++j) {
                         const int n = pn * 16 + j;
@@ -245,6 +345,7 @@ class CpuEncoder : public Encoder {
         const float scale = 1.f / std::sqrt((float)HD);
         const int QB = 4;
         const int nqb = (N + QB - 1) / QB;
+        const bool use_avx2 = has_avx2_fma_f16c();
 #pragma omp parallel
         {
             std::vector<float> sc((size_t)QB * N);
@@ -258,12 +359,13 @@ class CpuEncoder : public Encoder {
                         const float* kp = qkv + (size_t)k * 3 * D + D + h * HD;
                         for (int i = 0; i < nq; ++i) {
                             const float* qp = qkv + (size_t)(q0 + i) * 3 * D + h * HD;
-                            __m256 a = _mm256_setzero_ps();
-                            for (int d = 0; d < HD; d += 8) a = _mm256_fmadd_ps(_mm256_loadu_ps(qp + d), _mm256_loadu_ps(kp + d), a);
-                            __m128 lo = _mm_add_ps(_mm256_castps256_ps128(a), _mm256_extractf128_ps(a, 1));
-                            lo = _mm_hadd_ps(lo, lo);
-                            lo = _mm_hadd_ps(lo, lo);
-                            const float s = _mm_cvtss_f32(lo) * scale;
+#if QV_VISION_X86_SIMD
+                            const float dot = use_avx2 ? attn_dot_avx2(qp, kp, HD) : attn_dot_scalar(qp, kp, HD);
+#else
+                            (void)use_avx2;
+                            const float dot = attn_dot_scalar(qp, kp, HD);
+#endif
+                            const float s = dot * scale;
                             sc[(size_t)i * N + k] = s;
                             mx[i] = std::max(mx[i], s);
                         }
@@ -275,28 +377,12 @@ class CpuEncoder : public Encoder {
                             sc[(size_t)i * N + k] = e;
                             sum[i] += e;
                         }
-                    // HD == 64: process two halves of 32 channels (4 ymm accumulators per query)
-                    for (int half = 0; half < 2; ++half) {
-                        __m256 acc[QB][4];
-                        for (int i = 0; i < QB; ++i)
-                            for (int j = 0; j < 4; ++j) acc[i][j] = _mm256_setzero_ps();
-                        for (int k = 0; k < N; ++k) {
-                            const float* vp = qkv + (size_t)k * 3 * D + 2 * D + h * HD + half * 32;
-                            const __m256 v0 = _mm256_loadu_ps(vp), v1 = _mm256_loadu_ps(vp + 8), v2 = _mm256_loadu_ps(vp + 16), v3 = _mm256_loadu_ps(vp + 24);
-                            for (int i = 0; i < nq; ++i) {
-                                const __m256 p = _mm256_set1_ps(sc[(size_t)i * N + k]);
-                                acc[i][0] = _mm256_fmadd_ps(p, v0, acc[i][0]);
-                                acc[i][1] = _mm256_fmadd_ps(p, v1, acc[i][1]);
-                                acc[i][2] = _mm256_fmadd_ps(p, v2, acc[i][2]);
-                                acc[i][3] = _mm256_fmadd_ps(p, v3, acc[i][3]);
-                            }
-                        }
-                        for (int i = 0; i < nq; ++i) {
-                            const __m256 inv = _mm256_set1_ps(1.f / sum[i]);
-                            float* op = out + (size_t)(q0 + i) * D + h * HD + half * 32;
-                            for (int j = 0; j < 4; ++j) _mm256_storeu_ps(op + 8 * j, _mm256_mul_ps(acc[i][j], inv));
-                        }
-                    }
+#if QV_VISION_X86_SIMD
+                    if (use_avx2 && HD == 64) attn_v_avx2(qkv, sc.data(), N, nq, q0, h, HD, D, sum, out);
+                    else attn_v_scalar(qkv, sc.data(), N, nq, q0, h, HD, D, sum, out);
+#else
+                    attn_v_scalar(qkv, sc.data(), N, nq, q0, h, HD, D, sum, out);
+#endif
                 }
         }
     }
