@@ -9,6 +9,12 @@
 namespace qv::cuda::ink {
 
 namespace {
+#ifndef MR_WPB
+#define MR_WPB 1
+#endif
+#ifndef MR_R
+#define MR_R 1
+#endif
 #ifndef GD_RPB
 #define GD_RPB 4
 #endif
@@ -1141,7 +1147,7 @@ void conv_commit(const float* rows, long rs, int T, int D, float* st, cudaStream
 // ======================================================================================================================
 
 template <int BITS, int R>
-__global__ void __launch_bounds__(128) k_mgemv_rows(GDs D, int nr) {
+__global__ void __launch_bounds__(MR_WPB * 32) k_mgemv_rows(GDs D, int nr) {
     int b = blockIdx.x, di = 0;
 #pragma unroll 1
     while (di < D.n - 1 && b >= D.d[di].nblk) {
@@ -1150,7 +1156,7 @@ __global__ void __launch_bounds__(128) k_mgemv_rows(GDs D, int nr) {
     }
     const GD& g = D.d[di];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int row0 = (b * 4 + warp) * R;
+    const int row0 = (b * MR_WPB + warp) * R;
     if (row0 >= g.N) return;
     float acc[R][8];
 #pragma unroll
@@ -1230,18 +1236,18 @@ __global__ void __launch_bounds__(128) k_mgemv_rows(GDs D, int nr) {
             }
 }
 void mgemv_rows(GDs& g, int bits, int nr, cudaStream_t s) {
-    constexpr int R = 2;
+    constexpr int R = MR_R;
     int tot = 0;
     for (int i = 0; i < g.n; ++i) {
-        g.d[i].nblk = (g.d[i].N + 4 * R - 1) / (4 * R);
+        g.d[i].nblk = (g.d[i].N + MR_WPB * R - 1) / (MR_WPB * R);
         tot += g.d[i].nblk;
     }
     switch (bits) {
-        case 3: k_mgemv_rows<3, R><<<tot, 128, 0, s>>>(g, nr); break;
-        case 4: k_mgemv_rows<4, R><<<tot, 128, 0, s>>>(g, nr); break;
-        case 5: k_mgemv_rows<5, R><<<tot, 128, 0, s>>>(g, nr); break;
-        case 6: k_mgemv_rows<6, R><<<tot, 128, 0, s>>>(g, nr); break;
-        case 8: k_mgemv_rows<8, R><<<tot, 128, 0, s>>>(g, nr); break;
+        case 3: k_mgemv_rows<3, R><<<tot, MR_WPB * 32, 0, s>>>(g, nr); break;
+        case 4: k_mgemv_rows<4, R><<<tot, MR_WPB * 32, 0, s>>>(g, nr); break;
+        case 5: k_mgemv_rows<5, R><<<tot, MR_WPB * 32, 0, s>>>(g, nr); break;
+        case 6: k_mgemv_rows<6, R><<<tot, MR_WPB * 32, 0, s>>>(g, nr); break;
+        case 8: k_mgemv_rows<8, R><<<tot, MR_WPB * 32, 0, s>>>(g, nr); break;
         default: std::fprintf(stderr, "mgemv_rows: unsupported bits %d\n", bits); std::abort();
     }
 }
