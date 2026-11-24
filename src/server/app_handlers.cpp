@@ -64,6 +64,13 @@ void App::handle_completion(const http::Request& req, http::Conn& c, Kind kind, 
     }
     if (!body.is_object() && kind == Kind::OaiChat) throw_error(400, "'messages' is required");
 
+    auto alive = [&] { return !c.peer_closed(); };
+    std::string req_model;
+    if (body.is_object()) if (const Value* mv = body.find("model"); mv && mv->is_string()) req_model = mv->as_string();
+    long lease_ticket = acquire_model_lease(req_model, alive);
+    if (lease_ticket == -2) { c.close_after = true; return; }
+    struct ModelLeaseGuard { App& a; long t; ~ModelLeaseGuard() { if (t >= 0) a.release_model_lease(t); } } lease_guard{*this, lease_ticket};
+
     // ---- prompts (native /completion accepts an array of prompts: one result per prompt, non-streaming)
     std::vector<std::vector<int>> prompts;
     Task base = parse_task(body, kind);
@@ -95,7 +102,6 @@ void App::handle_completion(const http::Request& req, http::Conn& c, Kind kind, 
     if (chat) { std::lock_guard<std::mutex> g(sm_); controls_[id] = base.reasoning_end; ctl_guard.id = id; }
     const long long created = (long long)std::time(nullptr);
     const std::string fp = build_info;
-    auto alive = [&] { return !c.peer_closed(); };
 
     auto timings_of = [&](const GenResult& r) { return timings_json(r); };
     auto base_chunk = [&](const char* object) {
@@ -307,7 +313,7 @@ void App::handle_completion(const http::Request& req, http::Conn& c, Kind kind, 
                     sse(o2);
                 };
             }
-            GenResult r = generate(tc, stream_alive, on_chunk, begin);
+            GenResult r = generate(tc, stream_alive, on_chunk, begin, lease_ticket);
             if (xl) xl->stopping_word = r.stopping_word;
             if (r.aborted) {
                 if (session && session->cancelled() && sock_ok) c.end_chunks();  // explicit stop (DELETE /v1/stream): end the stream cleanly
@@ -377,7 +383,7 @@ void App::handle_completion(const http::Request& req, http::Conn& c, Kind kind, 
         for (int ci = 0; ci < (oai ? base.n_choices : 1); ++ci) {
             Task tc = t;
             if (ci > 0 && tc.sp.has_seed) tc.sp.seed += ci;
-            GenResult r = generate(tc, alive, [](const Chunk&) { return true; }, [](int) {});
+            GenResult r = generate(tc, alive, [](const Chunk&) { return true; }, [](int) {}, lease_ticket);
             if (r.aborted) { c.close_after = true; return; }
             rs_.push_back(std::move(r));
         }
@@ -458,6 +464,12 @@ void App::handle_count_tokens(const http::Request& req, http::Conn& c, ApiFmt fm
     Value body;
     try { body = jd::parse(req.body); }
     catch (const jd::ParseError& e) { throw_error(400, std::string("[json.exception.parse_error.101] parse error: ") + e.what()); }
+    std::string req_model;
+    if (body.is_object()) if (const Value* mv = body.find("model"); mv && mv->is_string()) req_model = mv->as_string();
+    auto alive = [&] { return !c.peer_closed(); };
+    long lease_ticket = acquire_model_lease(req_model, alive);
+    if (lease_ticket == -2) { c.close_after = true; return; }
+    struct ModelLeaseGuard { App& a; long t; ~ModelLeaseGuard() { if (t >= 0) a.release_model_lease(t); } } lease_guard{*this, lease_ticket};
     if (fmt == ApiFmt::Responses) { try { body = responses_to_oai(body); } catch (const std::exception& e) { throw_error(400, e.what(), "invalid_request_error"); } }
     else if (fmt == ApiFmt::Anthropic) { try { body = anthropic_to_oai(body); } catch (const std::exception& e) { throw_error(400, e.what(), "invalid_request_error"); } }
     Task t = parse_task(body, Kind::OaiChat);
@@ -468,6 +480,16 @@ void App::handle_count_tokens(const http::Request& req, http::Conn& c, ApiFmt fm
 }
 
 void App::handle_infill(const http::Request& req, http::Conn& c) {
+    Value body;
+    try { body = jd::parse(req.body); }
+    catch (const jd::ParseError& e) { throw_error(400, std::string("[json.exception.parse_error.101] parse error: ") + e.what()); }
+    if (!body.is_object()) throw_error(400, "request body must be a JSON object");
+    auto alive = [&] { return !c.peer_closed(); };
+    std::string req_model;
+    if (const Value* mv = body.find("model"); mv && mv->is_string()) req_model = mv->as_string();
+    long lease_ticket = acquire_model_lease(req_model, alive);
+    if (lease_ticket == -2) { c.close_after = true; return; }
+    struct ModelLeaseGuard { App& a; long t; ~ModelLeaseGuard() { if (t >= 0) a.release_model_lease(t); } } lease_guard{*this, lease_ticket};
     if (fim_pre < 0 || fim_suf < 0 || fim_mid < 0) {
         std::string err;
         if (fim_pre < 0) err += "prefix token is missing. ";
@@ -475,10 +497,6 @@ void App::handle_infill(const http::Request& req, http::Conn& c) {
         if (fim_mid < 0) err += "middle token is missing. ";
         throw_error(501, "Infill is not supported by this model: " + err, "not_supported_error");
     }
-    Value body;
-    try { body = jd::parse(req.body); }
-    catch (const jd::ParseError& e) { throw_error(400, std::string("[json.exception.parse_error.101] parse error: ") + e.what()); }
-    if (!body.is_object()) throw_error(400, "request body must be a JSON object");
     if (const Value* p = body.find("prompt"); p && !p->is_string()) throw_error(400, "\"prompt\" must be a string");
     if (!body.find("input_prefix")) throw_error(400, "\"input_prefix\" is required");
     if (!body.find("input_suffix")) throw_error(400, "\"input_suffix\" is required");
@@ -526,7 +544,6 @@ void App::handle_infill(const http::Request& req, http::Conn& c) {
         e.extra.set("n_ctx", n_ctx);
         throw e;
     }
-    auto alive = [&] { return !c.peer_closed(); };
     if (t.stream) {
         bool ok = true, started = false;
         auto begin = [&](int) { if (!started) { started = true; ok = c.begin_stream(200, "text/event-stream"); } };
@@ -537,7 +554,7 @@ void App::handle_infill(const http::Request& req, http::Conn& c) {
             Value a = Value::array(); for (int x : ck.tokens) a.push(x);
             o2.set("tokens", std::move(a)); o2.set("stop", false); o2.set("id_slot", -1); o2.set("tokens_predicted", ck.n_decoded); o2.set("tokens_evaluated", (int)t.prompt.size());
             return sse(o2);
-        }, begin);
+        }, begin, lease_ticket);
         if (r.aborted) { c.close_after = true; return; }
         begin(0);
         Value o2 = Value::object();
@@ -549,7 +566,7 @@ void App::handle_infill(const http::Request& req, http::Conn& c) {
         if (ok) c.end_chunks(); else c.close_after = true;
         return;
     }
-    GenResult r = generate(t, alive, [](const Chunk&) { return true; }, [](int) {});
+    GenResult r = generate(t, alive, [](const Chunk&) { return true; }, [](int) {}, lease_ticket);
     if (r.aborted) { c.close_after = true; return; }
     Value o2 = Value::object();
     o2.set("index", 0); o2.set("content", r.content);

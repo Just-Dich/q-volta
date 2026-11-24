@@ -11,6 +11,9 @@ namespace qv::server {
 struct Options {
     // ---- model / engine
     std::string model;                 // Q-Volta model prefix (PREFIX.qv.json/.qv.bin) or a .qv path
+    std::string models_preset;         // --models-preset PATH: INI preset file for multi-model routing
+    int models_max = -1;               // --models-max N (accepted; qv_server keeps 1 active engine in memory)
+    bool preload = false;              // preset option: preload / load-on-startup = true loads this model at startup
     std::string backend = "auto";      // cuda | cpu | auto | mock
     std::string tokenizer;             // "" = use the tokenizer embedded in the .qv, then sidecar search (docs/QV_FORMAT.md)
     bool embedded_defaults = true;     // apply generation_config temperature/top_k/top_p of the .qv as default sampling (--no-embedded-defaults disables)
@@ -94,5 +97,7 @@ struct Options {
 // Returns 0 on success, otherwise the process exit code (message already printed). `exit_now` is set for --help/--version.
 int parse_args(int argc, char** argv, Options& o, bool& exit_now);
 bool flag_known(const std::string& spelling);
+// Apply a single key=value option from a preset INI to `o`. Returns false if the option has no effect / is unknown (`msg` set).
+bool apply_preset_option(Options& o, const std::string& key, const std::string& val, std::string& msg);
 
 }  // namespace qv::server

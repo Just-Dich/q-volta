@@ -89,7 +89,7 @@ std::string read_file(const std::string& p) {
 // Flags handled by apply(); everything else in the table is "accepted, ignored".
 const std::set<std::string>& handled() {
     static const std::set<std::string> s = {
-        "model", "ctx-size", "threads", "threads-http", "n-gpu-layers", "gpu-layers", "batch-size", "ubatch-size", "host", "port", "api-key", "api-key-file",
+        "model", "models-preset", "models-max", "ctx-size", "threads", "threads-http", "n-gpu-layers", "gpu-layers", "batch-size", "ubatch-size", "host", "port", "api-key", "api-key-file",
         "alias", "parallel", "cont-batching", "cache-prompt", "jinja", "chat-template", "chat-template-file", "chat-template-kwargs", "reasoning-format",
         "reasoning", "reasoning-budget", "reasoning-effort", "metrics", "slots", "props", "embedding", "predict", "temp", "top-k", "top-p", "min-p",
         "typical", "top-nsigma", "xtc-probability", "xtc-threshold", "repeat-penalty", "repeat-last-n", "presence-penalty", "frequency-penalty",
@@ -109,6 +109,8 @@ void apply(Options& o, const Resolved& r, const std::string& flag, const std::st
     const std::string& c = r.canon;
     auto warn = [&](const std::string& m) { o.warnings.push_back(m); };
     if (c == "model") o.model = val;
+    else if (c == "models-preset") o.models_preset = val;
+    else if (c == "models-max") o.models_max = to_int(val, flag);
     else if (c == "ctx-size") o.ctx = to_int(val, flag);
     else if (c == "threads") o.threads = to_int(val, flag);
     else if (c == "threads-http") o.http_threads = to_int(val, flag);
@@ -234,6 +236,42 @@ void apply(Options& o, const Resolved& r, const std::string& flag, const std::st
 }  // namespace
 
 bool flag_known(const std::string& s) { Resolved r; return resolve(s, r); }
+
+bool apply_preset_option(Options& o, const std::string& key, const std::string& val, std::string& msg) {
+    msg.clear();
+    std::string flag = "--" + key;
+    Resolved r;
+    if (!resolve(flag, r)) return false;
+    if (r.canon == "models-preset" || r.canon == "models-max" || r.canon == "host" || r.canon == "port") {
+        msg = "server-wide option '" + key + "' is ignored inside a preset section";
+        return false;
+    }
+    if (!handled().count(r.canon) && !r.own) {
+        msg = "option '" + key + "' has no effect in qv_server";
+        return false;
+    }
+    std::string v = val;
+    if (r.arg == 0) {
+        if (falsey(v)) {
+            Resolved nr;
+            if (resolve("--no-" + r.canon, nr)) r = nr;
+            else if (r.canon == "mtp" || r.canon == "cache-prompt" || r.canon == "jinja" || r.canon == "slots" || r.canon == "ui" || r.canon == "cors-credentials") { r.neg = true; }
+            else { msg = "option '" + key + "' cannot be disabled with false"; return false; }
+        } else if (!v.empty() && !truthy(v)) {
+            throw std::runtime_error("invalid boolean value '" + v + "' for '" + key + "'");
+        }
+    } else if (r.arg == 2 && v.empty()) {
+        v = "on";
+    }
+    size_t prev_warns = o.warnings.size();
+    apply(o, r, flag, v);
+    if (o.warnings.size() > prev_warns) {
+        msg = o.warnings.back();
+        o.warnings.resize(prev_warns);
+    }
+    o.given.insert(r.canon);
+    return true;
+}
 
 int parse_args(int argc, char** argv, Options& o, bool& exit_now) {
     exit_now = false;

@@ -22,6 +22,7 @@
 #include "server/compat_api.h"
 #include "server/http.h"
 #include "server/options.h"
+#include "server/presets.h"
 #include "tokenizer/tokenizer.h"
 #include "vision/vision.h"
 
@@ -164,6 +165,17 @@ class App {
     int fim_pre = -1, fim_suf = -1, fim_mid = -1, fim_rep = -1, fim_sep = -1;
 
     void init_slots();
+    // ---- model presets / routing (--models-preset)
+    Options base_opts;
+    std::vector<ModelPreset> presets;
+    std::string active_preset_id;
+    bool has_presets() const { return !presets.empty(); }
+    const ModelPreset* find_preset(const std::string& name) const;
+    void load_model(const Options& mo, const std::string& forced_id = "");
+    void unload_model();
+    long acquire_model_lease(const std::string& requested_model, const std::function<bool()>& alive);
+    void release_model_lease(long ticket);
+
     // --sleep-idle-seconds: the engine is destroyed after N idle seconds (VRAM / RAM freed) and rebuilt by `reload_engine` on the next task
     std::function<std::unique_ptr<Engine>()> reload_engine;
     std::atomic<bool> sleeping{false};
@@ -180,6 +192,7 @@ class App {
     void ensure_engine();  // under the engine lease: wake from sleep
     // ---- engine queue + slots
     std::mutex mu_;
+    mutable std::mutex state_mu_;  // guards active model metadata/tokenizer/template during hot-swap vs /models and /props reads
     std::condition_variable cv_;
     long next_ticket_ = 0, serving_ = 0;
     int waiting_ = 0;
@@ -230,7 +243,7 @@ class App {
     void lease_release(long ticket);
     struct Admission;
     void prefill_with_images(const Task& t, int off, int n, const std::vector<std::vector<float>>& emb);
-    GenResult generate(Task& t, const std::function<bool()>& alive, const std::function<bool(const Chunk&)>& on_chunk, const std::function<void(int)>& on_start);
+    GenResult generate(Task& t, const std::function<bool()>& alive, const std::function<bool(const Chunk&)>& on_chunk, const std::function<void(int)>& on_start, long existing_ticket = -1);
     // ---- handlers
     void handle_completion(const http::Request&, http::Conn&, Kind, ApiFmt fmt = ApiFmt::Oai, const Value* body_in = nullptr);
     void handle_responses(const http::Request&, http::Conn&);
@@ -244,6 +257,7 @@ class App {
     void handle_slot_action(const http::Request&, http::Conn&, int id);
     void handle_metrics(http::Conn&);
     void handle_models(http::Conn&);
+    void handle_model_load(const http::Request&, http::Conn&, bool load);
     void handle_messages(const http::Request&, http::Conn&);
     void respond_json(http::Conn& c, int status, const Value& v, const http::Headers& extra = {});
     bool serve_webui(const http::Request& req, http::Conn& c, const std::string& path);

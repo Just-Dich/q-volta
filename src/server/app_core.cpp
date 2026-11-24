@@ -4,10 +4,18 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <optional>
 #include <sstream>
+#include <type_traits>
+
+#ifdef QV_HAVE_CUDA
+#include <cuda_runtime.h>
+#endif
 
 #include "server/app.h"
+#include "server/mock_engine.h"
 
 namespace qv::server {
 
@@ -36,10 +44,12 @@ std::string mime_of(const std::string& p) {
 }  // namespace
 
 void App::init_slots() {
+    std::lock_guard<std::mutex> lk(mu_);
     n_slots = o.n_parallel < 0 ? 4 : std::max(1, o.n_parallel);
     slots_.assign(n_slots, SlotInfo());
     for (int i = 0; i < n_slots; ++i) slots_[i].id = i;
-    m_.t_start = (long long)std::time(nullptr);
+    owner_slot_ = 0;
+    if (m_.t_start == 0) m_.t_start = (long long)std::time(nullptr);
 }
 
 Value App::model_json() const {
@@ -90,6 +100,56 @@ Value App::model_json() const {
 }
 
 void App::handle_models(http::Conn& c) {
+    if (has_presets()) {
+        std::lock_guard<std::mutex> slk(state_mu_);
+        Value models = Value::array();
+        Value data = Value::array();
+        for (const auto& p : presets) {
+            const bool loaded = (p.id == active_preset_id && eng != nullptr);
+            Value m;
+            if (loaded) {
+                m = model_json();
+                m.set("id", p.id);
+                Value al = Value::array();
+                al.push(p.id);
+                for (auto& a : p.opts.alias) if (a != p.id) al.push(a);
+                m.set("aliases", std::move(al));
+            } else {
+                m = Value::object();
+                m.set("id", p.id);
+                Value al = Value::array();
+                al.push(p.id);
+                for (auto& a : p.opts.alias) if (a != p.id) al.push(a);
+                m.set("aliases", std::move(al));
+                m.set("tags", Value::array());
+                m.set("object", "model");
+                m.set("created", started_at);
+                m.set("owned_by", "q-volta");
+                Value meta = Value::object();
+                meta.set("n_ctx", p.opts.ctx > 0 ? p.opts.ctx : 4096);
+                m.set("meta", std::move(meta));
+            }
+            Value st = Value::object();
+            st.set("value", loaded ? "loaded" : "unloaded");
+            m.set("status", std::move(st));
+            data.push(std::move(m));
+
+            Value e = Value::object();
+            e.set("name", p.id);
+            e.set("model", p.id);
+            e.set("type", "model");
+            Value det = Value::object();
+            det.set("format", "qv");
+            e.set("details", std::move(det));
+            models.push(std::move(e));
+        }
+        Value r = Value::object();
+        r.set("models", std::move(models));
+        r.set("object", "list");
+        r.set("data", std::move(data));
+        respond_json(c, 200, r);
+        return;
+    }
     Value m = model_json();
     Value models = Value::array();
     Value e = Value::object();
@@ -127,7 +187,38 @@ void App::handle_models(http::Conn& c) {
     respond_json(c, 200, r);
 }
 
+void App::handle_model_load(const http::Request& req, http::Conn& c, bool load) {
+    if (!has_presets()) throw_error(400, "router mode is not active (start with --models-preset)");
+    Value body = Value::object();
+    if (!req.body.empty()) {
+        try { body = jd::parse(req.body); } catch (const jd::ParseError& e) { throw_error(400, std::string("[json.exception.parse_error.101] parse error: ") + e.what()); }
+        if (!body.is_object()) throw_error(400, "request body must be a JSON object");
+    }
+    std::string mname;
+    if (const Value* mv = body.find("model"); mv && mv->is_string()) mname = mv->as_string();
+    auto alive = [&] { return !c.peer_closed(); };
+    if (load) {
+        if (mname.empty()) throw_error(400, "missing 'model' field");
+        long ticket = acquire_model_lease(mname, alive);
+        if (ticket == -2) { c.close_after = true; return; }
+        struct Rel { App& a; long t; ~Rel() { if (t >= 0) a.release_model_lease(t); } } rel{*this, ticket};
+        Value r = Value::object();
+        r.set("success", true);
+        r.set("model", active_preset_id);
+        respond_json(c, 200, r);
+    } else {
+        long ticket = lease_acquire(alive);
+        if (ticket < 0) { c.close_after = true; return; }
+        struct Rel { App& a; long t; ~Rel() { a.lease_release(t); } } rel{*this, ticket};
+        if (!active_preset_id.empty() && (mname.empty() || mname == active_preset_id || find_preset(mname) == find_preset(active_preset_id))) unload_model();
+        Value r = Value::object();
+        r.set("success", true);
+        respond_json(c, 200, r);
+    }
+}
+
 void App::handle_props(http::Conn& c) {
+    std::lock_guard<std::mutex> slk(state_mu_);
     Value r = Value::object();
     Task dt;
     parse_sampling(Value::object(), dt);
@@ -324,6 +415,12 @@ void App::handle_tokenize(const http::Request& req, http::Conn& c) {
     Value body;
     try { body = jd::parse(req.body); } catch (const jd::ParseError& e) { throw_error(400, std::string("[json.exception.parse_error.101] parse error: ") + e.what()); }
     if (!body.is_object()) throw_error(400, "[json.exception.type_error.302] type must be object, but is " + std::string(body.is_array() ? "array" : "string"));
+    std::string req_model;
+    if (const Value* mv = body.find("model"); mv && mv->is_string()) req_model = mv->as_string();
+    auto alive = [&] { return !c.peer_closed(); };
+    long ticket = acquire_model_lease(req_model, alive);
+    if (ticket == -2) { c.close_after = true; return; }
+    struct Rel { App& a; long t; ~Rel() { if (t >= 0) a.release_model_lease(t); } } rel{*this, ticket};
     auto tn = [](const Value& v) { return v.is_string() ? "string" : v.is_number() ? "number" : v.is_bool() ? "boolean" : v.is_array() ? "array" : "object"; };
     std::string content;
     if (const Value* v = body.find("content"); v && !v->is_null()) {
@@ -359,6 +456,12 @@ void App::handle_detokenize(const http::Request& req, http::Conn& c) {
     Value body;
     try { body = jd::parse(req.body); } catch (const jd::ParseError& e) { throw_error(400, std::string("[json.exception.parse_error.101] parse error: ") + e.what()); }
     if (!body.is_object()) throw_error(400, "[json.exception.type_error.302] type must be object, but is " + std::string(body.is_array() ? "array" : "string"));
+    std::string req_model;
+    if (const Value* mv = body.find("model"); mv && mv->is_string()) req_model = mv->as_string();
+    auto alive = [&] { return !c.peer_closed(); };
+    long ticket = acquire_model_lease(req_model, alive);
+    if (ticket == -2) { c.close_after = true; return; }
+    struct Rel { App& a; long t; ~Rel() { if (t >= 0) a.release_model_lease(t); } } rel{*this, ticket};
     std::vector<int> ids;
     if (const Value* v = body.find("tokens"); v && !v->is_null()) {
         if (!v->is_array()) throw_error(400, std::string("[json.exception.type_error.302] type must be array, but is ") + (v->is_string() ? "string" : v->is_number() ? "number" : v->is_bool() ? "boolean" : "object"));
@@ -376,6 +479,12 @@ void App::handle_detokenize(const http::Request& req, http::Conn& c) {
 void App::handle_apply_template(const http::Request& req, http::Conn& c) {
     Value body;
     try { body = jd::parse(req.body); } catch (const jd::ParseError& e) { throw_error(400, std::string("[json.exception.parse_error.101] parse error: ") + e.what()); }
+    std::string req_model;
+    if (body.is_object()) if (const Value* mv = body.find("model"); mv && mv->is_string()) req_model = mv->as_string();
+    auto alive = [&] { return !c.peer_closed(); };
+    long ticket = acquire_model_lease(req_model, alive);
+    if (ticket == -2) { c.close_after = true; return; }
+    struct Rel { App& a; long t; ~Rel() { if (t >= 0) a.release_model_lease(t); } } rel{*this, ticket};
     Task t = parse_task(body, Kind::OaiChat);
     Value r = Value::object();
     r.set("prompt", t.prompt_text);
@@ -421,6 +530,8 @@ void App::route(const http::Request& req, http::Conn& c) {
             Value v = Value::object(); v.set("success", true); respond_json(c, 200, v); return;
         }
         if (get && (path == "/models" || path == "/v1/models")) { handle_models(c); return; }
+        if (post && (path == "/models/load" || path == "/v1/models/load")) { handle_model_load(req, c, true); return; }
+        if (post && (path == "/models/unload" || path == "/v1/models/unload")) { handle_model_load(req, c, false); return; }
         if (post && (path == "/completion" || path == "/completions")) { handle_completion(req, c, Kind::Native); return; }
         if (post && path == "/v1/completions") { handle_completion(req, c, Kind::OaiCmpl); return; }
         if (post && (path == "/chat/completions" || path == "/v1/chat/completions")) { handle_completion(req, c, Kind::OaiChat); return; }
@@ -528,4 +639,309 @@ void App::start_sleep_watcher() {
     });
 }
 void App::stop_sleep_watcher() { sleep_stop_ = true; if (sleep_thr_.joinable()) sleep_thr_.join(); }
+
+const ModelPreset* App::find_preset(const std::string& name) const {
+    if (presets.empty()) return nullptr;
+    if (name.empty()) {
+        if (!active_preset_id.empty()) {
+            for (const auto& p : presets) if (p.id == active_preset_id) return &p;
+        }
+        return &presets[0];
+    }
+    for (const auto& p : presets) if (p.id == name) return &p;
+    for (const auto& p : presets) {
+        for (const auto& a : p.opts.alias) if (a == name) return &p;
+    }
+    return nullptr;
+}
+
+void App::unload_model() {
+    eng.reset();
+    std::lock_guard<std::mutex> slk(state_mu_);
+    venc.reset();
+    tmpl.reset();
+    {
+        std::lock_guard<std::mutex> lk(gm_);
+        vocab_.reset();
+        matchers_.clear();
+    }
+    cached_.clear();
+    tok = Tokenizer();
+    model_id.clear();
+    model_template.clear();
+    model_meta_json.clear();
+    embedded_blobs.clear();
+    embedded_applied.clear();
+    template_source = "none";
+    tokenizer_path.clear();
+    model_arch.clear();
+    stop_ids.clear();
+    bos_id = eos_id = -1;
+    image_token_id = -1;
+    fim_pre = fim_suf = fim_mid = fim_rep = fim_sep = -1;
+    cached_n_embd = 0;
+    cached_weight_bytes = 0;
+    sleeping = false;
+    active_preset_id.clear();
+}
+
+void App::load_model(const Options& mo_in, const std::string& forced_id) {
+    unload_model();
+    try {
+        std::unique_lock<std::mutex> slk(state_mu_);
+        o = mo_in;
+        if (o.ctx <= 0) o.ctx = 4096;
+        n_ctx = o.ctx;
+        model_id = !forced_id.empty() ? forced_id : (!o.alias.empty() ? o.alias[0] : (o.model.empty() ? std::string("qv-mock") : o.model));
+        slk.unlock();
+        init_slots();
+        for (auto& w : o.warnings) std::fprintf(stderr, "warning: %s\n", w.c_str());
+
+        auto exists = [](const std::string& p) { std::ifstream f(p, std::ios::binary); return (bool)f; };
+        std::string stem = o.model;
+        if (stem.size() > 3 && stem.compare(stem.size() - 3, 3, ".qv") == 0 && !exists(stem)) stem.resize(stem.size() - 3);
+
+        std::optional<qv::ModelFile> emb;
+        if (!o.model.empty()) {
+            try { if (exists(stem) || exists(stem + ".qv") || exists(stem + ".qv.json")) emb = qv::ModelFile::open(stem); }
+            catch (const std::exception&) {}
+        }
+        slk.lock();
+        if (emb) {
+            for (auto& [n, b] : emb->blobs) embedded_blobs.push_back(n);
+            model_meta_json = emb->meta();
+        }
+        std::string tpath = o.tokenizer;
+        bool tok_embedded = false;
+        if (tpath.empty() && emb && emb->has_blob("tokenizer.json")) {
+            try { tok = qv::Tokenizer::from_memory(emb->blob("tokenizer.json")); }
+            catch (const std::exception& e) { throw std::runtime_error(std::string("embedded tokenizer: ") + e.what()); }
+            tok_embedded = true;
+            tpath = "embedded:" + o.model;
+        }
+        if (tpath.empty() && !o.model.empty()) {
+            std::string base = o.model;
+            if (base.size() > 3 && base.compare(base.size() - 3, 3, ".qv") == 0) base.resize(base.size() - 3);
+            size_t sl = base.find_last_of('/');
+            std::string dir = sl == std::string::npos ? "." : base.substr(0, sl);
+            for (std::string cand : {base + ".tokenizer.json", dir + "/../Qwen3.8-27B/tokenizer.json", dir + "/tokenizer.json"})
+                if (exists(cand)) { tpath = cand; break; }
+        }
+        if (tpath.empty()) throw std::runtime_error("no tokenizer: the model file has no embedded tokenizer.json (embed one with tools/qv_embed.py) and none was found next to it; pass --tokenizer PATH");
+        if (!tok_embedded) {
+            try { tok = qv::Tokenizer::load(tpath); }
+            catch (const std::exception& e) { throw std::runtime_error(std::string("tokenizer: ") + e.what()); }
+        }
+        tokenizer_path = tpath;
+        for (const char* s : {"<|im_end|>", "<|endoftext|>", "<|content_model_end_sampling|>"}) { int id = tok.token_id(s); if (id >= 0) stop_ids.push_back(id); }
+        eos_id = tok.token_id("<|im_end|>");
+        if (eos_id < 0) eos_id = tok.token_id("<|content_model_end_sampling|>");
+        bos_id = tok.token_id("<|endoftext|>");
+        if (emb && emb->has_blob("generation_config.json")) {
+            try {
+                qv::jd::Value gc = qv::jd::parse(emb->blob("generation_config.json"));
+                std::vector<int> eos;
+                if (const qv::jd::Value* e = gc.find("eos_token_id")) { if (e->is_array()) for (auto& v : e->items()) eos.push_back((int)v.as_int()); else if (e->is_number()) eos.push_back((int)e->as_int()); }
+                for (int id : eos)
+                    if (id >= 0 && id < tok.vocab_size() && std::find(stop_ids.begin(), stop_ids.end(), id) == stop_ids.end()) stop_ids.push_back(id);
+                if (!eos.empty() && eos_id < 0 && eos[0] >= 0 && eos[0] < tok.vocab_size()) eos_id = eos[0];
+                if (const qv::jd::Value* b = gc.find("bos_token_id")) if (b->is_number() && bos_id < 0) bos_id = (int)b->as_int();
+                if (o.embedded_defaults) {
+                    auto num = [&](const char* k, const char* flag, auto& dst) {
+                        const qv::jd::Value* v = gc.find(k);
+                        if (!v || !v->is_number() || o.given.count(flag)) return;
+                        dst = (std::decay_t<decltype(dst)>)v->as_double();
+                        embedded_applied += std::string(embedded_applied.empty() ? "" : ", ") + flag + "=" + v->dump();
+                    };
+                    num("temperature", "temp", o.temp);
+                    num("top_k", "top-k", o.top_k);
+                    num("top_p", "top-p", o.top_p);
+                }
+            } catch (const std::exception& e) { std::fprintf(stderr, "warning: embedded generation_config.json ignored: %s\n", e.what()); }
+        }
+        fim_pre = tok.token_id("<|fim_prefix|>");
+        fim_suf = tok.token_id("<|fim_suffix|>");
+        fim_mid = tok.token_id("<|fim_middle|>");
+        fim_rep = tok.token_id("<|repo_name|>");
+        fim_sep = tok.token_id("<|file_sep|>");
+        template_source = "none";
+        if (emb && emb->has_blob("chat_template.jinja")) {
+            model_template = std::string(emb->blob("chat_template.jinja"));
+            template_source = "embedded";
+        } else if (!tok_embedded) {
+            std::string tp = tpath.substr(0, tpath.find_last_of('/') == std::string::npos ? 0 : tpath.find_last_of('/')) + "/chat_template.jinja";
+            std::ifstream f(tp, std::ios::binary);
+            if (f) { std::stringstream ss; ss << f.rdbuf(); model_template = ss.str(); template_source = "sidecar"; }
+        }
+        {
+            std::string warn, over = o.chat_template;
+            if (!o.chat_template_file.empty()) {
+                std::ifstream f(o.chat_template_file, std::ios::binary);
+                if (!f) throw std::runtime_error("failed to open chat template file " + o.chat_template_file);
+                std::stringstream ss; ss << f.rdbuf(); over = ss.str();
+            }
+            if (!over.empty()) template_source = "override";
+            tmpl = std::make_unique<ChatTemplates>(model_template, over, o.jinja, warn);
+            if (!warn.empty()) std::fprintf(stderr, "warning: %s\n", warn.c_str());
+        }
+        if (emb && !embedded_blobs.empty()) {
+            std::string names;
+            for (auto& n : embedded_blobs) names += (names.empty() ? "" : ", ") + n;
+            std::fprintf(stderr, "[qv_server] embedded in the model: %s; tokenizer=%s, chat template=%s%s%s\n", names.c_str(), tok_embedded ? "embedded" : "explicit/sidecar", template_source.c_str(),
+                         embedded_applied.empty() ? "" : ", sampling defaults from generation_config: ", embedded_applied.c_str());
+        }
+        slk.unlock();
+
+        std::string backend = o.backend;
+#ifdef QV_HAVE_CUDA
+        if (backend == "auto") {
+            int n = 0;
+            backend = (!(o.ngl_given && o.n_gpu_layers == 0) && cudaGetDeviceCount(&n) == cudaSuccess && n > 0) ? "cuda" : "cpu";
+        }
+#else
+        if (backend == "auto") backend = "cpu";
+#endif
+        if (backend != "cpu" && backend != "cuda" && backend != "mock") throw std::runtime_error("--backend must be cuda, cpu, auto or mock");
+
+        qv::EngineOptions eo;
+        eo.max_ctx = o.ctx;
+        eo.kv_mode = o.kv_mode;
+        eo.kv4_kmode = o.kv4_kmode;
+        eo.mtp = o.mtp;
+        eo.mtp_depth = o.mtp_depth;
+        eo.threads = o.threads > 0 ? o.threads : (int)std::min(32u, std::max(1u, std::thread::hardware_concurrency()));
+        chunk = o.prefill_chunk > 0 ? o.prefill_chunk : (o.ubatch > 0 ? o.ubatch : (backend == "cuda" ? 2048 : 256));
+        eo.prefill_chunk = chunk;
+        mtp_chunk = 8;
+
+        Options mo = o;
+        auto make_engine = [this, backend, stem, eo, mo]() mutable -> std::unique_ptr<qv::Engine> {
+            std::unique_ptr<qv::Engine> e;
+            if (backend == "mock") {
+                if (const char* ms = std::getenv("QV_MOCK_LOAD_MS")) std::this_thread::sleep_for(std::chrono::milliseconds(std::atoi(ms)));
+                auto script = tok.encode(mo.mock_text, false);
+                e = std::make_unique<qv::MockEngine>(tok.vocab_size(), script, eos_id, mo.mock_loop, mo.mock_delay_us);
+            } else {
+                if (mo.model.empty()) throw std::runtime_error("no model: pass -m MODEL (or set LLAMA_ARG_MODEL)");
+                qv::ModelFile mf = qv::ModelFile::open(stem);
+                if (eo.mtp && mf.cfg.arch == "inkling2_loop") {
+                    std::string base = stem.size() > 3 && stem.compare(stem.size() - 3, 3, ".qv") == 0 ? stem.substr(0, stem.size() - 3) : stem;
+                    auto ex = [](const std::string& f) { return std::ifstream(f).good(); };
+                    if (!mo.mtp_file.empty()) eo.mtp_file = mo.mtp_file;
+                    else if (ex(base + "-mtp.qv")) eo.mtp_file = base + "-mtp.qv";
+                    else {
+                        const size_t d = base.rfind('-'), sl = base.rfind('/');
+                        const std::string alt = d != std::string::npos && (sl == std::string::npos || d > sl) ? base.substr(0, d) + "-mtp.qv" : "";
+                        if (!alt.empty() && ex(alt)) eo.mtp_file = alt;
+                        else throw std::runtime_error("--mtp: MTP sidecar not found (tried " + base + "-mtp.qv" + (alt.empty() ? "" : " and " + alt) + "); pass --mtp-file PATH");
+                    }
+                    mtp_chunk = 32;
+                    if (eo.mtp_depth == 1) eo.mtp_depth = 3;
+                }
+                if (backend == "cpu") {
+#ifdef QV_HAVE_CPU
+                    e = qv::make_cpu_engine(mf, eo);
+#else
+                    throw std::runtime_error("this build has no CPU engine");
+#endif
+                } else {
+#ifdef QV_HAVE_CUDA
+                    e = qv::make_cuda_engine(mf, eo);
+#else
+                    throw std::runtime_error("this build has no CUDA engine (configure with -DQV_CUDA=ON)");
+#endif
+                }
+            }
+            return e;
+        };
+
+        auto new_eng = make_engine();
+        std::string arch = backend == "mock" ? "mock" : new_eng->config().arch;
+        int ceos = backend == "mock" ? -1 : new_eng->config().eos;
+        int hidden = backend == "mock" ? 0 : new_eng->config().hidden;
+        long long wbytes = backend == "mock" ? 0 : (long long)new_eng->device_bytes_weights();
+        new_eng->sync();
+
+        // ---- vision sidecar (Inkling image input)
+        std::unique_ptr<vision::Encoder> new_venc;
+        std::string vf = o.vision_file;
+        if (vf.empty() && !o.model.empty() && arch == "inkling2_loop") {
+            std::string base = o.model;
+            if (base.size() > 3 && base.compare(base.size() - 3, 3, ".qv") == 0) base.resize(base.size() - 3);
+            const size_t sl = base.find_last_of('/');
+            const std::string dir = sl == std::string::npos ? "." : base.substr(0, sl);
+            std::string fam = base;
+            if (const size_t d = fam.find_last_of('-'); d != std::string::npos && d > sl + 1) fam.resize(d);
+            for (const std::string& cand : {base + "-vision.qv", fam + "-vision.qv", dir + "/inkling2-mini-vision.qv"})
+                if (exists(cand)) { vf = cand; break; }
+        }
+        if (vf == "mock") {
+            new_venc = std::make_unique<qv::MockVisionEncoder>();
+        } else if (!vf.empty() && vf != "none") {
+            const bool cu = backend == "cuda";
+            new_venc = qv::vision::Encoder::create(vf, cu);
+            std::fprintf(stderr, "[qv_server] vision: %s (%s encoder, image tokens = ceil(h/40)*ceil(w/40), remote images %s, local root '%s')\n", vf.c_str(), new_venc->backend(),
+                         o.allow_remote_images ? "ALLOWED" : "off", o.image_root.c_str());
+        }
+
+        slk.lock();
+        eng = std::move(new_eng);
+        model_arch = arch;
+        if (ceos >= 0) {
+            if (std::find(stop_ids.begin(), stop_ids.end(), ceos) == stop_ids.end()) stop_ids.push_back(ceos);
+            if (eos_id < 0) eos_id = ceos;
+        }
+        cached_n_embd = hidden;
+        cached_weight_bytes = wbytes;
+        reload_engine = make_engine;
+        backend_name = backend;
+        venc = std::move(new_venc);
+        if (venc) {
+            image_token_id = tok.token_id(o.image_token);
+            if (image_token_id < 0) throw std::runtime_error("image token " + o.image_token + " is not in the tokenizer");
+            vsrc.allow_remote = o.allow_remote_images;
+            vsrc.limits.max_side = o.image_max_side;
+            std::error_code ec;
+            vsrc.local_root = o.image_root.empty() ? "" : std::filesystem::absolute(o.image_root, ec).string();
+        }
+        active_preset_id = forced_id;
+    } catch (...) {
+        unload_model();
+        throw;
+    }
+}
+
+long App::acquire_model_lease(const std::string& requested_model, const std::function<bool()>& alive) {
+    if (!has_presets()) return -1;
+    const ModelPreset* p = find_preset(requested_model);
+    if (!p) throw_error(404, "The model '" + requested_model + "' does not exist", "model_not_found");
+    long ticket = lease_acquire(alive);
+    if (ticket < 0) return -2;
+    if (active_preset_id != p->id || !eng) {
+        auto t0 = Clock::now();
+        std::string prev = active_preset_id;
+        try {
+            load_model(p->opts, p->id);
+        } catch (const std::exception& e) {
+            release_model_lease(ticket);
+            throw_error(503, std::string("failed to load model '") + p->id + "': " + e.what(), "unavailable_error");
+        }
+        if (o.verbosity >= 3 && !o.log_disable) {
+            if (prev.empty())
+                std::fprintf(stderr, "[qv_server] loaded preset '%s' in %.1fs (backend=%s, n_ctx=%d, mtp=%d)\n",
+                             p->id.c_str(), std::chrono::duration<double>(Clock::now() - t0).count(), backend_name.c_str(), n_ctx, (int)o.mtp);
+            else
+                std::fprintf(stderr, "[qv_server] switched model '%s' -> '%s' in %.1fs (backend=%s, n_ctx=%d, mtp=%d)\n",
+                             prev.c_str(), p->id.c_str(), std::chrono::duration<double>(Clock::now() - t0).count(), backend_name.c_str(), n_ctx, (int)o.mtp);
+        }
+    }
+    return ticket;
+}
+
+void App::release_model_lease(long ticket) {
+    if (ticket < 0) return;
+    last_task_ms_ = mono_ms();
+    lease_release(ticket);
+}
+
 }  // namespace qv::server

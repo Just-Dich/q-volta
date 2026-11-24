@@ -121,7 +121,7 @@ ToolGrammar tool_call_grammar(const jd::Value& tools, const ToolGrammarOptions& 
                         std::string u = add_until_rule(b, pn + "-text", "\n</parameter>");
                         item = pre + " " + u + " " + q("\n");
                     } else {
-                        std::string v = b.add_schema(pn, sch);
+                        std::string v = b.add_schema(pn, sch, &d.params);
                         item = pre + " " + v + " " + q("\n</parameter>\n");
                     }
                     body += (required ? " " + item : " (" + item + ")?");

@@ -251,7 +251,7 @@ void App::parse_sampling(const Value& bv, Task& t) {
         s.dry_sequence_breakers.clear();
         for (auto& x : v->items()) if (x.is_string()) s.dry_sequence_breakers.push_back(x.as_string());
     }
-    for (auto& br : s.dry_sequence_breakers) { auto ids = tok.encode(br, false); if (!ids.empty()) s.dry_breaker_tokens.push_back(ids); }
+    if (tok.vocab_size() > 0) for (auto& br : s.dry_sequence_breakers) { auto ids = tok.encode(br, false); if (!ids.empty()) s.dry_breaker_tokens.push_back(ids); }
     s.mirostat = b.integer("mirostat", o.mirostat);
     s.mirostat_tau = (float)b.num("mirostat_tau", o.mirostat_tau);
     s.mirostat_eta = (float)b.num("mirostat_eta", o.mirostat_eta);
@@ -558,12 +558,12 @@ void App::prefill_with_images(const Task& t, int off, int n, const std::vector<s
     eng->prefill_embeds(ids.data(), rows.data(), mask.data(), n, off);
 }
 
-GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::function<bool(const Chunk&)>& on_chunk, const std::function<void(int)>& on_start) {
+GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::function<bool(const Chunk&)>& on_chunk, const std::function<void(int)>& on_start, long existing_ticket) {
     GenResult r;
     // ---- admission: FIFO ticket, slots are logical (one engine)
-    long ticket = lease_acquire(alive);
+    long ticket = existing_ticket >= 0 ? existing_ticket : lease_acquire(alive);
     if (ticket < 0) { r.aborted = true; return r; }
-    struct Release { App& a; long ticket; ~Release() { a.last_task_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count(); a.lease_release(ticket); } } rel{*this, ticket};
+    struct Release { App& a; long ticket; bool own; ~Release() { a.last_task_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count(); if (own) a.lease_release(ticket); } } rel{*this, ticket, existing_ticket < 0};
     try { ensure_engine(); } catch (const std::exception& e) { throw_error(503, std::string("model reload failed: ") + e.what(), "unavailable_error"); }
 
     int sid = 0;
