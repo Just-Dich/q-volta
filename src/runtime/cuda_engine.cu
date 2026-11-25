@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -402,6 +403,14 @@ class CudaEngine final : public Engine {
     int *d_v_, *d_m_, *d_draft_, *d_varg_, *h_a_, *h_b_, *h_res_;  // d_v_: [tok NTM | pos NTM]; d_m_: [tok | pos | chain pos]
     float *snap_gdn_ = nullptr, *snap_conv_ = nullptr;
     cudaGraphExec_t vgraph_[NTM_MAX + 1] = {};
+    static constexpr int SPEC_MAX_CAND = 4096;
+    int* d_scand_id_ = nullptr;
+    float* d_scand_val_ = nullptr;
+    CandMeta* d_smeta_ = nullptr;
+    std::vector<CandMeta> h_smeta_;
+    std::vector<int> h_scand_id_;
+    std::vector<float> h_scand_val_;
+    std::vector<float> h_sfull_;
 
     void alloc_mtp() {
         const Config& c = cfg_;
@@ -445,6 +454,13 @@ class CudaEngine final : public Engine {
         QV_CUDA_CHECK(cudaMallocHost(&h_res_, 2 * N * sizeof(int)));
         snap_gdn_ = dalloc<float>((size_t)(N - 1) * gdn_bytes_ / 4);
         snap_conv_ = dalloc<float>((size_t)(N - 1) * conv_bytes_ / 4);
+        d_scand_id_ = dalloc<int>((size_t)N * SPEC_MAX_CAND);
+        d_scand_val_ = dalloc<float>((size_t)N * SPEC_MAX_CAND);
+        d_smeta_ = dalloc<CandMeta>(N);
+        h_smeta_.resize(N);
+        h_scand_id_.resize((size_t)N * SPEC_MAX_CAND);
+        h_scand_val_.resize((size_t)N * SPEC_MAX_CAND);
+        h_sfull_.resize(V);
         const char* e = std::getenv("QV_MTP_PROF");
         mtp_prof_ = e && e[0] == '1';
         const char* g = std::getenv("QV_MTP_GRAPH");
@@ -593,7 +609,21 @@ class CudaEngine final : public Engine {
         prefill_layer(mtp_L_, nf, pos0, pf_m_);
     }
 
-    void decode_mtp(int first, int start_pos, int n, std::vector<int>& out) {
+    int masked_argmax_from_gpu(const float* d_logits_row, TokenConstraint* tc) {
+        const int V = cfg_.vocab;
+        if ((int)h_sfull_.size() < V) h_sfull_.resize(V);
+        QV_CUDA_CHECK(cudaMemcpyAsync(h_sfull_.data(), d_logits_row, (size_t)V * 4, cudaMemcpyDeviceToHost, stream_));
+        QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
+        if (tc && !tc->awaiting()) tc->mask_logits(h_sfull_.data(), (size_t)V);
+        int best = 0;
+        float bv = h_sfull_[0];
+        for (int i = 1; i < V; ++i) {
+            if (h_sfull_[i] > bv) { bv = h_sfull_[i]; best = i; }
+        }
+        return best;
+    }
+
+    void decode_mtp(int first, int start_pos, int n, std::vector<int>& out, TokenConstraint* tc = nullptr) {
         using clk = std::chrono::steady_clock;
         auto ms = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
         const Config& c = cfg_;
@@ -614,10 +644,15 @@ class CudaEngine final : public Engine {
                 forward();
                 QV_CUDA_CHECK(cudaMemcpyAsync(hlast_, xn_, H * 4, cudaMemcpyDeviceToDevice, stream_));
                 cur = argmax();
+                if (tc && !tc->try_accept(cur)) {
+                    cur = masked_argmax_from_gpu(logits_, tc);
+                    (void)tc->try_accept(cur);
+                }
                 out[produced++] = cur;
                 p += 1;
                 mtp_st_.plain_steps++;
                 mtp_st_.plain_ms += ms(t0, clk::now());
+                if (tc && (tc->is_eog(cur) || tc->is_dead())) break;
                 continue;
             }
             t0 = clk::now();
@@ -631,11 +666,29 @@ class CudaEngine final : public Engine {
             QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
             auto t1 = clk::now();
             int m = 0;
-            while (m < NT - 1 && h_res_[m] == h_res_[NTM_ + m]) ++m;
+            int n_acc = 0;
+            bool stop_chunk = false;
+            if (!tc) {
+                while (m < NT - 1 && h_res_[m] == h_res_[NTM_ + m]) ++m;
+                n_acc = m;
+            } else {
+                for (int j = 0; j < NT; ++j) {
+                    int target = h_res_[j];
+                    if (!tc->try_accept(target)) {
+                        target = masked_argmax_from_gpu(vlogits_ + (size_t)j * V, tc);
+                        (void)tc->try_accept(target);
+                    }
+                    h_res_[j] = target;
+                    const bool matched_draft = (j < NT - 1 && target == h_res_[NTM_ + j]);
+                    if (matched_draft) n_acc = j + 1;
+                    if (tc->is_eog(target) || tc->is_dead()) { m = j; stop_chunk = true; break; }
+                    if (!matched_draft) { m = j; break; }
+                }
+            }
             mtp_st_.verify_ms += ms(t0, t1);
             mtp_st_.cycles++;
             mtp_st_.drafted += NT - 1;
-            mtp_st_.accepted += m;
+            mtp_st_.accepted += n_acc;
             for (int j = 0; j <= m; ++j) out[produced++] = h_res_[j];
             QV_CUDA_CHECK(cudaMemcpyAsync(logits_, vlogits_ + (size_t)m * V, (size_t)V * 4, cudaMemcpyDeviceToDevice, stream_));
             QV_CUDA_CHECK(cudaMemcpyAsync(hlast_, vxn_ + (size_t)m * H, (size_t)H * 4, cudaMemcpyDeviceToDevice, stream_));
@@ -644,15 +697,230 @@ class CudaEngine final : public Engine {
                 QV_CUDA_CHECK(cudaMemcpyAsync(gdn_state_, snap_gdn_ + (size_t)m * (gdn_bytes_ / 4), gdn_bytes_, cudaMemcpyDeviceToDevice, stream_));
             }
             cur = h_res_[m];
-            if (produced < n) {
+            if (!stop_chunk && produced < n) {
                 Dd = std::min(D, n - produced - 1);
                 if (Dd > 0) mtp_draft(m + 1, h_res_, vxn_, p, Dd);
             }
             p += m + 1;
             if (mtp_prof_) { QV_CUDA_CHECK(cudaStreamSynchronize(stream_)); mtp_st_.draft_ms += ms(t1, clk::now()); }
+            if (stop_chunk) break;
         }
+        out.resize(produced);
         QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
         mtp_ready_ = p;
+    }
+
+    void extract_gpu_rows(const float* d_logits_base, int n_rows, float margin) {
+        const int V = cfg_.vocab;
+        for (int t = 0; t < n_rows; ++t) {
+            extract_top_candidates(d_logits_base + (size_t)t * V, V, margin, SPEC_MAX_CAND,
+                                   d_scand_id_ + (size_t)t * SPEC_MAX_CAND,
+                                   d_scand_val_ + (size_t)t * SPEC_MAX_CAND,
+                                   d_smeta_ + t, stream_);
+        }
+        QV_CUDA_CHECK(cudaMemcpyAsync(h_smeta_.data(), d_smeta_, (size_t)n_rows * sizeof(CandMeta), cudaMemcpyDeviceToHost, stream_));
+        QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
+        bool any_copy = false;
+        for (int t = 0; t < n_rows; ++t) {
+            const int cnt = h_smeta_[t].count;
+            if (cnt > 0 && cnt <= SPEC_MAX_CAND) {
+                QV_CUDA_CHECK(cudaMemcpyAsync(h_scand_id_.data() + (size_t)t * SPEC_MAX_CAND,
+                                              d_scand_id_ + (size_t)t * SPEC_MAX_CAND,
+                                              (size_t)cnt * sizeof(int), cudaMemcpyDeviceToHost, stream_));
+                QV_CUDA_CHECK(cudaMemcpyAsync(h_scand_val_.data() + (size_t)t * SPEC_MAX_CAND,
+                                              d_scand_val_ + (size_t)t * SPEC_MAX_CAND,
+                                              (size_t)cnt * sizeof(float), cudaMemcpyDeviceToHost, stream_));
+                any_copy = true;
+            }
+        }
+        if (any_copy) QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
+    }
+
+    void build_dist_for_row(const float* d_logits_base, int row, float margin,
+                            const SpecSamplingParams& sp, TokenConstraint* tc, SpecDist& out_dist) {
+        const int V = cfg_.vocab;
+        bool ok = false;
+        if (margin >= 0.0f) {
+            const CandMeta& md = h_smeta_[row];
+            ok = md.count > 0 && md.count <= SPEC_MAX_CAND &&
+                 build_dist_from_candidates(h_scand_id_.data() + (size_t)row * SPEC_MAX_CAND,
+                                            h_scand_val_.data() + (size_t)row * SPEC_MAX_CAND,
+                                            md.count, md.mx, (double)md.sum_exp, sp, out_dist, tc);
+        }
+        if (!ok) {
+            if ((int)h_sfull_.size() < V) h_sfull_.resize(V);
+            QV_CUDA_CHECK(cudaMemcpyAsync(h_sfull_.data(), d_logits_base + (size_t)row * V, (size_t)V * 4, cudaMemcpyDeviceToHost, stream_));
+            QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
+            build_dist_dense(h_sfull_.data(), V, sp, out_dist, tc);
+        }
+    }
+
+    void build_dists_from_gpu(const float* d_logits_base, int n_rows, const SpecSamplingParams& sp,
+                              SpecDist* out_dists, TokenConstraint* tc = nullptr) {
+        const float margin = spec_candidate_margin(sp);
+        if (margin >= 0.0f) extract_gpu_rows(d_logits_base, n_rows, margin);
+        for (int t = 0; t < n_rows; ++t) build_dist_for_row(d_logits_base, t, margin, sp, tc, out_dists[t]);
+    }
+
+    void mtp_draft_speculative(int nt, const int* nxt, const float* hid, int q0, int Dd,
+                               const SpecSamplingParams& sp, std::mt19937_64& rng,
+                               int* drafts_out, SpecDist* q_out) {
+        for (int t = 0; t < nt; ++t) { h_b_[t] = nxt[t]; h_b_[NTM_ + t] = q0 + t; }
+        for (int j = 1; j < Dd; ++j) h_b_[2 * NTM_ + j - 1] = q0 + nt - 1 + j;
+        QV_CUDA_CHECK(cudaMemcpyAsync(d_m_, h_b_, 3 * NTM_ * sizeof(int), cudaMemcpyHostToDevice, stream_));
+        const int kind = hid == hlast_ ? 0 : nt;
+        graph_run(kind, [&] { mtp_run(nt, d_m_, hid, d_m_ + NTM_, d_draft_); });
+        build_dists_from_gpu(mlogits_, 1, sp, &q_out[0]);
+        drafts_out[0] = sample_dist(q_out[0], rng);
+        for (int j = 1; j < Dd; ++j) {
+            QV_CUDA_CHECK(cudaMemcpyAsync(d_draft_ + (j - 1), &drafts_out[j - 1], sizeof(int), cudaMemcpyHostToDevice, stream_));
+            graph_run(NTM_ + j, [&] { mtp_run(1, d_draft_ + j - 1, mhid_, d_m_ + 2 * NTM_ + j - 1, d_draft_ + j); });
+            build_dists_from_gpu(mlogits_, 1, sp, &q_out[j]);
+            drafts_out[j] = sample_dist(q_out[j], rng);
+        }
+        if (Dd > 0) QV_CUDA_CHECK(cudaMemcpyAsync(d_draft_, drafts_out, (size_t)Dd * sizeof(int), cudaMemcpyHostToDevice, stream_));
+    }
+
+    void decode_mtp_speculative(int first, int start_pos, int n, const SpecSamplingParams& sp, std::vector<int>& out,
+                                TokenConstraint* tc = nullptr) {
+        using clk = std::chrono::steady_clock;
+        auto ms = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+        const Config& c = cfg_;
+        const int H = c.hidden, V = c.vocab, D = opt_.mtp_depth;
+        const float margin = spec_candidate_margin(sp);
+        std::mt19937_64 rng(sp.seed);
+        out.resize(n);
+        int cur = first, p = start_pos, produced = 0;
+        int drafts[NTM_MAX] = {};
+        SpecDist q_dists[NTM_MAX];
+        auto t0 = clk::now();
+        int Dd = std::min(D, n - 1);
+        if (Dd > 0) mtp_draft_speculative(1, &cur, hlast_, p - 1, Dd, sp, rng, drafts, q_dists);
+        if (mtp_prof_) { QV_CUDA_CHECK(cudaStreamSynchronize(stream_)); mtp_st_.draft_ms += ms(t0, clk::now()); }
+        while (produced < n) {
+            const int NT = std::min(D + 1, n - produced);
+            if (NT == 1 || p + 2 * D + 3 >= opt_.max_ctx) {
+                t0 = clk::now();
+                h_tp_[0] = cur;
+                h_tp_[1] = p;
+                QV_CUDA_CHECK(cudaMemcpyAsync(d_tok_, h_tp_, 2 * sizeof(int), cudaMemcpyHostToDevice, stream_));
+                forward();
+                QV_CUDA_CHECK(cudaMemcpyAsync(hlast_, xn_, H * 4, cudaMemcpyDeviceToDevice, stream_));
+                SpecDist tail_p;
+                build_dists_from_gpu(logits_, 1, sp, &tail_p, tc);
+                cur = sample_dist(tail_p, rng);
+                if (tc) (void)tc->try_accept(cur);
+                out[produced++] = cur;
+                p += 1;
+                mtp_st_.plain_steps++;
+                mtp_st_.plain_ms += ms(t0, clk::now());
+                if (tc && (tc->is_eog(cur) || tc->is_dead())) break;
+                continue;
+            }
+            t0 = clk::now();
+            for (int t = 0; t < NTM_; ++t) h_a_[NTM_ + t] = p + t;
+            h_a_[0] = cur;
+            QV_CUDA_CHECK(cudaMemcpyAsync(d_v_, h_a_, 2 * NTM_ * sizeof(int), cudaMemcpyHostToDevice, stream_));
+            QV_CUDA_CHECK(cudaMemcpyAsync(d_v_ + 1, d_draft_, (NT - 1) * sizeof(int), cudaMemcpyDeviceToDevice, stream_));
+            run_verify(NT);
+            if (margin >= 0.0f) extract_gpu_rows(vlogits_, NT, margin);
+            auto t1 = clk::now();
+            int m = 0;
+            int n_acc = 0;
+            bool stop_chunk = false;
+            int accepted_seq[NTM_MAX];
+            for (int j = 0; j < NT; ++j) {
+                SpecDist pj;
+                build_dist_for_row(vlogits_, j, margin, sp, tc, pj);
+                if (j < NT - 1 && spec_accept(pj, q_dists[j], drafts[j], rng)) {
+                    accepted_seq[j] = drafts[j];
+                    n_acc = j + 1;
+                    if (tc) {
+                        (void)tc->try_accept(drafts[j]);
+                        if (tc->is_eog(drafts[j]) || tc->is_dead()) { m = j; stop_chunk = true; break; }
+                    }
+                    m = j + 1;
+                } else {
+                    const int final_tok = (j < NT - 1) ? sample_residual(pj, q_dists[j], rng) : sample_dist(pj, rng);
+                    accepted_seq[j] = final_tok;
+                    if (tc) {
+                        (void)tc->try_accept(final_tok);
+                        if (tc->is_eog(final_tok) || tc->is_dead()) stop_chunk = true;
+                    }
+                    m = j;
+                    break;
+                }
+            }
+            mtp_st_.verify_ms += ms(t0, t1);
+            mtp_st_.cycles++;
+            mtp_st_.drafted += NT - 1;
+            mtp_st_.accepted += n_acc;
+            for (int j = 0; j <= m; ++j) out[produced++] = accepted_seq[j];
+            QV_CUDA_CHECK(cudaMemcpyAsync(logits_, vlogits_ + (size_t)m * V, (size_t)V * 4, cudaMemcpyDeviceToDevice, stream_));
+            QV_CUDA_CHECK(cudaMemcpyAsync(hlast_, vxn_ + (size_t)m * H, (size_t)H * 4, cudaMemcpyDeviceToDevice, stream_));
+            if (m < NT - 1) {
+                QV_CUDA_CHECK(cudaMemcpyAsync(conv_state_, snap_conv_ + (size_t)m * (conv_bytes_ / 4), conv_bytes_, cudaMemcpyDeviceToDevice, stream_));
+                QV_CUDA_CHECK(cudaMemcpyAsync(gdn_state_, snap_gdn_ + (size_t)m * (gdn_bytes_ / 4), gdn_bytes_, cudaMemcpyDeviceToDevice, stream_));
+            }
+            cur = accepted_seq[m];
+            if (!stop_chunk && produced < n) {
+                Dd = std::min(D, n - produced - 1);
+                if (Dd > 0) mtp_draft_speculative(m + 1, accepted_seq, vxn_, p, Dd, sp, rng, drafts, q_dists);
+            }
+            p += m + 1;
+            if (mtp_prof_) { QV_CUDA_CHECK(cudaStreamSynchronize(stream_)); mtp_st_.draft_ms += ms(t1, clk::now()); }
+            if (stop_chunk) break;
+        }
+        out.resize(produced);
+        QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
+        mtp_ready_ = p;
+    }
+
+    bool has_speculative_decode() const override { return opt_.mtp && mtp_on_; }
+    bool has_constrained_mtp() const override { return opt_.mtp && mtp_on_; }
+    void decode_speculative(int first, int start_pos, int n, const SpecSamplingParams& sp, std::vector<int>& out) override {
+        decode_speculative_constrained(first, start_pos, n, sp, out, nullptr);
+    }
+    void decode_greedy_constrained(int first, int start_pos, int n, std::vector<int>& out, TokenConstraint* tc) override {
+        if (start_pos + n > opt_.max_ctx) throw std::runtime_error("context overflow");
+        if (opt_.mtp && mtp_on_ && n >= 2 && mtp_ready_ == start_pos) {
+            decode_mtp(first, start_pos, n, out, tc);
+            return;
+        }
+        out.clear();
+        int tok = first;
+        for (int i = 0; i < n; ++i) {
+            step(tok, start_pos + i);
+            int cand = argmax();
+            if (tc && !tc->try_accept(cand)) {
+                cand = masked_argmax_from_gpu(logits_, tc);
+                (void)tc->try_accept(cand);
+            }
+            out.push_back(cand);
+            tok = cand;
+            if (tc && (tc->is_eog(cand) || tc->is_dead())) break;
+        }
+    }
+    void decode_speculative_constrained(int first, int start_pos, int n, const SpecSamplingParams& sp,
+                                        std::vector<int>& out, TokenConstraint* tc) override {
+        if (start_pos + n > opt_.max_ctx) throw std::runtime_error("context overflow");
+        if (opt_.mtp && mtp_on_ && n >= 2 && mtp_ready_ == start_pos) {
+            decode_mtp_speculative(first, start_pos, n, sp, out, tc);
+            return;
+        }
+        std::mt19937_64 rng(sp.seed);
+        SpecDist dist;
+        out.clear();
+        int tok = first;
+        for (int i = 0; i < n; ++i) {
+            step(tok, start_pos + i);
+            logits(h_sfull_);
+            build_dist_dense(h_sfull_.data(), cfg_.vocab, sp, dist, tc);
+            tok = sample_dist(dist, rng);
+            if (tc) (void)tc->try_accept(tok);
+            out.push_back(tok);
+            if (tc && (tc->is_eog(tok) || tc->is_dead())) break;
+        }
     }
 
     // The verify pass reads tokens/positions from device memory only, so it is captured once per row count and replayed.

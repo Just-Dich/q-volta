@@ -728,7 +728,10 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
                 sampler.set_mask(gmask);
             }
             const bool grammar_active_init = gmask && !gmask->state().awaiting_trigger();
-            bool argmax_ok = t.sp.engine_argmax_ok() && !grammar_active_init;  // active constraints sample on host logits
+            const bool mtp_gram = o.mtp && o.mtp_grammar && gmask && eng->has_constrained_mtp();
+            bool argmax_ok = t.sp.engine_argmax_ok() && !grammar_active_init;  // fetch()/finish() fast argmax (never bypasses active grammar)
+            bool chunk_greedy_ok = t.sp.engine_argmax_ok() && (!grammar_active_init || mtp_gram);
+            bool spec_ok = !t.sp.engine_argmax_ok() && t.sp.speculative_ok() && eng->has_speculative_decode() && (!grammar_active_init || mtp_gram);
             sampler.want_post_ = t.post_probs && t.n_probs > 0;
             Tokenizer::Decoder dec(tok);
             std::string pending;      // decoded text not yet emitted (held back for stop-string / utf-8)
@@ -738,7 +741,7 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
             size_t la_base_pos = 0;  // cached_.size() right before the current lookahead chunk (position of `first`)
             bool la_saved = false;   // whether eng->state_save() was taken at la_base_pos
             const bool want_probs = t.n_probs > 0;
-            bool use_chunk = o.mtp && argmax_ok && !want_probs && !t.reasoning_end;
+            bool use_chunk = o.mtp && (chunk_greedy_ok || spec_ok) && !want_probs && !t.reasoning_end;
             std::vector<int> forced;
             int reason_toks = 0;
             bool budget_hit = false;
@@ -752,8 +755,8 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
                 return (t.thinking_open || seen.find(t.think_start) != std::string::npos) && seen.find(t.think_end) == std::string::npos;
             };
             if (std::getenv("QV_MTP_DEBUG"))
-                std::fprintf(stderr, "[qv_server] use_chunk=%d (mtp=%d argmax_ok=%d constrained=%d lazy=%d probs=%d)\n",
-                             (int)use_chunk, (int)o.mtp, (int)argmax_ok, (int)constrained,
+                std::fprintf(stderr, "[qv_server] use_chunk=%d (mtp=%d argmax_ok=%d spec_ok=%d mtp_gram=%d constrained=%d lazy=%d probs=%d)\n",
+                             (int)use_chunk, (int)o.mtp, (int)argmax_ok, (int)spec_ok, (int)mtp_gram, (int)constrained,
                              (int)(gmask && gmask->state().awaiting_trigger()), (int)want_probs);
             Chunk ck;
             bool hit_stop_word = false;
@@ -845,58 +848,64 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
                 if (!alive()) { r.aborted = true; break; }
                 if (trigger_fired) {
                     argmax_ok = false;
-                    use_chunk = false;
-                    if (la < lookahead.size()) {
-                        // `tk` is lookahead[la - 1], already present in cached_ at index (la_base_pos + la).
-                        // Roll engine back to right after `tk` (cached_[0 .. keep_len)) and compute masked next token.
-                        const size_t keep_len = la_base_pos + la + 1;
-                        const size_t dropped = cached_.size() - keep_len;
+                    if (!mtp_gram) {
+                        chunk_greedy_ok = false;
+                        spec_ok = false;
+                        use_chunk = false;
+                        if (la < lookahead.size()) {
+                            // `tk` is lookahead[la - 1], already present in cached_ at index (la_base_pos + la).
+                            // Roll engine back to right after `tk` (cached_[0 .. keep_len)) and compute masked next token.
+                            const size_t keep_len = la_base_pos + la + 1;
+                            const size_t dropped = cached_.size() - keep_len;
+                            if (std::getenv("QV_MTP_DEBUG"))
+                                std::fprintf(stderr, "[qv_server] lazy grammar triggered at gen=%d (rollback=%zu tokens, fast=%d)\n",
+                                             n, dropped, (int)la_saved);
+                            lookahead.clear();
+                            la = 0;
+                            int fa = -1;
+                            if (la_saved) {
+                                cached_.resize(keep_len);
+                                EngOp op(*this, sid);
+                                eng->state_restore();
+                                for (size_t p = la_base_pos; p < keep_len; ++p) eng->step(cached_[p], (int)p);
+                                fa = fetch();
+                            } else {
+                                std::vector<int> replay(cached_.begin(), cached_.begin() + keep_len);
+                                { EngOp op(*this, sid); eng->reset(); }
+                                cached_.clear();
+                                for (size_t k = 0; k < t.images.size(); ++k) {
+                                    if (!img_emb[k].empty()) continue;
+                                    if (!alive()) { r.aborted = true; break; }
+                                    img_emb[k].resize((size_t)t.images[k].n * venc->cfg().text_hidden);
+                                    std::lock_guard<std::mutex> vlk(venc_mu_);
+                                    venc->encode(*t.images[k].px, img_emb[k].data());
+                                }
+                                if (r.aborted) break;
+                                for (size_t off = 0; off < keep_len;) {
+                                    if (!alive()) { r.aborted = true; break; }
+                                    const int ch = (multi_seq && n_busy_ > 1) ? std::min(chunk, std::max(1, shared_chunk)) : chunk;
+                                    const size_t lim = (!t.images.empty() && off < (size_t)N) ? (size_t)N : keep_len;
+                                    const int cnt = (int)std::min<size_t>(ch, lim - off);
+                                    { EngOp op(*this, sid);
+                                      if (!t.images.empty() && off < (size_t)N) prefill_with_images(t, (int)off, cnt, img_emb);
+                                      else eng->prefill(replay.data() + off, cnt, (int)off); }
+                                    cached_.insert(cached_.end(), replay.begin() + off, replay.begin() + off + cnt);
+                                    off += cnt;
+                                }
+                                if (r.aborted) break;
+                                { EngOp op(*this, sid); fa = fetch(); }
+                            }
+                            tk = finish(fa, tp, have_tp);
+                            continue;
+                        }
+                        // `tk` was either the very first token or the last token of lookahead: not yet fed into `eng`/`cached_`.
                         if (std::getenv("QV_MTP_DEBUG"))
-                            std::fprintf(stderr, "[qv_server] lazy grammar triggered at gen=%d (rollback=%zu tokens, fast=%d)\n",
-                                         n, dropped, (int)la_saved);
+                            std::fprintf(stderr, "[qv_server] lazy grammar triggered at gen=%d (no rollback)\n", n);
                         lookahead.clear();
                         la = 0;
-                        int fa = -1;
-                        if (la_saved) {
-                            cached_.resize(keep_len);
-                            EngOp op(*this, sid);
-                            eng->state_restore();
-                            for (size_t p = la_base_pos; p < keep_len; ++p) eng->step(cached_[p], (int)p);
-                            fa = fetch();
-                        } else {
-                            std::vector<int> replay(cached_.begin(), cached_.begin() + keep_len);
-                            { EngOp op(*this, sid); eng->reset(); }
-                            cached_.clear();
-                            for (size_t k = 0; k < t.images.size(); ++k) {
-                                if (!img_emb[k].empty()) continue;
-                                if (!alive()) { r.aborted = true; break; }
-                                img_emb[k].resize((size_t)t.images[k].n * venc->cfg().text_hidden);
-                                std::lock_guard<std::mutex> vlk(venc_mu_);
-                                venc->encode(*t.images[k].px, img_emb[k].data());
-                            }
-                            if (r.aborted) break;
-                            for (size_t off = 0; off < keep_len;) {
-                                if (!alive()) { r.aborted = true; break; }
-                                const int ch = (multi_seq && n_busy_ > 1) ? std::min(chunk, std::max(1, shared_chunk)) : chunk;
-                                const size_t lim = (!t.images.empty() && off < (size_t)N) ? (size_t)N : keep_len;
-                                const int cnt = (int)std::min<size_t>(ch, lim - off);
-                                { EngOp op(*this, sid);
-                                  if (!t.images.empty() && off < (size_t)N) prefill_with_images(t, (int)off, cnt, img_emb);
-                                  else eng->prefill(replay.data() + off, cnt, (int)off); }
-                                cached_.insert(cached_.end(), replay.begin() + off, replay.begin() + off + cnt);
-                                off += cnt;
-                            }
-                            if (r.aborted) break;
-                            { EngOp op(*this, sid); fa = fetch(); }
-                        }
-                        tk = finish(fa, tp, have_tp);
-                        continue;
+                    } else if (std::getenv("QV_MTP_DEBUG")) {
+                        std::fprintf(stderr, "[qv_server] lazy grammar triggered inside mtp_gram at gen=%d (continuing MTP)\n", n);
                     }
-                    // `tk` was either the very first token or the last token of lookahead: not yet fed into `eng`/`cached_`.
-                    if (std::getenv("QV_MTP_DEBUG"))
-                        std::fprintf(stderr, "[qv_server] lazy grammar triggered at gen=%d (no rollback)\n", n);
-                    lookahead.clear();
-                    la = 0;
                 }
                 // ---- next token
                 if (use_chunk) {
@@ -905,17 +914,37 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
                     if (budget >= 0) room = std::min(room, budget - n);
                     if (room >= 2) {
                         la_base_pos = cached_.size();
-                        la_saved = gmask != nullptr && !multi_seq && eng->has_state_save();
-                        {
+                        la_saved = gmask != nullptr && !mtp_gram && !multi_seq && eng->has_state_save();
+                        std::unique_ptr<grammar::GrammarTokenConstraint> gtc;
+                        if (mtp_gram) gtc = std::make_unique<grammar::GrammarTokenConstraint>(gmask->state().fork(), stop_ids);
+                        if (chunk_greedy_ok) {
                             EngOp op(*this, sid);
                             if (la_saved) eng->state_save();
-                            eng->decode_greedy(tk, (int)la_base_pos, room, lookahead, false);
+                            if (gtc) eng->decode_greedy_constrained(tk, (int)la_base_pos, room, lookahead, gtc.get());
+                            else eng->decode_greedy(tk, (int)la_base_pos, room, lookahead, false);
+                        } else {
+                            auto has_sampler = [&](const char* name) {
+                                return std::find(t.sp.samplers.begin(), t.sp.samplers.end(), name) != t.sp.samplers.end();
+                            };
+                            SpecSamplingParams ssp;
+                            ssp.temperature = t.sp.temperature;
+                            ssp.top_k = has_sampler("top_k") ? t.sp.top_k : 0;
+                            ssp.top_p = has_sampler("top_p") ? t.sp.top_p : 1.0f;
+                            ssp.min_p = has_sampler("min_p") ? t.sp.min_p : 0.0f;
+                            ssp.min_keep = t.sp.min_keep;
+                            ssp.seed = sampler.next_seed();
+                            EngOp op(*this, sid);
+                            if (la_saved) eng->state_save();
+                            if (gtc) eng->decode_speculative_constrained(tk, (int)la_base_pos, room, ssp, lookahead, gtc.get());
+                            else eng->decode_speculative(tk, (int)la_base_pos, room, ssp, lookahead);
                         }
-                        cached_.push_back(tk);
-                        for (int i = 0; i + 1 < room; ++i) cached_.push_back(lookahead[i]);
-                        la = 0;
-                        tk = lookahead[la++];
-                        continue;
+                        if (!lookahead.empty()) {
+                            cached_.push_back(tk);
+                            for (size_t i = 0; i + 1 < lookahead.size(); ++i) cached_.push_back(lookahead[i]);
+                            la = 0;
+                            tk = lookahead[la++];
+                            continue;
+                        }
                     }
                 }
                 int fa;

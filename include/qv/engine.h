@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "qv/model.h"
+#include "qv/spec_sampling.h"
 
 namespace qv {
 
@@ -51,6 +52,22 @@ class Engine {
     }
     // Greedy decode n tokens; first = token at start_pos (argmax of the logits after the context).
     virtual void decode_greedy(int first, int start_pos, int n, std::vector<int>& out, bool use_graph) = 0;
+    // Lossless speculative sampling of n tokens (temperature > 0).
+    virtual bool has_speculative_decode() const { return false; }
+    virtual void decode_speculative(int first, int start_pos, int n, const SpecSamplingParams& sp, std::vector<int>& out) {
+        (void)first; (void)start_pos; (void)n; (void)sp; (void)out;
+        throw std::runtime_error("this engine does not support speculative sampling");
+    }
+    // Constrained MTP variants: verify-time TokenConstraint; may return fewer than `n` tokens if `tc->is_eog(tok)` or `tc->is_dead()`.
+    virtual bool has_constrained_mtp() const { return false; }
+    virtual void decode_greedy_constrained(int first, int start_pos, int n, std::vector<int>& out, TokenConstraint* tc) {
+        (void)tc;
+        decode_greedy(first, start_pos, n, out, false);
+    }
+    virtual void decode_speculative_constrained(int first, int start_pos, int n, const SpecSamplingParams& sp, std::vector<int>& out, TokenConstraint* tc) {
+        (void)tc;
+        decode_speculative(first, start_pos, n, sp, out);
+    }
     virtual int argmax() = 0;                         // greedy next token from the last step's logits
     virtual void logits(std::vector<float>& out) = 0; // copy last logits to host
     virtual void reset() = 0;                         // clear recurrent/KV state

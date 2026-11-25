@@ -26,6 +26,7 @@ struct Options {
     int kv_mode = 0, kv4_kmode = 0;
     bool mtp = false;
     int mtp_depth = 1;
+    bool mtp_grammar = false;          // preset/CLI: allow MTP decode under active GBNF grammar (tool_calls, json_schema)
     // ---- vision (Inkling image input; docs/INKLING_VISION.md)
     std::string vision_file;           // sidecar .qv; "" = auto (<model stem>-vision.qv, then <dir>/<family>-vision.qv), "none" = off, "mock" = test encoder
     bool allow_remote_images = false;  // http(s) image_url fetching (SSRF-guarded); data: URLs and files below --image-root always work

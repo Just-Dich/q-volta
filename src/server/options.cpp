@@ -31,6 +31,7 @@ const std::vector<FlagEntry>& table() {
 struct OwnFlag { const char* name; const char* canon; int arg; };
 const OwnFlag kOwn[] = {
     {"--backend", "backend", 1}, {"--kv", "kv", 1}, {"--kv4-kmode", "kv4-kmode", 1}, {"--mtp", "mtp", 0}, {"--no-mtp", "no-mtp", 0},
+    {"--mtp-grammar", "mtp-grammar", 0}, {"--no-mtp-grammar", "no-mtp-grammar", 0},
     {"--mtp-depth", "mtp-depth", 1}, {"--mtp-file", "mtp-file", 1}, {"--prefill-chunk", "prefill-chunk", 1}, {"--tokenizer", "tokenizer", 1}, {"--no-embedded-defaults", "no-embedded-defaults", 0},
     {"--model-name", "alias", 1}, {"--max-ctx", "ctx-size", 1}, {"--http-threads", "threads-http", 1}, {"--max-queue", "max-queue", 1},
     {"--default-max-tokens", "predict", 1}, {"--quiet", "log-disable", 0}, {"--mock-text", "mock-text", 1},
@@ -96,7 +97,7 @@ const std::set<std::string>& handled() {
         "dry-multiplier", "dry-base", "dry-allowed-length", "dry-penalty-last-n", "dry-sequence-breaker", "mirostat", "mirostat-lr", "mirostat-ent",
         "dynatemp-range", "dynatemp-exp", "seed", "samplers", "ignore-eos", "logit-bias", "timeout", "path", "ui", "log-disable", "verbose", "log-verbosity",
         "slot-save-path", "special", "cors-origins", "cors-methods", "cors-headers", "cors-credentials", "api-prefix", "min-keep", "grammar", "grammar-file", "json-schema", "json-schema-file", "help", "version",
-        "backend", "kv", "kv4-kmode", "mtp", "no-mtp", "mtp-depth", "mtp-file", "prefill-chunk", "tokenizer", "no-embedded-defaults", "max-queue", "mock-text", "mock-loop", "mock-delay-us",
+        "backend", "kv", "kv4-kmode", "mtp", "no-mtp", "mtp-grammar", "no-mtp-grammar", "mtp-depth", "mtp-file", "prefill-chunk", "tokenizer", "no-embedded-defaults", "max-queue", "mock-text", "mock-loop", "mock-delay-us",
         "reasoning-preserve", "context-shift", "warmup", "flash-attn", "mlock", "mmap", "no-mmap", "perf", "escape", "verbosity", "log-colors", "log-timestamps",
         "log-prefix", "kv-unified", "cache-idle-slots", "lora", "lora-scaled", "ssl-key-file", "ssl-cert-file", "hf-repo", "model-url", "docker-repo",
         "hf-file", "hf-token", "offline", "no-mlock", "vision-file", "allow-remote-images", "image-root", "image-max-side", "image-token",
@@ -211,6 +212,8 @@ void apply(Options& o, const Resolved& r, const std::string& flag, const std::st
     else if (c == "kv4-kmode") o.kv4_kmode = val == "token" ? 1 : 0;
     else if (c == "mtp") o.mtp = true;
     else if (c == "no-mtp") o.mtp = false;
+    else if (c == "mtp-grammar") o.mtp_grammar = true;
+    else if (c == "no-mtp-grammar") o.mtp_grammar = false;
     else if (c == "mtp-depth") o.mtp_depth = to_int(val, flag);
     else if (c == "mtp-file") o.mtp_file = val;
     else if (c == "prefill-chunk") o.prefill_chunk = to_int(val, flag);

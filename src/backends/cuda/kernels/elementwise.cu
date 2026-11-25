@@ -177,4 +177,51 @@ void argmax_advance(const float* x, int n, int* tok, int* pos, int* gen, cudaStr
 
 void argmax(const float* x, int n, int* out, cudaStream_t s) { argmax_advance(x, n, out, nullptr, nullptr, s); }
 
+__global__ void cand_max_final_kernel(const float* pv, const int* pi, int m, CandMeta* meta) {
+    float best = -INFINITY;
+    int bi = 0x7fffffff;
+    for (int i = threadIdx.x; i < m; i += blockDim.x) argmax_merge(best, bi, pv[i], pi[i]);
+    block_argmax(best, bi);
+    if (threadIdx.x == 0) {
+        meta->mx = best;
+        meta->sum_exp = 0.0f;
+        meta->count = 0;
+    }
+}
+
+__global__ void extract_cand_kernel(const float* __restrict__ x, int n, float margin, int max_cand,
+                                    int* __restrict__ cid, float* __restrict__ cval, CandMeta* meta) {
+    __shared__ float red[32];
+    const float mx = meta->mx;
+    const bool ok = isfinite(mx);
+    const float thr = mx - margin;
+    float local_sum = 0.0f;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        const float v = x[i];
+        if (ok) {
+            local_sum += expf(v - mx);
+            if (v >= thr) {
+                const int idx = atomicAdd(&meta->count, 1);
+                if (idx < max_cand) {
+                    cid[idx] = i;
+                    cval[idx] = v;
+                }
+            }
+        }
+    }
+    local_sum = block_sum(local_sum, red);
+    if (threadIdx.x == 0 && ok) atomicAdd(&meta->sum_exp, local_sum);
+}
+
+void extract_top_candidates(const float* x, int n, float margin, int max_cand,
+                            int* cand_id, float* cand_val, CandMeta* meta, cudaStream_t s) {
+    if (!g_pv) {
+        QV_CUDA_CHECK(cudaMalloc(&g_pv, ARG_BLOCKS * sizeof(float)));
+        QV_CUDA_CHECK(cudaMalloc(&g_pi, ARG_BLOCKS * sizeof(int)));
+    }
+    argmax_partial_kernel<<<ARG_BLOCKS, 256, 0, s>>>(x, n, g_pv, g_pi);
+    cand_max_final_kernel<<<1, 256, 0, s>>>(g_pv, g_pi, ARG_BLOCKS, meta);
+    extract_cand_kernel<<<ARG_BLOCKS, 256, 0, s>>>(x, n, margin, max_cand, cand_id, cand_val, meta);
+}
+
 }  // namespace qv::cuda

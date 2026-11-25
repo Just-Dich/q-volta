@@ -3,8 +3,10 @@
 // few deterministic runners-up, so top-k / top-p / logprobs / seeded sampling behave like on a real model. Honours the
 // engine contract (prefill leaves logits of the last row, step(token,pos), reset()).
 #pragma once
+#include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <random>
 #include <thread>
 
 #include "qv/engine.h"
@@ -32,6 +34,45 @@ class MockEngine : public Engine {
         out.resize(n);
         int tok = first;
         for (int i = 0; i < n; ++i) { step(tok, start_pos + i); tok = argmax(); out[i] = tok; }
+    }
+    bool has_speculative_decode() const override { return true; }
+    bool has_constrained_mtp() const override { return true; }
+    void decode_greedy_constrained(int first, int start_pos, int n, std::vector<int>& out, TokenConstraint* tc) override {
+        out.clear();
+        std::vector<float> lg;
+        int tok = first;
+        for (int i = 0; i < n; ++i) {
+            step(tok, start_pos + i);
+            int cand = argmax();
+            if (tc && !tc->try_accept(cand)) {
+                logits(lg);
+                if (!tc->awaiting()) tc->mask_logits(lg.data(), lg.size());
+                cand = (int)(std::max_element(lg.begin(), lg.end()) - lg.begin());
+                (void)tc->try_accept(cand);
+            }
+            out.push_back(cand);
+            tok = cand;
+            if (tc && (tc->is_eog(cand) || tc->is_dead())) break;
+        }
+    }
+    void decode_speculative(int first, int start_pos, int n, const SpecSamplingParams& sp, std::vector<int>& out) override {
+        decode_speculative_constrained(first, start_pos, n, sp, out, nullptr);
+    }
+    void decode_speculative_constrained(int first, int start_pos, int n, const SpecSamplingParams& sp, std::vector<int>& out, TokenConstraint* tc) override {
+        out.clear();
+        std::mt19937_64 rng(sp.seed);
+        std::vector<float> lg;
+        SpecDist dist;
+        int tok = first;
+        for (int i = 0; i < n; ++i) {
+            step(tok, start_pos + i);
+            logits(lg);
+            build_dist_dense(lg.data(), cfg_.vocab, sp, dist, tc);
+            tok = sample_dist(dist, rng);
+            if (tc) (void)tc->try_accept(tok);
+            out.push_back(tok);
+            if (tc && (tc->is_eog(tok) || tc->is_dead())) break;
+        }
     }
     int argmax() override { return scripted(); }
     void logits(std::vector<float>& out) override {

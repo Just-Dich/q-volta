@@ -10,4 +10,12 @@ void embed(const QMat& E, const int* tok, float* out, cudaStream_t s);
 void silu_mul(const float* g, const float* u, float* out, float* xs32, int n, cudaStream_t s, const Q8Buf* q8 = nullptr);
 void argmax(const float* x, int n, int* out, cudaStream_t s);
 void argmax_advance(const float* x, int n, int* tok, int* pos, int* gen, cudaStream_t s);
+
+struct CandMeta {
+    float mx;
+    float sum_exp;
+    int count;
+};
+void extract_top_candidates(const float* x, int n, float margin, int max_cand,
+                            int* cand_id, float* cand_val, CandMeta* meta, cudaStream_t s);
 }  // namespace qv::cuda
