@@ -44,6 +44,9 @@ class MockEngine : public Engine {
         for (int j = 0; j < 3; ++j) { int a = (t + 1 + j * 7919) % V; if (a != t) out[a] = ru[j]; }
     }
     void reset() override { st_[cur_].k = 0; st_[cur_].prompt_end = 0; }
+    bool has_state_save() const override { return true; }
+    void state_save() override { saved_ = st_[cur_]; }
+    void state_restore() override { st_[cur_] = saved_; }
     const std::vector<float>& hidden_dump() const override { return empty_; }
     const std::vector<float>& logits_dump() const override { return empty_; }
     void sync() override {}
@@ -57,6 +60,7 @@ class MockEngine : public Engine {
     int delay_us_;
     struct Seq { int k = 0, prompt_end = 0; };
     std::vector<Seq> st_;
+    Seq saved_;
     int cur_ = 0;
     std::vector<float> empty_;
     int scripted() const {

@@ -219,6 +219,7 @@ class CpuEngine final : public Engine {
         logits_all_.clear();
         mtp_ready_ = -1;
     }
+    bool has_state_save() const override { return true; }
     void state_save() override { conv_save_ = conv_state_; gdn_save_ = gdn_state_; }
     void state_restore() override { conv_state_ = conv_save_; gdn_state_ = gdn_save_; mtp_ready_ = -1; }
     void set_sparse(const std::string& v) override {

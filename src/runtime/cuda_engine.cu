@@ -352,6 +352,19 @@ class CudaEngine final : public Engine {
         mtp_ready_ = -1;
         QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
     }
+    bool has_state_save() const override { return true; }
+    void state_save() override {
+        if (!save_conv_ && conv_bytes_ > 0) save_conv_ = dalloc<float>(conv_bytes_ / 4);
+        if (!save_gdn_ && gdn_bytes_ > 0) save_gdn_ = dalloc<float>(gdn_bytes_ / 4);
+        if (conv_bytes_ > 0) QV_CUDA_CHECK(cudaMemcpyAsync(save_conv_, conv_state_, conv_bytes_, cudaMemcpyDeviceToDevice, stream_));
+        if (gdn_bytes_ > 0) QV_CUDA_CHECK(cudaMemcpyAsync(save_gdn_, gdn_state_, gdn_bytes_, cudaMemcpyDeviceToDevice, stream_));
+    }
+    void state_restore() override {
+        if (save_conv_ && conv_bytes_ > 0) QV_CUDA_CHECK(cudaMemcpyAsync(conv_state_, save_conv_, conv_bytes_, cudaMemcpyDeviceToDevice, stream_));
+        if (save_gdn_ && gdn_bytes_ > 0) QV_CUDA_CHECK(cudaMemcpyAsync(gdn_state_, save_gdn_, gdn_bytes_, cudaMemcpyDeviceToDevice, stream_));
+        mtp_ready_ = -1;
+        QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
+    }
     void mtp_stats(MtpStats& s) const override { s = mtp_st_; }
     void set_mtp_enabled(bool on) override { mtp_on_ = on && opt_.mtp; mtp_ready_ = -1; }
     const std::vector<float>& hidden_dump() const override { return hidden_; }
@@ -697,7 +710,7 @@ class CudaEngine final : public Engine {
     QMat embed_, head_;
     const float* final_norm_ = nullptr;
     // state
-    float *conv_state_ = nullptr, *gdn_state_ = nullptr, *k_cache_ = nullptr, *v_cache_ = nullptr;
+    float *conv_state_ = nullptr, *gdn_state_ = nullptr, *save_conv_ = nullptr, *save_gdn_ = nullptr, *k_cache_ = nullptr, *v_cache_ = nullptr;
     size_t conv_bytes_ = 0, gdn_bytes_ = 0;
     // int4 KV (EngineOptions::kv_int4)
     bool kv4_on_ = false;

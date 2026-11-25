@@ -704,6 +704,70 @@ def test_mtp_chunk_path_matches_plain():
         a.stop(); b.stop()
 
 
+def test_mtp_lazy_grammar_tools():
+    def read_log(srv):
+        srv.stop()
+        with open(srv.log.name, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+
+    # 1. Plain text response with tools (tool_choice=auto): MTP runs at full chunk speed
+    plain_txt = "I will not call any tool, just writing a long plain answer with many words."
+    a = Srv(qv_cmd("--mock-text", plain_txt), name="lazy_plain")
+    b = Srv(qv_cmd("--mock-text", plain_txt, "--mtp"), env={"QV_MTP_DEBUG": "1"}, name="lazy_mtp")
+    try:
+        ra = a.req("POST", "/v1/chat/completions", chat_body(tools=[WEATHER], max_tokens=64))[2]["choices"][0]
+        rb = b.req("POST", "/v1/chat/completions", chat_body(tools=[WEATHER], max_tokens=64))[2]["choices"][0]
+        assert ra["message"] == rb["message"] and ra["finish_reason"] == rb["finish_reason"]
+        assert "tool_calls" not in rb["message"]
+        log_b = read_log(b)
+        assert "use_chunk=1" in log_b and "lazy=1" in log_b
+    finally:
+        a.stop(); b.stop()
+
+    # 2. Mid-chunk trigger word followed by invalid tokens: rollback + grammar masking must match plain 1-token path
+    mid_txt = "Sure, let me check the current weather for your city right now.\n<tool_call>INVALID GARBAGE"
+    a = Srv(qv_cmd("--mock-text", mid_txt), name="trig_plain")
+    b = Srv(qv_cmd("--mock-text", mid_txt, "--mtp"), env={"QV_MTP_DEBUG": "1"}, name="trig_mtp")
+    try:
+        ra = a.req("POST", "/v1/chat/completions", chat_body(tools=[WEATHER], max_tokens=200))[2]["choices"][0]
+        rb = b.req("POST", "/v1/chat/completions", chat_body(tools=[WEATHER], max_tokens=200))[2]["choices"][0]
+        assert rb["finish_reason"] == "tool_calls"
+        assert rb["message"]["tool_calls"][0]["function"]["name"] == "get_weather"
+        assert isinstance(json.loads(rb["message"]["tool_calls"][0]["function"]["arguments"]), dict)
+        assert rb["message"]["content"] == ra["message"]["content"]
+        assert rb["finish_reason"] == ra["finish_reason"]
+        assert rb["message"]["tool_calls"][0]["function"] == ra["message"]["tool_calls"][0]["function"]
+        log_b = read_log(b)
+        assert "use_chunk=1" in log_b and "lazy grammar triggered" in log_b
+    finally:
+        a.stop(); b.stop()
+
+    # 3. Trigger at the very first token (no rollback branch)
+    head_txt = "<tool_call>INVALID GARBAGE"
+    a = Srv(qv_cmd("--mock-text", head_txt), name="head_plain")
+    b = Srv(qv_cmd("--mock-text", head_txt, "--mtp"), env={"QV_MTP_DEBUG": "1"}, name="head_mtp")
+    try:
+        ra = a.req("POST", "/v1/chat/completions", chat_body(tools=[WEATHER], max_tokens=200))[2]["choices"][0]
+        rb = b.req("POST", "/v1/chat/completions", chat_body(tools=[WEATHER], max_tokens=200))[2]["choices"][0]
+        assert rb["finish_reason"] == "tool_calls"
+        assert rb["message"]["tool_calls"][0]["function"]["name"] == "get_weather"
+        assert isinstance(json.loads(rb["message"]["tool_calls"][0]["function"]["arguments"]), dict)
+        assert rb["message"]["content"] == ra["message"]["content"]
+        assert rb["message"]["tool_calls"][0]["function"] == ra["message"]["tool_calls"][0]["function"]
+    finally:
+        a.stop(); b.stop()
+
+    # 4. Required (non-lazy) grammar must keep MTP disabled
+    b = Srv(qv_cmd("--mock-text", head_txt, "--mtp"), env={"QV_MTP_DEBUG": "1"}, name="req_mtp")
+    try:
+        r = b.req("POST", "/v1/chat/completions", chat_body(tools=[WEATHER], tool_choice="required", max_tokens=200))[2]["choices"][0]
+        assert r["finish_reason"] == "tool_calls"
+        log_b = read_log(b)
+        assert "use_chunk=0" in log_b and "lazy=0" in log_b
+    finally:
+        b.stop()
+
+
 # ----- CLI / environment
 def run_cli(args, env=None, wait=True):
     return subprocess.run([QV_SERVER] + args, capture_output=True, text=True, timeout=30, env=dict(os.environ, **(env or {})))

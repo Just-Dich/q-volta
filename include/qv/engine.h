@@ -59,6 +59,7 @@ class Engine {
     virtual void sync() = 0;
     // research hooks (CPU backend, branch p9/tier): snapshot/restore the recurrent state (GDN + conv; KV is rewritten by replay),
     // and switch single-token attention to sparse block retrieval ("off" or "sink,recent,block,k[,agg]").
+    virtual bool has_state_save() const { return false; }
     virtual void state_save() {}
     virtual void state_restore() {}
     virtual void set_sparse(const std::string&) {}
