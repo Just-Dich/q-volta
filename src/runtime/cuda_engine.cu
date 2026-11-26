@@ -71,6 +71,9 @@ class CudaEngine final : public Engine {
             if (h_scand_id_) cudaFreeHost(h_scand_id_);
             if (h_scand_val_) cudaFreeHost(h_scand_val_);
             if (h_sfull_p_) cudaFreeHost(h_sfull_p_);
+            if (h_dq_id_) cudaFreeHost(h_dq_id_);
+            if (h_dq_prob_) cudaFreeHost(h_dq_prob_);
+            if (h_dq_cnt_) cudaFreeHost(h_dq_cnt_);
         }
         for (auto g : vgraph_) if (g) cudaGraphExecDestroy(g);
         for (auto g : vgraph_spec_) if (g) cudaGraphExecDestroy(g);
@@ -449,6 +452,150 @@ class CudaEngine final : public Engine {
         QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
         return true;
     }
+    struct KvCkptHdr {
+        uint32_t magic = 0x51564B31u;  // "QVK1"
+        int32_t kv_mode = 0;           // 0=fp32, 1=int4(kv4 blocks), 2=fp16(kv4 exact)
+        int32_t kv4_kmode = 0;
+        int32_t n_kv_layers = 0;
+        int32_t n_kv_heads = 0;
+        int32_t head_dim = 0;
+        int32_t n_tokens = 0;
+        int32_t used_blocks = 0;
+        uint64_t payload_bytes = 0;
+    };
+    int kv_ckpt_mode() const {
+        if (!kv4_on_) return 0;
+        return (!kv4_.empty() && kv4_[0].exact) ? 2 : 1;
+    }
+    size_t checkpoint_bytes() const override {
+        const size_t n_kv_layers = (size_t)n_attn_ + (opt_.mtp ? 1 : 0);
+        const size_t ring_b = (kv4_on_ && !kv4_.empty() && !kv4_[0].exact && kv4_ring_k_ && kv4_ring_v_)
+                                  ? n_kv_layers * (size_t)cfg_.n_kv_heads * (size_t)KV4_RING * (size_t)KV4_D * sizeof(__half)
+                                  : 0;
+        const size_t hlast_b = (opt_.mtp && hlast_) ? (size_t)cfg_.hidden * sizeof(float) : 0;
+        const size_t logits_b = (size_t)cfg_.vocab * sizeof(float);
+        return 48 + conv_bytes_ + gdn_bytes_ + 2 * ring_b + hlast_b + logits_b;  // sizeof(CkptHdr) == 48
+    }
+    bool has_kv_checkpoint() const override { return true; }
+    size_t kv_checkpoint_bytes(int n_tokens) const override {
+        if (n_tokens < 0 || n_tokens > opt_.max_ctx) return 0;
+        const int n_kv_layers = n_attn_ + (opt_.mtp ? 1 : 0);
+        const size_t rows = (size_t)n_kv_layers * (size_t)cfg_.n_kv_heads;
+        const int mode = kv_ckpt_mode();
+        size_t payload = 0;
+        if (mode == 1) {
+            if (kv4_.empty()) return 0;
+            const int used_blk = std::min(kv4_[0].nblocks, kv4_q(kv4_[0], n_tokens) / KV4_BLK);
+            payload = rows * (size_t)used_blk * KV4_REC_BYTES;
+        } else if (mode == 2) {
+            payload = 2 * rows * (size_t)n_tokens * KV4_D * sizeof(__half);
+        } else {
+            payload = 2 * rows * (size_t)n_tokens * (size_t)cfg_.head_dim * sizeof(float);
+        }
+        return sizeof(KvCkptHdr) + payload;
+    }
+    bool save_kv_prefix(std::vector<uint8_t>& out, int n_tokens) override {
+        if (n_tokens < 0 || n_tokens > opt_.max_ctx) return false;
+        const int n_kv_layers = n_attn_ + (opt_.mtp ? 1 : 0);
+        const size_t rows = (size_t)n_kv_layers * (size_t)cfg_.n_kv_heads;
+        const int mode = kv_ckpt_mode();
+        KvCkptHdr h;
+        h.kv_mode = mode;
+        h.kv4_kmode = opt_.kv4_kmode;
+        h.n_kv_layers = n_kv_layers;
+        h.n_kv_heads = cfg_.n_kv_heads;
+        h.head_dim = cfg_.head_dim;
+        h.n_tokens = n_tokens;
+        if (mode == 1) {
+            if (kv4_.empty()) return false;
+            h.used_blocks = std::min(kv4_[0].nblocks, kv4_q(kv4_[0], n_tokens) / KV4_BLK);
+            h.payload_bytes = rows * (size_t)h.used_blocks * KV4_REC_BYTES;
+        } else if (mode == 2) {
+            h.payload_bytes = 2 * rows * (size_t)n_tokens * KV4_D * sizeof(__half);
+        } else {
+            h.payload_bytes = 2 * rows * (size_t)n_tokens * (size_t)cfg_.head_dim * sizeof(float);
+        }
+        out.resize(sizeof(KvCkptHdr) + h.payload_bytes);
+        std::memcpy(out.data(), &h, sizeof(h));
+        uint8_t* p = out.data() + sizeof(h);
+        QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
+        if (mode == 1) {
+            if (h.used_blocks > 0 && rows > 0) {
+                const size_t row_w = (size_t)h.used_blocks * KV4_REC_BYTES;
+                const size_t spitch = (size_t)kv4_[0].nblocks * KV4_REC_BYTES;
+                QV_CUDA_CHECK(cudaMemcpy2DAsync(p, row_w, kv4_blocks_, spitch, row_w, rows, cudaMemcpyDeviceToHost, stream_));
+            }
+        } else if (mode == 2) {
+            if (n_tokens > 0 && rows > 0) {
+                const size_t row_w = (size_t)n_tokens * KV4_D * sizeof(__half);
+                const size_t spitch = (size_t)opt_.max_ctx * KV4_D * sizeof(__half);
+                const size_t half_b = rows * row_w;
+                QV_CUDA_CHECK(cudaMemcpy2DAsync(p, row_w, kv4_ring_k_, spitch, row_w, rows, cudaMemcpyDeviceToHost, stream_));
+                QV_CUDA_CHECK(cudaMemcpy2DAsync(p + half_b, row_w, kv4_ring_v_, spitch, row_w, rows, cudaMemcpyDeviceToHost, stream_));
+            }
+        } else {
+            if (n_tokens > 0 && rows > 0) {
+                const size_t row_w = (size_t)n_tokens * (size_t)cfg_.head_dim * sizeof(float);
+                const size_t spitch = (size_t)opt_.max_ctx * (size_t)cfg_.head_dim * sizeof(float);
+                const size_t half_b = rows * row_w;
+                QV_CUDA_CHECK(cudaMemcpy2DAsync(p, row_w, k_cache_, spitch, row_w, rows, cudaMemcpyDeviceToHost, stream_));
+                QV_CUDA_CHECK(cudaMemcpy2DAsync(p + half_b, row_w, v_cache_, spitch, row_w, rows, cudaMemcpyDeviceToHost, stream_));
+            }
+        }
+        QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
+        return true;
+    }
+    bool restore_kv_prefix(const std::vector<uint8_t>& in) override {
+        if (in.size() < sizeof(KvCkptHdr)) return false;
+        KvCkptHdr h;
+        std::memcpy(&h, in.data(), sizeof(h));
+        if (h.magic != 0x51564B31u) return false;
+        const int n_kv_layers = n_attn_ + (opt_.mtp ? 1 : 0);
+        const int mode = kv_ckpt_mode();
+        if (h.kv_mode != mode || h.kv4_kmode != opt_.kv4_kmode || h.n_kv_layers != n_kv_layers ||
+            h.n_kv_heads != cfg_.n_kv_heads || h.head_dim != cfg_.head_dim ||
+            h.n_tokens < 0 || h.n_tokens > opt_.max_ctx) return false;
+        const size_t rows = (size_t)n_kv_layers * (size_t)cfg_.n_kv_heads;
+        size_t expected_payload = 0;
+        if (mode == 1) {
+            if (kv4_.empty()) return false;
+            const int expected_blk = std::min(kv4_[0].nblocks, kv4_q(kv4_[0], h.n_tokens) / KV4_BLK);
+            if (h.used_blocks != expected_blk) return false;
+            expected_payload = rows * (size_t)expected_blk * KV4_REC_BYTES;
+        } else if (mode == 2) {
+            expected_payload = 2 * rows * (size_t)h.n_tokens * KV4_D * sizeof(__half);
+        } else {
+            expected_payload = 2 * rows * (size_t)h.n_tokens * (size_t)cfg_.head_dim * sizeof(float);
+        }
+        if (h.payload_bytes != expected_payload || in.size() != sizeof(KvCkptHdr) + expected_payload) return false;
+        QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
+        const uint8_t* p = in.data() + sizeof(KvCkptHdr);
+        if (mode == 1) {
+            if (h.used_blocks > 0 && rows > 0) {
+                const size_t row_w = (size_t)h.used_blocks * KV4_REC_BYTES;
+                const size_t dpitch = (size_t)kv4_[0].nblocks * KV4_REC_BYTES;
+                QV_CUDA_CHECK(cudaMemcpy2DAsync(kv4_blocks_, dpitch, p, row_w, row_w, rows, cudaMemcpyHostToDevice, stream_));
+            }
+        } else if (mode == 2) {
+            if (h.n_tokens > 0 && rows > 0) {
+                const size_t row_w = (size_t)h.n_tokens * KV4_D * sizeof(__half);
+                const size_t dpitch = (size_t)opt_.max_ctx * KV4_D * sizeof(__half);
+                const size_t half_b = rows * row_w;
+                QV_CUDA_CHECK(cudaMemcpy2DAsync(kv4_ring_k_, dpitch, p, row_w, row_w, rows, cudaMemcpyHostToDevice, stream_));
+                QV_CUDA_CHECK(cudaMemcpy2DAsync(kv4_ring_v_, dpitch, p + half_b, row_w, row_w, rows, cudaMemcpyHostToDevice, stream_));
+            }
+        } else {
+            if (h.n_tokens > 0 && rows > 0) {
+                const size_t row_w = (size_t)h.n_tokens * (size_t)cfg_.head_dim * sizeof(float);
+                const size_t dpitch = (size_t)opt_.max_ctx * (size_t)cfg_.head_dim * sizeof(float);
+                const size_t half_b = rows * row_w;
+                QV_CUDA_CHECK(cudaMemcpy2DAsync(k_cache_, dpitch, p, row_w, row_w, rows, cudaMemcpyHostToDevice, stream_));
+                QV_CUDA_CHECK(cudaMemcpy2DAsync(v_cache_, dpitch, p + half_b, row_w, row_w, rows, cudaMemcpyHostToDevice, stream_));
+            }
+        }
+        QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
+        return true;
+    }
     void mtp_stats(MtpStats& s) const override { s = mtp_st_; }
     void set_mtp_enabled(bool on) override { mtp_on_ = on && opt_.mtp; mtp_ready_ = -1; }
     const std::vector<float>& hidden_dump() const override { return hidden_; }
@@ -497,6 +644,12 @@ class CudaEngine final : public Engine {
     float* h_scand_val_ = nullptr;
     float* h_sfull_p_ = nullptr;
     std::vector<float> h_sfull_;
+    int* d_dq_id_ = nullptr;
+    float* d_dq_prob_ = nullptr;
+    int* d_dq_cnt_ = nullptr;
+    int* h_dq_id_ = nullptr;
+    float* h_dq_prob_ = nullptr;
+    int* h_dq_cnt_ = nullptr;
 
     void alloc_mtp() {
         const Config& c = cfg_;
@@ -547,12 +700,24 @@ class CudaEngine final : public Engine {
         QV_CUDA_CHECK(cudaMallocHost(&h_scand_id_, (size_t)N * SPEC_MAX_CAND * sizeof(int)));
         QV_CUDA_CHECK(cudaMallocHost(&h_scand_val_, (size_t)N * SPEC_MAX_CAND * sizeof(float)));
         QV_CUDA_CHECK(cudaMallocHost(&h_sfull_p_, (size_t)V * sizeof(float)));
+        d_dq_id_ = dalloc<int>((size_t)N * DRAFT_MAX_CAND);
+        d_dq_prob_ = dalloc<float>((size_t)N * DRAFT_MAX_CAND);
+        d_dq_cnt_ = dalloc<int>(N);
+        QV_CUDA_CHECK(cudaMallocHost(&h_dq_id_, (size_t)N * DRAFT_MAX_CAND * sizeof(int)));
+        QV_CUDA_CHECK(cudaMallocHost(&h_dq_prob_, (size_t)N * DRAFT_MAX_CAND * sizeof(float)));
+        QV_CUDA_CHECK(cudaMallocHost(&h_dq_cnt_, (size_t)N * sizeof(int)));
         const char* e = std::getenv("QV_MTP_PROF");
         mtp_prof_ = e && e[0] == '1';
         const char* g = std::getenv("QV_MTP_GRAPH");
         mtp_graph_ = !(g && g[0] == '0');
         argmax_advance(logits_, V, d_varg_, nullptr, nullptr, stream_);  // allocates the argmax scratch before any graph capture
         extract_top_candidates_batch(vlogits_, V, N, 10.0f, SPEC_MAX_CAND, d_scand_id_, d_scand_val_, d_smeta_, stream_);
+        {
+            GpuDraftParams wgp;
+            wgp.max_extract = SPEC_MAX_CAND;
+            sample_draft_gpu(mlogits_, V, wgp, 1ull, d_scand_id_, d_scand_val_, d_smeta_,
+                             d_dq_id_, d_dq_prob_, d_dq_cnt_, d_draft_, stream_);
+        }
         QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
     }
 
@@ -741,6 +906,7 @@ class CudaEngine final : public Engine {
         if (mtp_prof_) { QV_CUDA_CHECK(cudaStreamSynchronize(stream_)); mtp_st_.draft_ms += ms(t0, clk::now()); }
         while (produced < n) {
             const int NT = std::min(D + 1, n - produced);
+            if (NT == 1 && produced > 0 && p + 2 * D + 3 < opt_.max_ctx) break;
             if (NT == 1 || p + 2 * D + 3 >= opt_.max_ctx) {  // tail / context end: plain step (state stays identical to plain decode)
                 t0 = clk::now();
                 h_tp_[0] = cur;
@@ -811,7 +977,6 @@ class CudaEngine final : public Engine {
             if (stop_chunk) break;
         }
         out.resize(produced);
-        QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
         mtp_ready_ = p;
     }
 
@@ -855,7 +1020,7 @@ class CudaEngine final : public Engine {
             ok = md.count > 0 && md.count <= SPEC_MAX_CAND &&
                  build_dist_from_candidates(h_scand_id_ + (size_t)row * SPEC_MAX_CAND,
                                             h_scand_val_ + (size_t)row * SPEC_MAX_CAND,
-                                            md.count, md.mx, (double)md.sum_exp, sp, out_dist, tc);
+                                            md.count, md.mx, (double)md.sum_exp, sp, out_dist, tc, margin);
         }
         if (!ok) {
             float* buf = h_sfull_p_;
@@ -876,22 +1041,32 @@ class CudaEngine final : public Engine {
         for (int t = 0; t < n_rows; ++t) build_dist_for_row(d_logits_base, t, margin, sp, tc, out_dists[t]);
     }
 
-    void mtp_draft_speculative(int nt, const int* nxt, const float* hid, int q0, int Dd,
-                               const SpecSamplingParams& sp, std::mt19937_64& rng,
-                               int* drafts_out, SpecDist* q_out) {
+    void mtp_draft_gpu(int nt, const int* nxt, const float* hid, int q0, int Dd,
+                       const SpecSamplingParams& sp, std::mt19937_64& rng) {
         for (int t = 0; t < nt; ++t) { h_b_[t] = nxt[t]; h_b_[NTM_ + t] = q0 + t; }
         for (int j = 1; j < Dd; ++j) h_b_[2 * NTM_ + j - 1] = q0 + nt - 1 + j;
         QV_CUDA_CHECK(cudaMemcpyAsync(d_m_, h_b_, 3 * NTM_ * sizeof(int), cudaMemcpyHostToDevice, stream_));
+        GpuDraftParams gp;
+        if (sp.min_p > 0.0f && sp.min_keep <= 1) {
+            gp.margin = std::max(3.5f, -std::log(sp.min_p) + 0.1f);
+        } else {
+            gp.margin = std::clamp(7.5f * sp.temperature, 4.0f, 9.0f);
+        }
+        gp.temperature = sp.temperature;
+        gp.top_k = sp.top_k;
+        gp.top_p = sp.top_p;
+        gp.min_p = sp.min_p;
+        gp.min_keep = sp.min_keep;
+        gp.max_extract = SPEC_MAX_CAND;
         const int kind = hid == hlast_ ? 0 : nt;
         graph_run_spec(kind, [&] { mtp_run(nt, d_m_, hid, d_m_ + NTM_, d_draft_, false); });
-        build_dists_from_gpu(mlogits_, 1, sp, &q_out[0]);
-        drafts_out[0] = sample_dist(q_out[0], rng);
+        sample_draft_gpu(mlogits_, cfg_.vocab, gp, rng(), d_scand_id_, d_scand_val_, d_smeta_,
+                         d_dq_id_, d_dq_prob_, d_dq_cnt_, d_draft_, stream_);
         for (int j = 1; j < Dd; ++j) {
-            h_res_[j - 1] = drafts_out[j - 1];
-            QV_CUDA_CHECK(cudaMemcpyAsync(d_draft_ + (j - 1), h_res_ + (j - 1), sizeof(int), cudaMemcpyHostToDevice, stream_));
             graph_run_spec(NTM_ + j, [&] { mtp_run(1, d_draft_ + j - 1, mhid_, d_m_ + 2 * NTM_ + j - 1, d_draft_ + j, false); });
-            build_dists_from_gpu(mlogits_, 1, sp, &q_out[j]);
-            drafts_out[j] = sample_dist(q_out[j], rng);
+            sample_draft_gpu(mlogits_, cfg_.vocab, gp, rng(), d_scand_id_, d_scand_val_, d_smeta_,
+                             d_dq_id_ + (size_t)j * DRAFT_MAX_CAND, d_dq_prob_ + (size_t)j * DRAFT_MAX_CAND,
+                             d_dq_cnt_ + j, d_draft_ + j, stream_);
         }
     }
 
@@ -909,10 +1084,11 @@ class CudaEngine final : public Engine {
         SpecDist q_dists[NTM_MAX];
         auto t0 = clk::now();
         int Dd = std::min(D, n - 1);
-        if (Dd > 0) mtp_draft_speculative(1, &cur, hlast_, p - 1, Dd, sp, rng, drafts, q_dists);
+        if (Dd > 0) mtp_draft_gpu(1, &cur, hlast_, p - 1, Dd, sp, rng);
         if (mtp_prof_) { QV_CUDA_CHECK(cudaStreamSynchronize(stream_)); mtp_st_.draft_ms += ms(t0, clk::now()); }
         while (produced < n) {
             const int NT = std::min(D + 1, n - produced);
+            if (NT == 1 && produced > 0 && p + 2 * D + 3 < opt_.max_ctx) break;
             if (NT == 1 || p + 2 * D + 3 >= opt_.max_ctx) {
                 t0 = clk::now();
                 h_tp_[0] = cur;
@@ -933,12 +1109,29 @@ class CudaEngine final : public Engine {
             }
             t0 = clk::now();
             h_a_[0] = cur;
-            for (int j = 0; j < NT - 1; ++j) h_a_[1 + j] = drafts[j];
             for (int t = 0; t < NTM_; ++t) h_a_[NTM_ + t] = p + t;
             QV_CUDA_CHECK(cudaMemcpyAsync(d_v_, h_a_, 2 * NTM_ * sizeof(int), cudaMemcpyHostToDevice, stream_));
+            QV_CUDA_CHECK(cudaMemcpyAsync(d_v_ + 1, d_draft_, (NT - 1) * sizeof(int), cudaMemcpyDeviceToDevice, stream_));
+            QV_CUDA_CHECK(cudaMemcpyAsync(h_res_ + NTM_, d_draft_, (NT - 1) * sizeof(int), cudaMemcpyDeviceToHost, stream_));
+            QV_CUDA_CHECK(cudaMemcpyAsync(h_dq_cnt_, d_dq_cnt_, (NT - 1) * sizeof(int), cudaMemcpyDeviceToHost, stream_));
+            QV_CUDA_CHECK(cudaMemcpyAsync(h_dq_id_, d_dq_id_, (size_t)(NT - 1) * DRAFT_MAX_CAND * sizeof(int), cudaMemcpyDeviceToHost, stream_));
+            QV_CUDA_CHECK(cudaMemcpyAsync(h_dq_prob_, d_dq_prob_, (size_t)(NT - 1) * DRAFT_MAX_CAND * sizeof(float), cudaMemcpyDeviceToHost, stream_));
             run_verify_spec(NT);
             if (margin >= 0.0f) extract_gpu_rows(vlogits_, NT, margin);
+            else QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
             auto t1 = clk::now();
+            for (int j = 0; j < NT - 1; ++j) {
+                drafts[j] = h_res_[NTM_ + j];
+                const int qc = std::clamp(h_dq_cnt_[j], 0, DRAFT_MAX_CAND);
+                q_dists[j].dense = false;
+                q_dists[j].dn.clear();
+                q_dists[j].sp.resize((size_t)qc);
+                const int* qids = h_dq_id_ + (size_t)j * DRAFT_MAX_CAND;
+                const float* qprs = h_dq_prob_ + (size_t)j * DRAFT_MAX_CAND;
+                for (int i = 0; i < qc; ++i) q_dists[j].sp[(size_t)i] = {qids[i], qprs[i]};
+                std::sort(q_dists[j].sp.begin(), q_dists[j].sp.end(),
+                          [](const auto& a, const auto& b) { return a.first < b.first; });
+            }
             int m = 0;
             int n_acc = 0;
             bool stop_chunk = false;
@@ -979,14 +1172,13 @@ class CudaEngine final : public Engine {
             cur = accepted_seq[m];
             if (!stop_chunk && produced < n) {
                 Dd = std::min(D, n - produced - 1);
-                if (Dd > 0) mtp_draft_speculative(m + 1, accepted_seq, vxn_, p, Dd, sp, rng, drafts, q_dists);
+                if (Dd > 0) mtp_draft_gpu(m + 1, accepted_seq, vxn_, p, Dd, sp, rng);
             }
             p += m + 1;
             if (mtp_prof_) { QV_CUDA_CHECK(cudaStreamSynchronize(stream_)); mtp_st_.draft_ms += ms(t1, clk::now()); }
             if (stop_chunk) break;
         }
         out.resize(produced);
-        QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
         mtp_ready_ = p;
     }
 

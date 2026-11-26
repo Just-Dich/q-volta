@@ -276,6 +276,72 @@ class CpuEngine final : public Engine {
         mtp_ready_ = h.mtp_ready;
         return true;
     }
+    struct CpuKvHdr {
+        uint32_t magic = 0x43504B31u;  // "CPK1"
+        int32_t n_kv_layers = 0, n_kv_heads = 0, head_dim = 0, n_tokens = 0;
+        uint64_t payload_bytes = 0;
+    };
+    size_t checkpoint_bytes() const override {
+        return 40 + (conv_state_.size() + gdn_state_.size() + logits_.size() + mtp_hid_last_.size()) * sizeof(float);  // sizeof(CpuCkptHdr) == 40
+    }
+    bool has_kv_checkpoint() const override { return true; }
+    size_t kv_checkpoint_bytes(int n_tokens) const override {
+        if (n_tokens < 0 || n_tokens > opt_.max_ctx) return 0;
+        const size_t rows = (size_t)(n_attn_ + (opt_.mtp ? 1 : 0)) * (size_t)cfg_.n_kv_heads;
+        return sizeof(CpuKvHdr) + 2 * rows * (size_t)n_tokens * (size_t)cfg_.head_dim * sizeof(float);
+    }
+    bool save_kv_prefix(std::vector<uint8_t>& out, int n_tokens) override {
+        if (n_tokens < 0 || n_tokens > opt_.max_ctx) return false;
+        const int n_kv_layers = n_attn_ + (opt_.mtp ? 1 : 0);
+        const size_t rows = (size_t)n_kv_layers * (size_t)cfg_.n_kv_heads;
+        const size_t row_w = (size_t)n_tokens * (size_t)cfg_.head_dim * sizeof(float);
+        const size_t spitch = (size_t)opt_.max_ctx * (size_t)cfg_.head_dim * sizeof(float);
+        CpuKvHdr h;
+        h.n_kv_layers = n_kv_layers;
+        h.n_kv_heads = cfg_.n_kv_heads;
+        h.head_dim = cfg_.head_dim;
+        h.n_tokens = n_tokens;
+        h.payload_bytes = 2 * rows * row_w;
+        out.resize(sizeof(CpuKvHdr) + h.payload_bytes);
+        std::memcpy(out.data(), &h, sizeof(h));
+        uint8_t* p = out.data() + sizeof(h);
+        if (row_w > 0 && rows > 0) {
+            const uint8_t* ks = reinterpret_cast<const uint8_t*>(k_cache_);
+            const uint8_t* vs = reinterpret_cast<const uint8_t*>(v_cache_);
+            uint8_t* kp = p;
+            uint8_t* vp = p + rows * row_w;
+            for (size_t r = 0; r < rows; ++r) {
+                std::memcpy(kp + r * row_w, ks + r * spitch, row_w);
+                std::memcpy(vp + r * row_w, vs + r * spitch, row_w);
+            }
+        }
+        return true;
+    }
+    bool restore_kv_prefix(const std::vector<uint8_t>& in) override {
+        if (in.size() < sizeof(CpuKvHdr)) return false;
+        CpuKvHdr h;
+        std::memcpy(&h, in.data(), sizeof(h));
+        if (h.magic != 0x43504B31u) return false;
+        const int n_kv_layers = n_attn_ + (opt_.mtp ? 1 : 0);
+        if (h.n_kv_layers != n_kv_layers || h.n_kv_heads != cfg_.n_kv_heads || h.head_dim != cfg_.head_dim ||
+            h.n_tokens < 0 || h.n_tokens > opt_.max_ctx) return false;
+        const size_t rows = (size_t)n_kv_layers * (size_t)cfg_.n_kv_heads;
+        const size_t row_w = (size_t)h.n_tokens * (size_t)cfg_.head_dim * sizeof(float);
+        const size_t expected_payload = 2 * rows * row_w;
+        if (h.payload_bytes != expected_payload || in.size() != sizeof(CpuKvHdr) + expected_payload) return false;
+        if (row_w > 0 && rows > 0) {
+            const size_t dpitch = (size_t)opt_.max_ctx * (size_t)cfg_.head_dim * sizeof(float);
+            const uint8_t* kp = in.data() + sizeof(CpuKvHdr);
+            const uint8_t* vp = kp + rows * row_w;
+            uint8_t* kd = reinterpret_cast<uint8_t*>(k_cache_);
+            uint8_t* vd = reinterpret_cast<uint8_t*>(v_cache_);
+            for (size_t r = 0; r < rows; ++r) {
+                std::memcpy(kd + r * dpitch, kp + r * row_w, row_w);
+                std::memcpy(vd + r * dpitch, vp + r * row_w, row_w);
+            }
+        }
+        return true;
+    }
     void set_sparse(const std::string& v) override {
         sp_ = SparseCfg();
         if (v == "off" || v.empty()) return;

@@ -84,6 +84,13 @@ class Engine {
     virtual bool has_checkpoint() const { return false; }
     virtual bool save_checkpoint(std::vector<uint8_t>& out) { (void)out; return false; }
     virtual bool restore_checkpoint(const std::vector<uint8_t>& in) { (void)in; return false; }
+    virtual size_t checkpoint_bytes() const { return 0; }
+    // Host-RAM snapshot of the CURRENT sequence's non-ring KV cache prefix [0, n_tokens),
+    // paired with save_checkpoint()/restore_checkpoint() for independent parked context slots.
+    virtual bool has_kv_checkpoint() const { return false; }
+    virtual size_t kv_checkpoint_bytes(int n_tokens) const { (void)n_tokens; return 0; }
+    virtual bool save_kv_prefix(std::vector<uint8_t>& out, int n_tokens) { (void)out; (void)n_tokens; return false; }
+    virtual bool restore_kv_prefix(const std::vector<uint8_t>& in) { (void)in; return false; }
     virtual void set_sparse(const std::string&) {}
     virtual void set_mtp_enabled(bool) {}  // runtime switch (needs EngineOptions::mtp at construction)
     virtual void mtp_stats(MtpStats& s) const { s = MtpStats(); }

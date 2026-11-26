@@ -53,6 +53,7 @@ inline float spec_candidate_margin(const SpecSamplingParams& p) {
         return -std::log(p.min_p) + 1e-3f;
     }
     const float minp_margin = p.min_p > 0.0f ? (-std::log(p.min_p) + 1e-3f) : 10.0f;
+    if (p.top_k > 0) return std::max(14.0f, minp_margin);
     return std::max(10.0f, minp_margin);
 }
 
@@ -133,7 +134,8 @@ inline void apply_filters_and_temp(std::vector<SpecCand>& cur, double z_full, fl
 
 // Build SpecDist from GPU-extracted candidates (all tokens with val >= mx - margin). Returns false when a full-vocab fallback is required.
 inline bool build_dist_from_candidates(const int* ids, const float* vals, int count, float mx, double z_full,
-                                       const SpecSamplingParams& p, SpecDist& out, TokenConstraint* tc = nullptr) {
+                                       const SpecSamplingParams& p, SpecDist& out, TokenConstraint* tc = nullptr,
+                                       float margin = -1.0f) {
     if (count <= 0 || !std::isfinite(mx)) return false;
     const size_t min_k = (size_t)std::max(1, p.min_keep);
     const bool active_tc = tc && !tc->awaiting();
@@ -151,8 +153,6 @@ inline bool build_dist_from_candidates(const int* ids, const float* vals, int co
     }
     if (cur.empty()) return false;
     if (any_rejected && p.top_k <= 0 && p.top_p < 1.0f) return false;  // z_full includes disallowed tokens; use dense masked fallback
-    if (p.top_k > 0 && cur.size() < std::max<size_t>((size_t)p.top_k, min_k)) return false;
-    if (min_k > 1 && cur.size() < min_k) return false;
     if (p.temperature <= 0.0f) {
         int best_id = cur[0].id;
         float best_val = cur[0].val;
@@ -167,12 +167,75 @@ inline bool build_dist_from_candidates(const int* ids, const float* vals, int co
         out.sp.assign(1, {best_id, 1.0f});
         return true;
     }
+    if (min_k > 1 && cur.size() < min_k) return false;
     float cand_mx = mx;
     if (any_rejected) {
         cand_mx = cur[0].val;
         for (size_t i = 1; i < cur.size(); ++i) cand_mx = std::max(cand_mx, cur[i].val);
         const bool pure_temp = (p.top_k <= 0 && p.top_p >= 1.0f && p.min_p <= 0.0f);
         if (pure_temp && cand_mx < mx) return false;
+    }
+    if (p.top_k > 0) {
+        const size_t k = std::max<size_t>((size_t)p.top_k, min_k);
+        if (cur.size() < k) {
+            if (margin <= 0.0f) return false;
+            const double eff_margin = (double)margin - ((double)mx - (double)cand_mx);
+            if (eff_margin <= 0.0) return false;
+            const double tail_one = std::exp(-eff_margin);
+            const double eps = (double)(k - cur.size()) * tail_one;
+            std::sort(cur.begin(), cur.end(), [](const detail::SpecCand& a, const detail::SpecCand& b) {
+                return a.val > b.val || (a.val == b.val && a.id < b.id);
+            });
+            if (p.top_p < 1.0f) {
+                double sum_s = 0.0;
+                for (const auto& c : cur) sum_s += std::exp((double)c.val - (double)cand_mx);
+                if (!(sum_s > 0.0) || !std::isfinite(sum_s)) return false;
+                double cum = 0.0;
+                double prev_cum = 0.0;
+                size_t keep = cur.size();
+                bool found = false;
+                for (size_t i = 0; i < cur.size(); ++i) {
+                    const double w = std::exp((double)cur[i].val - (double)cand_mx);
+                    if (i + 1 >= min_k && !found) {
+                        const double next_cum = cum + w;
+                        if (next_cum / (sum_s + eps) >= (double)p.top_p) {
+                            keep = i + 1;
+                            prev_cum = cum;
+                            found = true;
+                            break;
+                        }
+                    }
+                    cum += w;
+                }
+                if (!found || (keep > min_k && prev_cum / sum_s >= (double)p.top_p)) return false;
+                cur.resize(keep);
+            } else if (p.min_p > 0.0f) {
+                if (tail_one >= (double)p.min_p) return false;
+            } else {
+                return false;
+            }
+            if (p.min_p > 0.0f && !cur.empty()) {
+                size_t keep = 0;
+                while (keep < cur.size() && std::exp((double)cur[keep].val - (double)cand_mx) >= (double)p.min_p) ++keep;
+                keep = std::max(keep, std::min(cur.size(), min_k));
+                cur.resize(keep);
+            }
+            if (cur.empty()) return false;
+            double sum_w = 0.0;
+            std::vector<double> w(cur.size());
+            const double inv_t = 1.0 / (double)p.temperature;
+            for (size_t i = 0; i < cur.size(); ++i) {
+                w[i] = std::exp(((double)cur[i].val - (double)cand_mx) * inv_t);
+                sum_w += w[i];
+            }
+            out.dense = false;
+            out.dn.clear();
+            out.sp.resize(cur.size());
+            const double inv_sum = sum_w > 0.0 ? (1.0 / sum_w) : 0.0;
+            for (size_t i = 0; i < cur.size(); ++i) out.sp[i] = {cur[i].id, (float)(w[i] * inv_sum)};
+            std::sort(out.sp.begin(), out.sp.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+            return true;
+        }
     }
     bool need_fallback = false;
     detail::apply_filters_and_temp(cur, z_full, cand_mx, false, p, out, need_fallback);

@@ -25,8 +25,21 @@ class MockEngine : public Engine {
     }
     int n_seq() const override { return (int)st_.size(); }
     void select_seq(int i) override { if (i < 0 || i >= (int)st_.size()) throw std::runtime_error("sequence index out of range"); cur_ = i; }
-    void step(int, int pos) override { delay(1); st_[cur_].k = pos + 1 - st_[cur_].prompt_end; }
-    void prefill(const int*, int T, int pos0) override { delay(T / 8 + 1); st_[cur_].prompt_end = pos0 + T; st_[cur_].k = 0; }
+    void step(int tok, int pos) override {
+        delay(1);
+        Seq& s = st_[cur_];
+        s.k = pos + 1 - s.prompt_end;
+        if ((int)s.kv.size() <= pos) s.kv.resize((size_t)pos + 1, -1);
+        s.kv[pos] = tok;
+    }
+    void prefill(const int* tokens, int T, int pos0) override {
+        delay(T / 8 + 1);
+        Seq& s = st_[cur_];
+        s.prompt_end = pos0 + T;
+        s.k = 0;
+        if ((int)s.kv.size() < pos0 + T) s.kv.resize((size_t)pos0 + T, -1);
+        for (int i = 0; i < T; ++i) s.kv[pos0 + i] = tokens ? tokens[i] : -1;
+    }
     void prefill_embeds(const int*, const float*, const unsigned char* mask, int T, int pos0) override {
         for (int i = 0; i < T; ++i) n_embeds_ += mask[i] ? 1 : 0;
         prefill(nullptr, T, pos0);
@@ -86,24 +99,59 @@ class MockEngine : public Engine {
         const float ru[3] = {18.0f, 17.0f, 16.0f};
         for (int j = 0; j < 3; ++j) { int a = (t + 1 + j * 7919) % V; if (a != t) out[a] = ru[j]; }
     }
-    void reset() override { st_[cur_].k = 0; st_[cur_].prompt_end = 0; }
+    void reset() override { st_[cur_].k = 0; st_[cur_].prompt_end = 0; st_[cur_].kv.clear(); }
     bool has_state_save() const override { return true; }
     void state_save() override { saved_ = st_[cur_]; }
     void state_restore() override { st_[cur_] = saved_; }
     bool has_checkpoint() const override { return true; }
+    size_t checkpoint_bytes() const override { return sizeof(int) * 2; }
     bool save_checkpoint(std::vector<uint8_t>& out) override {
-        out.resize(sizeof(Seq));
-        std::memcpy(out.data(), &st_[cur_], sizeof(Seq));
+        out.resize(sizeof(int) * 2);
+        std::memcpy(out.data(), &st_[cur_].k, sizeof(int));
+        std::memcpy(out.data() + sizeof(int), &st_[cur_].prompt_end, sizeof(int));
         ++ckpt_saves_;
         return true;
     }
     bool restore_checkpoint(const std::vector<uint8_t>& in) override {
-        if (in.size() != sizeof(Seq)) return false;
-        std::memcpy(&st_[cur_], in.data(), sizeof(Seq));
+        if (in.size() != sizeof(int) * 2) return false;
+        std::memcpy(&st_[cur_].k, in.data(), sizeof(int));
+        std::memcpy(&st_[cur_].prompt_end, in.data() + sizeof(int), sizeof(int));
         ++ckpt_restores_;
         return true;
     }
-    long ckpt_saves_ = 0, ckpt_restores_ = 0;
+    bool has_kv_checkpoint() const override { return true; }
+    size_t kv_checkpoint_bytes(int n_tokens) const override {
+        if (n_tokens < 0) return 0;
+        return sizeof(uint32_t) + sizeof(int) + (size_t)n_tokens * mock_kv_bytes_per_tok_;
+    }
+    bool save_kv_prefix(std::vector<uint8_t>& out, int n_tokens) override {
+        if (n_tokens < 0 || n_tokens > (int)st_[cur_].kv.size()) return false;
+        const size_t min_b = sizeof(uint32_t) + sizeof(int) + (size_t)n_tokens * sizeof(int);
+        const size_t pad_b = sizeof(uint32_t) + sizeof(int) + (size_t)n_tokens * mock_kv_bytes_per_tok_;
+        out.assign(std::max(min_b, pad_b), 0);
+        const uint32_t magic = 0x4D4B5631u;
+        std::memcpy(out.data(), &magic, sizeof(magic));
+        std::memcpy(out.data() + sizeof(magic), &n_tokens, sizeof(int));
+        if (n_tokens > 0) std::memcpy(out.data() + sizeof(magic) + sizeof(int), st_[cur_].kv.data(), (size_t)n_tokens * sizeof(int));
+        ++kv_saves_;
+        return true;
+    }
+    bool restore_kv_prefix(const std::vector<uint8_t>& in) override {
+        if (in.size() < sizeof(uint32_t) + sizeof(int)) return false;
+        uint32_t magic = 0;
+        int n_tokens = -1;
+        std::memcpy(&magic, in.data(), sizeof(magic));
+        std::memcpy(&n_tokens, in.data() + sizeof(magic), sizeof(int));
+        if (magic != 0x4D4B5631u || n_tokens < 0) return false;
+        if (in.size() < sizeof(uint32_t) + sizeof(int) + (size_t)n_tokens * sizeof(int)) return false;
+        st_[cur_].kv.resize((size_t)n_tokens);
+        if (n_tokens > 0) std::memcpy(st_[cur_].kv.data(), in.data() + sizeof(magic) + sizeof(int), (size_t)n_tokens * sizeof(int));
+        ++kv_restores_;
+        return true;
+    }
+    const std::vector<int>& mock_kv(int sq = 0) const { return st_[sq].kv; }
+    long ckpt_saves_ = 0, ckpt_restores_ = 0, kv_saves_ = 0, kv_restores_ = 0;
+    size_t mock_kv_bytes_per_tok_ = sizeof(int);
     const std::vector<float>& hidden_dump() const override { return empty_; }
     const std::vector<float>& logits_dump() const override { return empty_; }
     void sync() override {}
@@ -115,7 +163,7 @@ class MockEngine : public Engine {
     int eos_;
     bool loop_;
     int delay_us_;
-    struct Seq { int k = 0, prompt_end = 0; };
+    struct Seq { int k = 0, prompt_end = 0; std::vector<int> kv; };
     std::vector<Seq> st_;
     Seq saved_;
     int cur_ = 0;

@@ -683,27 +683,114 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
     r.n_prompt = N;
     if (!alive()) { r.aborted = true; return r; }
     try {
+        const int sq = seq_of(sid);
         auto& ckpts_ = ckpts_of(sid);
+        constexpr int kCkptTail = 16;
+        constexpr size_t kCkptMinDelta = 1024;
+        const size_t max_ckpts = multi_seq ? 1u : 2u;
+        const int min_ckpt_toks = std::max(1, o.checkpoint_min_tokens);
+        const bool l2_enabled = o.checkpoint_slots > 0 && o.checkpoint_ram_mb > 0 &&
+                                eng->has_checkpoint() && eng->has_kv_checkpoint();
+        const size_t max_ram_bytes = (size_t)o.checkpoint_ram_mb * (1024ull * 1024ull);
+
+        auto park_current_slot = [&]() {
+            if (!l2_enabled || !slot_cacheable_[sq] || (int)cached_.size() < min_ckpt_toks) return;
+            for (int id : cached_) if (id < 0) return;  // multimodal placeholder tokens cannot be safely parked
+            int best_pre_ci = -1, exact_end_ci = -1;
+            size_t best_pre_len = 0;
+            for (int ci = 0; ci < (int)ckpts_.size(); ++ci) {
+                const size_t len = ckpts_[ci].tokens.size();
+                if (len == cached_.size()) exact_end_ci = ci;
+                else if (len < cached_.size() && len > best_pre_len) {
+                    best_pre_len = len;
+                    best_pre_ci = ci;
+                }
+            }
+            const size_t kv_est = eng->kv_checkpoint_bytes((int)cached_.size());
+            if (kv_est == 0) return;
+            size_t est = kv_est;
+            if (best_pre_ci >= 0) est += ckpts_[best_pre_ci].bytes();
+            if (exact_end_ci >= 0) est += ckpts_[exact_end_ci].bytes();
+            else est += cached_.size() * sizeof(int) + eng->checkpoint_bytes();
+            if (!parked_pool_.reserve_for(est, o.checkpoint_slots, max_ram_bytes)) return;
+
+            auto tp_park0 = now();
+            ParkedSlot ps;
+            ps.kv_tokens = (int)cached_.size();
+            std::vector<uint8_t> end_blob;
+            bool ok_save = false;
+            {
+                EngOp op(*this, sid);
+                ok_save = eng->save_kv_prefix(ps.kv_blob, ps.kv_tokens);
+                if (ok_save && exact_end_ci < 0) ok_save = eng->save_checkpoint(end_blob);
+            }
+            if (!ok_save) return;
+            if (best_pre_ci >= 0) ps.points.push_back(ckpts_[best_pre_ci]);
+            if (exact_end_ci >= 0) ps.points.push_back(ckpts_[exact_end_ci]);
+            else ps.points.push_back(PromptCheckpoint{cached_, std::move(end_blob)});
+            const size_t n_pts = ps.points.size();
+            const size_t ps_bytes = ps.bytes();
+            const int ps_toks = ps.kv_tokens;
+            if (parked_pool_.insert(std::move(ps), o.checkpoint_slots, max_ram_bytes) &&
+                o.verbosity >= 3 && !o.log_disable) {
+                std::fprintf(stderr,
+                             "[qv_server] slot %d parked L2 checkpoint: tokens=%d points=%zu (%.1f MB, %.0fms, pool=%zu/%d %.1f MB)\n",
+                             sid, ps_toks, n_pts, ps_bytes / (1024.0 * 1024.0), ms(tp_park0, now()),
+                             parked_pool_.size(), o.checkpoint_slots, parked_pool_.total_bytes() / (1024.0 * 1024.0));
+            }
+        };
+
         size_t start = 0;
         if (t.cache_prompt && !cached_.empty() && cached_.size() <= (size_t)N && std::equal(cached_.begin(), cached_.end(), t.prompt.begin())) {
             start = cached_.size();
-        } else if (t.cache_prompt && !ckpts_.empty() && eng->has_checkpoint()) {
-            int best_ci = -1;
-            size_t best_len = 0;
-            for (int ci = 0; ci < (int)ckpts_.size(); ++ci) {
-                const auto& toks = ckpts_[ci].tokens;
-                if (!toks.empty() && toks.size() <= (size_t)N && toks.size() > best_len &&
-                    std::equal(toks.begin(), toks.end(), t.prompt.begin())) {
-                    best_len = toks.size();
-                    best_ci = ci;
+        } else if (t.cache_prompt) {
+            int best_l1_ci = -1;
+            size_t best_l1_len = 0;
+            if (!ckpts_.empty() && eng->has_checkpoint()) {
+                for (int ci = 0; ci < (int)ckpts_.size(); ++ci) {
+                    const auto& toks = ckpts_[ci].tokens;
+                    if (!toks.empty() && toks.size() <= (size_t)N && toks.size() > best_l1_len &&
+                        std::equal(toks.begin(), toks.end(), t.prompt.begin())) {
+                        best_l1_len = toks.size();
+                        best_l1_ci = ci;
+                    }
                 }
             }
-            if (best_ci >= 0) {
+            ParkedCheckpointPool::Match l2m;
+            const bool have_l2 = l2_enabled && parked_pool_.take_best_match(t.prompt, best_l1_len, l2m);
+            if (have_l2) {
+                park_current_slot();
+                auto tp_rest0 = now();
+                const size_t l2_bytes = l2m.slot.bytes();
                 bool ok = false;
-                { EngOp op(*this, sid); ok = eng->restore_checkpoint(ckpts_[best_ci].blob); }
+                {
+                    EngOp op(*this, sid);
+                    ok = eng->restore_kv_prefix(l2m.slot.kv_blob) &&
+                         eng->restore_checkpoint(l2m.slot.points[l2m.point_idx].blob);
+                }
                 if (ok) {
-                    start = best_len;
-                    cached_ = ckpts_[best_ci].tokens;
+                    start = l2m.match_len;
+                    cached_ = l2m.slot.points[l2m.point_idx].tokens;
+                    ckpts_.clear();
+                    for (auto& pt : l2m.slot.points) {
+                        if (pt.tokens.size() <= start) ckpts_.push_back(std::move(pt));
+                    }
+                    std::sort(ckpts_.begin(), ckpts_.end(),
+                              [](const PromptCheckpoint& a, const PromptCheckpoint& b) { return a.tokens.size() < b.tokens.size(); });
+                    if (ckpts_.size() > max_ckpts) {
+                        ckpts_.erase(ckpts_.begin(), ckpts_.end() - (std::ptrdiff_t)max_ckpts);
+                    }
+                    if (o.verbosity >= 3 && !o.log_disable) {
+                        std::fprintf(stderr, "[qv_server] slot %d restored L2 checkpoint: cached=%zu/%d (%.1f MB, %.0fms)\n",
+                                     sid, start, N, l2_bytes / (1024.0 * 1024.0), ms(tp_rest0, now()));
+                    }
+                }
+            } else if (best_l1_ci >= 0) {
+                bool ok = false;
+                { EngOp op(*this, sid); ok = eng->restore_checkpoint(ckpts_[best_l1_ci].blob); }
+                if (ok) {
+                    start = best_l1_len;
+                    cached_ = ckpts_[best_l1_ci].tokens;
                     ckpts_.erase(
                         std::remove_if(ckpts_.begin(), ckpts_.end(),
                                        [&](const PromptCheckpoint& c) { return c.tokens.size() > start; }),
@@ -712,11 +799,14 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
             }
         }
         if (start == 0) {
-            EngOp op(*this, sid);
-            eng->reset();
+            park_current_slot();
+            { EngOp op(*this, sid); eng->reset(); }
             cached_.clear();
             ckpts_.clear();
         }
+        if (start == 0) slot_cacheable_[sq] = (t.cache_prompt && t.images.empty()) ? 1 : 0;
+        else if (!t.images.empty()) slot_cacheable_[sq] = 0;
+        else if (t.cache_prompt) slot_cacheable_[sq] = 1;
         r.n_cache = (int)start;
         r.n_prompt_eval = N - (int)start;
         { std::lock_guard<std::mutex> lk(mu_); slots_[sid].n_prompt_cache = (int)start; }
@@ -731,15 +821,12 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
             img_emb.back().resize((size_t)ip.n * venc->cfg().text_hidden);
             { std::lock_guard<std::mutex> vlk(venc_mu_); venc->encode(*ip.px, img_emb.back().data()); }
         }
-        constexpr int kCkptTail = 16;
-        constexpr int kCkptMinPrompt = 4096;
-        constexpr size_t kCkptMinDelta = 1024;
-        const size_t max_ckpts = multi_seq ? 1u : 2u;
+        const int ckpt_min_prompt = std::max(kCkptTail + 1, o.checkpoint_min_tokens);
         size_t prev_ck_len = 0;
         for (const auto& c : ckpts_) prev_ck_len = std::max(prev_ck_len, c.tokens.size());
         const bool want_ckpt = t.cache_prompt && t.images.empty() && eng->has_checkpoint() &&
-                               N >= kCkptMinPrompt && (size_t)(N - kCkptTail) > start &&
-                               (size_t)(N - kCkptTail) >= prev_ck_len + kCkptMinDelta;
+                               N >= ckpt_min_prompt && (size_t)(N - kCkptTail) > start &&
+                               (prev_ck_len == 0 || (size_t)(N - kCkptTail) >= prev_ck_len + kCkptMinDelta);
         const size_t ckpt_cut = want_ckpt ? (size_t)(N - kCkptTail) : 0;
         bool ckpt_done = !want_ckpt;
         for (size_t off = start; off < (size_t)N;) {
@@ -1049,6 +1136,7 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
         { EngOp op(*this, sid); eng->reset(); }
         cached_.clear();
         ckpts_of(sid).clear();
+        slot_cacheable_[seq_of(sid)] = 0;
         std::fprintf(stderr, "[qv_server] engine error: %s\n", e.what());
         throw_error(500, std::string("engine error: ") + e.what());
     }
