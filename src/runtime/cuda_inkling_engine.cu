@@ -197,6 +197,72 @@ class InklingEngine final : public Engine {
         QV_CUDA_CHECK(cudaMemset(ticket_, 0, 4));
         QV_CUDA_CHECK(cudaDeviceSynchronize());
     }
+    bool has_checkpoint() const override { return !mtp_; }
+    bool save_checkpoint(std::vector<uint8_t>& out) override {
+        if (mtp_) return false;
+        struct InkCkptHdr {
+            uint32_t magic = 0x494B4331u;
+            uint64_t lkv_b = 0, cstk_b = 0, csta_b = 0, logits_b = 0;
+        };
+        flush_fin();
+        QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
+        InkCkptHdr h;
+        h.lkv_b = (size_t)n_lslots_ * ik::NKV * 1024 * ik::HD * sizeof(__half);
+        h.cstk_b = (size_t)48 * 3 * 1024 * sizeof(float);
+        h.csta_b = (size_t)48 * 3 * ik::H * sizeof(float);
+        h.logits_b = (size_t)cfg_.vocab * sizeof(float);
+        const size_t tot = sizeof(InkCkptHdr) + 2 * h.lkv_b + 2 * h.cstk_b + 2 * h.csta_b + h.logits_b;
+        out.resize(tot);
+        uint8_t* p = out.data();
+        std::memcpy(p, &h, sizeof(h));
+        p += sizeof(h);
+        auto get = [&](const void* src, size_t b) {
+            if (b > 0) QV_CUDA_CHECK(cudaMemcpy(p, src, b, cudaMemcpyDeviceToHost));
+            p += b;
+        };
+        get(lk_, h.lkv_b);
+        get(lv_, h.lkv_b);
+        get(cst_k_, h.cstk_b);
+        get(cst_v_, h.cstk_b);
+        get(cst_a_, h.csta_b);
+        get(cst_m_, h.csta_b);
+        get(logits_, h.logits_b);
+        return true;
+    }
+    bool restore_checkpoint(const std::vector<uint8_t>& in) override {
+        if (mtp_) return false;
+        struct InkCkptHdr {
+            uint32_t magic = 0x494B4331u;
+            uint64_t lkv_b = 0, cstk_b = 0, csta_b = 0, logits_b = 0;
+        };
+        if (in.size() < sizeof(InkCkptHdr)) return false;
+        InkCkptHdr h;
+        std::memcpy(&h, in.data(), sizeof(h));
+        if (h.magic != 0x494B4331u) return false;
+        const size_t lkv_b = (size_t)n_lslots_ * ik::NKV * 1024 * ik::HD * sizeof(__half);
+        const size_t cstk_b = (size_t)48 * 3 * 1024 * sizeof(float);
+        const size_t csta_b = (size_t)48 * 3 * ik::H * sizeof(float);
+        const size_t logits_b = (size_t)cfg_.vocab * sizeof(float);
+        if (h.lkv_b != lkv_b || h.cstk_b != cstk_b || h.csta_b != csta_b || h.logits_b != logits_b) return false;
+        const size_t tot = sizeof(InkCkptHdr) + 2 * lkv_b + 2 * cstk_b + 2 * csta_b + logits_b;
+        if (in.size() != tot) return false;
+        QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
+        pend_.on = false;
+        const uint8_t* p = in.data() + sizeof(InkCkptHdr);
+        auto put = [&](void* dst, size_t b) {
+            if (b > 0) QV_CUDA_CHECK(cudaMemcpy(dst, p, b, cudaMemcpyHostToDevice));
+            p += b;
+        };
+        put(lk_, lkv_b);
+        put(lv_, lkv_b);
+        put(cst_k_, cstk_b);
+        put(cst_v_, cstk_b);
+        put(cst_a_, csta_b);
+        put(cst_m_, csta_b);
+        put(logits_, logits_b);
+        QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
+        return true;
+    }
     const std::vector<float>& hidden_dump() const override { return hidden_; }
     const std::vector<float>& logits_dump() const override { return logits_dump_; }
     const std::vector<int>& aux_dump() const override { return rids_; }

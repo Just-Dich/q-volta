@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <random>
 #include <thread>
 
@@ -88,6 +90,20 @@ class MockEngine : public Engine {
     bool has_state_save() const override { return true; }
     void state_save() override { saved_ = st_[cur_]; }
     void state_restore() override { st_[cur_] = saved_; }
+    bool has_checkpoint() const override { return true; }
+    bool save_checkpoint(std::vector<uint8_t>& out) override {
+        out.resize(sizeof(Seq));
+        std::memcpy(out.data(), &st_[cur_], sizeof(Seq));
+        ++ckpt_saves_;
+        return true;
+    }
+    bool restore_checkpoint(const std::vector<uint8_t>& in) override {
+        if (in.size() != sizeof(Seq)) return false;
+        std::memcpy(&st_[cur_], in.data(), sizeof(Seq));
+        ++ckpt_restores_;
+        return true;
+    }
+    long ckpt_saves_ = 0, ckpt_restores_ = 0;
     const std::vector<float>& hidden_dump() const override { return empty_; }
     const std::vector<float>& logits_dump() const override { return empty_; }
     void sync() override {}

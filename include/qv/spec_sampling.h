@@ -46,7 +46,9 @@ struct SpecDist {
 // Margin (mx - val <= margin) for GPU candidate extraction; < 0 means go straight to dense softmax.
 inline float spec_candidate_margin(const SpecSamplingParams& p) {
     if (p.temperature <= 0.0f) return 0.0f;
-    if (p.top_k <= 0 && p.top_p >= 1.0f && p.min_p <= 0.0f) return -1.0f;
+    if (p.top_k <= 0 && p.top_p >= 1.0f && p.min_p <= 0.0f) {
+        return (p.temperature <= 1.5f) ? (24.0f * p.temperature) : -1.0f;
+    }
     if (p.min_p > 0.0f && p.top_p >= 1.0f && p.top_k <= 0 && p.min_keep <= 1) {
         return -std::log(p.min_p) + 1e-3f;
     }
@@ -169,6 +171,8 @@ inline bool build_dist_from_candidates(const int* ids, const float* vals, int co
     if (any_rejected) {
         cand_mx = cur[0].val;
         for (size_t i = 1; i < cur.size(); ++i) cand_mx = std::max(cand_mx, cur[i].val);
+        const bool pure_temp = (p.top_k <= 0 && p.top_p >= 1.0f && p.min_p <= 0.0f);
+        if (pure_temp && cand_mx < mx) return false;
     }
     bool need_fallback = false;
     detail::apply_filters_and_temp(cur, z_full, cand_mx, false, p, out, need_fallback);
@@ -203,13 +207,47 @@ inline void build_dist_dense(const float* logits, int V, const SpecSamplingParam
     if (p.top_k <= 0 && p.top_p >= 1.0f && p.min_p <= 0.0f) {
         float mx = -std::numeric_limits<float>::infinity();
         for (int i = 0; i < V; ++i) mx = std::max(mx, logits[i]);
+        if (!std::isfinite(mx)) {
+            out.dense = false;
+            out.dn.clear();
+            out.sp.assign(1, {0, 1.0f});
+            return;
+        }
+        const double inv_t = 1.0 / (double)p.temperature;
+        if (V > 256) {
+            out.sp.clear();
+            out.sp.reserve(256);
+            double sum_sp = 0.0;
+            bool overflow = false;
+            for (int i = 0; i < V; ++i) {
+                if (!std::isfinite(logits[i])) continue;
+                const double z = ((double)logits[i] - (double)mx) * inv_t;
+                if (z > -36.0) {
+                    if (out.sp.size() >= 2048) { overflow = true; break; }
+                    const float w = (float)std::exp(z);
+                    out.sp.emplace_back(i, w);
+                    sum_sp += w;
+                }
+            }
+            if (!overflow && !out.sp.empty() && sum_sp > 0.0) {
+                const double inv_s = 1.0 / sum_sp;
+                for (auto& kv : out.sp) kv.second = (float)(kv.second * inv_s);
+                out.dense = false;
+                out.dn.clear();
+                return;
+            }
+            out.sp.clear();
+        }
         out.dense = true;
         out.sp.clear();
         out.dn.resize((size_t)V);
         double sum = 0.0;
-        const double inv_t = 1.0 / (double)p.temperature;
         for (int i = 0; i < V; ++i) {
-            const float w = std::isfinite(logits[i]) ? std::exp((float)(((double)logits[i] - (double)mx) * inv_t)) : 0.0f;
+            float w = 0.0f;
+            if (std::isfinite(logits[i])) {
+                const double z = ((double)logits[i] - (double)mx) * inv_t;
+                if (z > -36.0) w = (float)std::exp(z);
+            }
             out.dn[(size_t)i] = w;
             sum += w;
         }
@@ -221,28 +259,76 @@ inline void build_dist_dense(const float* logits, int V, const SpecSamplingParam
         }
         return;
     }
-    std::vector<detail::SpecCand> cur((size_t)V);
     float mx = -std::numeric_limits<float>::infinity();
-    for (int i = 0; i < V; ++i) {
-        cur[(size_t)i] = {i, logits[i]};
-        mx = std::max(mx, logits[i]);
+    for (int i = 0; i < V; ++i) mx = std::max(mx, logits[i]);
+    const size_t min_k = (size_t)std::max(1, p.min_keep);
+    auto gt = [](const detail::SpecCand& a, const detail::SpecCand& b) {
+        return a.val > b.val || (a.val == b.val && a.id < b.id);
+    };
+    if (!std::isfinite(mx)) {
+        out.dense = false;
+        out.dn.clear();
+        out.sp.assign(1, {0, 1.0f});
+        return;
     }
-    double z_full = 0.0;
-    if (p.top_p < 1.0f && p.top_k <= 0 && std::isfinite(mx)) {
-        for (int i = 0; i < V; ++i) z_full += std::exp((double)logits[i] - (double)mx);
-    }
+    auto fill_finite_or_all = [&](std::vector<detail::SpecCand>& dst, size_t req_k) {
+        dst.clear();
+        dst.reserve(std::min((size_t)V, std::max<size_t>(req_k, 1024)));
+        for (int i = 0; i < V; ++i) {
+            if (std::isfinite(logits[i])) dst.push_back({i, logits[i]});
+        }
+        if (dst.size() < req_k) {
+            dst.resize((size_t)V);
+            for (int i = 0; i < V; ++i) dst[(size_t)i] = {i, logits[i]};
+        }
+    };
+    std::vector<detail::SpecCand> cur;
     if (p.top_k > 0) {
-        const size_t k = std::max<size_t>((size_t)p.top_k, (size_t)std::max(1, p.min_keep));
+        const size_t k = std::max<size_t>((size_t)p.top_k, min_k);
+        fill_finite_or_all(cur, k);
         if (k < cur.size()) {
-            auto gt = [](const detail::SpecCand& a, const detail::SpecCand& b) {
-                return a.val > b.val || (a.val == b.val && a.id < b.id);
-            };
             std::nth_element(cur.begin(), cur.begin() + k, cur.end(), gt);
             cur.resize(k);
         }
+        bool need_fallback = false;
+        detail::apply_filters_and_temp(cur, 0.0, mx, true, p, out, need_fallback);
+    } else if (p.top_p < 1.0f) {
+        double z_full = 0.0;
+        cur.reserve(256);
+        for (int i = 0; i < V; ++i) {
+            if (!std::isfinite(logits[i])) continue;
+            const float d = logits[i] - mx;
+            if (d > -36.0f) z_full += std::exp((double)d);
+            if (d >= -14.0f) cur.push_back({i, logits[i]});
+        }
+        bool need_fallback = false;
+        if (!cur.empty()) {
+            detail::apply_filters_and_temp(cur, z_full, mx, false, p, out, need_fallback);
+        } else {
+            need_fallback = true;
+        }
+        if (need_fallback) {
+            fill_finite_or_all(cur, min_k);
+            detail::apply_filters_and_temp(cur, z_full, mx, true, p, out, need_fallback);
+        }
+    } else {
+        const float thr = mx + std::log(p.min_p) - 1e-4f;
+        cur.reserve(256);
+        for (int i = 0; i < V; ++i) {
+            if (std::isfinite(logits[i]) && logits[i] >= thr) cur.push_back({i, logits[i]});
+        }
+        bool need_fallback = false;
+        if (cur.size() >= min_k) {
+            detail::apply_filters_and_temp(cur, 0.0, mx, true, p, out, need_fallback);
+        } else {
+            fill_finite_or_all(cur, min_k);
+            if (min_k < cur.size()) {
+                std::nth_element(cur.begin(), cur.begin() + min_k, cur.end(), gt);
+                cur.resize(min_k);
+            }
+            detail::apply_filters_and_temp(cur, 0.0, mx, true, p, out, need_fallback);
+        }
     }
-    bool need_fallback = false;
-    detail::apply_filters_and_temp(cur, z_full, mx, true, p, out, need_fallback);
 }
 
 inline double spec_uniform(std::mt19937_64& rng) {

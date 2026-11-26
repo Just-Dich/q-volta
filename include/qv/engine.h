@@ -79,6 +79,11 @@ class Engine {
     virtual bool has_state_save() const { return false; }
     virtual void state_save() {}
     virtual void state_restore() {}
+    // Host-RAM prefix checkpoint of the CURRENT sequence (mutable recurrent/conv state, ring KV windows, last logits).
+    // Safe to restore as long as non-ring KV positions [0, checkpoint_pos) have not been overwritten since save_checkpoint().
+    virtual bool has_checkpoint() const { return false; }
+    virtual bool save_checkpoint(std::vector<uint8_t>& out) { (void)out; return false; }
+    virtual bool restore_checkpoint(const std::vector<uint8_t>& in) { (void)in; return false; }
     virtual void set_sparse(const std::string&) {}
     virtual void set_mtp_enabled(bool) {}  // runtime switch (needs EngineOptions::mtp at construction)
     virtual void mtp_stats(MtpStats& s) const { s = MtpStats(); }

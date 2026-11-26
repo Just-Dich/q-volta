@@ -524,13 +524,16 @@ int App::pick_slot_locked(const Waiter& w) const {
     if (w.want >= 0 && w.want < n_slots) return slot_busy_[w.want] ? -1 : w.want;
     int best = -1;
     size_t best_len = 0;
-    for (int s = 0; s < n_slots; ++s) {  // 1. idle slot whose cached context is a prefix of the prompt (longest wins)
+    for (int s = 0; s < n_slots; ++s) {  // 1. idle slot whose cached context (or prefix checkpoint) is a prefix of the prompt (longest wins)
         if (slot_busy_[s]) continue;
-        const std::vector<int>& c = slot_cached_[s];
-        if (w.prompt && !c.empty() && c.size() <= w.prompt->size() && c.size() > best_len && std::equal(c.begin(), c.end(), w.prompt->begin())) { best = s; best_len = c.size(); }
+        auto consider = [&](const std::vector<int>& c) {
+            if (w.prompt && !c.empty() && c.size() <= w.prompt->size() && c.size() > best_len && std::equal(c.begin(), c.end(), w.prompt->begin())) { best = s; best_len = c.size(); }
+        };
+        consider(slot_cached_[s]);
+        for (const auto& ck : slot_ckpts_[s]) consider(ck.tokens);
     }
     if (best >= 0) return best;
-    for (int s = 0; s < n_slots; ++s) if (!slot_busy_[s] && slot_cached_[s].empty()) return s;  // 2. an empty slot
+    for (int s = 0; s < n_slots; ++s) if (!slot_busy_[s] && slot_cached_[s].empty() && slot_ckpts_[s].empty()) return s;  // 2. an empty slot
     for (int s = 0; s < n_slots; ++s)                                                          // 3. least recently used
         if (!slot_busy_[s] && (best < 0 || slot_used_[s] < slot_used_[best])) best = s;
     return best;
@@ -680,9 +683,40 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
     r.n_prompt = N;
     if (!alive()) { r.aborted = true; return r; }
     try {
+        auto& ckpts_ = ckpts_of(sid);
         size_t start = 0;
-        if (t.cache_prompt && !cached_.empty() && cached_.size() <= (size_t)N && std::equal(cached_.begin(), cached_.end(), t.prompt.begin())) start = cached_.size();
-        else { EngOp op(*this, sid); eng->reset(); cached_.clear(); }
+        if (t.cache_prompt && !cached_.empty() && cached_.size() <= (size_t)N && std::equal(cached_.begin(), cached_.end(), t.prompt.begin())) {
+            start = cached_.size();
+        } else if (t.cache_prompt && !ckpts_.empty() && eng->has_checkpoint()) {
+            int best_ci = -1;
+            size_t best_len = 0;
+            for (int ci = 0; ci < (int)ckpts_.size(); ++ci) {
+                const auto& toks = ckpts_[ci].tokens;
+                if (!toks.empty() && toks.size() <= (size_t)N && toks.size() > best_len &&
+                    std::equal(toks.begin(), toks.end(), t.prompt.begin())) {
+                    best_len = toks.size();
+                    best_ci = ci;
+                }
+            }
+            if (best_ci >= 0) {
+                bool ok = false;
+                { EngOp op(*this, sid); ok = eng->restore_checkpoint(ckpts_[best_ci].blob); }
+                if (ok) {
+                    start = best_len;
+                    cached_ = ckpts_[best_ci].tokens;
+                    ckpts_.erase(
+                        std::remove_if(ckpts_.begin(), ckpts_.end(),
+                                       [&](const PromptCheckpoint& c) { return c.tokens.size() > start; }),
+                        ckpts_.end());
+                }
+            }
+        }
+        if (start == 0) {
+            EngOp op(*this, sid);
+            eng->reset();
+            cached_.clear();
+            ckpts_.clear();
+        }
         r.n_cache = (int)start;
         r.n_prompt_eval = N - (int)start;
         { std::lock_guard<std::mutex> lk(mu_); slots_[sid].n_prompt_cache = (int)start; }
@@ -697,11 +731,23 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
             img_emb.back().resize((size_t)ip.n * venc->cfg().text_hidden);
             { std::lock_guard<std::mutex> vlk(venc_mu_); venc->encode(*ip.px, img_emb.back().data()); }
         }
+        constexpr int kCkptTail = 16;
+        constexpr int kCkptMinPrompt = 4096;
+        constexpr size_t kCkptMinDelta = 2048;
+        const size_t max_ckpts = multi_seq ? 1u : 2u;
+        size_t prev_ck_len = 0;
+        for (const auto& c : ckpts_) prev_ck_len = std::max(prev_ck_len, c.tokens.size());
+        const bool want_ckpt = t.cache_prompt && t.images.empty() && eng->has_checkpoint() &&
+                               N >= kCkptMinPrompt && (size_t)(N - kCkptTail) > start &&
+                               (size_t)(N - kCkptTail) >= prev_ck_len + kCkptMinDelta;
+        const size_t ckpt_cut = want_ckpt ? (size_t)(N - kCkptTail) : 0;
+        bool ckpt_done = !want_ckpt;
         for (size_t off = start; off < (size_t)N;) {
             if (!alive()) { r.aborted = true; return r; }
             // prefill budget per engine turn: with other slots running, smaller chunks so their decode steps are not stalled for long
             const int ch = (multi_seq && n_busy_ > 1) ? std::min(chunk, std::max(1, shared_chunk)) : chunk;
             int n = (int)std::min<size_t>(ch, N - off);
+            if (!ckpt_done && off < ckpt_cut && off + (size_t)n > ckpt_cut) n = (int)(ckpt_cut - off);
             { EngOp op(*this, sid);
               if (t.images.empty()) eng->prefill(t.prompt.data() + off, n, (int)off);
               else prefill_with_images(t, (int)off, n, img_emb); }
@@ -709,6 +755,17 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
             { std::lock_guard<std::mutex> lk(mu_); slots_[sid].n_prompt_processed = (int)(off + n - start); }
             if (t.on_progress) t.on_progress(N, (int)start, (int)(off + n), ms(tp0, now()));
             off += n;
+            if (!ckpt_done && off == ckpt_cut) {
+                PromptCheckpoint ck;
+                ck.tokens = cached_;
+                bool saved = false;
+                { EngOp op(*this, sid); saved = eng->save_checkpoint(ck.blob); }
+                if (saved) {
+                    if (ckpts_.size() >= max_ckpts) ckpts_.back() = std::move(ck);
+                    else ckpts_.push_back(std::move(ck));
+                }
+                ckpt_done = true;
+            }
         }
         r.prompt_ms = ms(tp0, now());
         if (t.n_predict == 0) { r.stop_type = "limit"; r.tokens_cached = (int)cached_.size(); goto done; }
@@ -991,6 +1048,7 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
     } catch (const std::exception& e) {
         { EngOp op(*this, sid); eng->reset(); }
         cached_.clear();
+        ckpts_of(sid).clear();
         std::fprintf(stderr, "[qv_server] engine error: %s\n", e.what());
         throw_error(500, std::string("engine error: ") + e.what());
     }

@@ -128,6 +128,7 @@ class Sampler {
     void apply_dry(std::vector<float>& lg) const;
     void softmax();
     void sort_desc();
+    void keep_best_one();
     void s_top_k(int k);
     void s_top_p(float p);
     void s_min_p(float p);

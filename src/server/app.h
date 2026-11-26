@@ -251,8 +251,14 @@ class App {
     FairMutex eng_mu_;  // engine operations (prefill chunk / decode step) of the concurrently running sequences
     std::vector<SlotInfo> slots_;
     std::vector<std::vector<int>> slot_cached_;  // per sequence: tokens inside the engine (logits valid for exactly this context)
+    struct PromptCheckpoint {
+        std::vector<int> tokens;
+        std::vector<uint8_t> blob;
+    };
+    std::vector<std::vector<PromptCheckpoint>> slot_ckpts_;
     int seq_of(int sid) const { return multi_seq ? sid : 0; }
     std::vector<int>& cached_of(int sid) { return slot_cached_[seq_of(sid)]; }
+    std::vector<PromptCheckpoint>& ckpts_of(int sid) { return slot_ckpts_[seq_of(sid)]; }
     int owner_slot_ = 0;
     long task_counter_ = 0;
     // metrics

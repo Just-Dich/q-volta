@@ -63,6 +63,7 @@ void App::set_sequences(bool multi) {
     slot_busy_.assign(n_slots, 0);
     slot_used_.assign(n_slots, 0);
     slot_cached_.assign(multi_seq ? n_slots : 1, std::vector<int>());
+    slot_ckpts_.assign(multi_seq ? n_slots : 1, {});
 }
 
 Value App::model_json() const {
@@ -345,6 +346,7 @@ void App::handle_slot_action(const http::Request& req, http::Conn& c, int id) {
         long n = (long)cached_.size();
         { EngTurn tn(*this, id); eng->reset(); }
         cached_.clear();
+        ckpts_of(id).clear();
         r.set("n_erased", n);
     } else if (action == "save") {
         for (int c : cached_) if (c < 0) throw_error(400, "Unable to save slot: it holds image tokens (images are not serialised)");
@@ -377,6 +379,7 @@ void App::handle_slot_action(const http::Request& req, http::Conn& c, int id) {
         std::fclose(f);
         { EngTurn tn(*this, id); eng->reset(); }
         cached_.clear();
+        ckpts_of(id).clear();
         for (size_t off = 0; off < toks.size(); off += chunk) {
             int k = (int)std::min<size_t>(chunk, toks.size() - off);
             { EngTurn tn(*this, id); eng->prefill(toks.data() + off, k, (int)off); }
@@ -627,6 +630,7 @@ void App::ensure_engine() {
     eng = reload_engine();
     eng->sync();
     for (auto& c : slot_cached_) c.clear();
+    for (auto& v : slot_ckpts_) v.clear();
     sleeping = false;
     std::fprintf(stderr, "[qv_server] model reloaded in %.1fs\n", std::chrono::duration<double>(Clock::now() - t0).count());
 }
@@ -652,6 +656,7 @@ void App::start_sleep_watcher() {
                     std::fprintf(stderr, "[qv_server] server is entering sleeping state (idle for %d s): model unloaded\n", o.sleep_idle_seconds);
                     eng.reset();
                     for (auto& c : slot_cached_) c.clear();
+                    for (auto& v : slot_ckpts_) v.clear();
                     sleeping = true;
                 }
             }
@@ -686,6 +691,7 @@ void App::unload_model() {
         matchers_.clear();
     }
     for (auto& c : slot_cached_) c.clear();
+    for (auto& v : slot_ckpts_) v.clear();
     tok = Tokenizer();
     model_id.clear();
     model_template.clear();

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -168,6 +169,7 @@ class CudaEngine final : public Engine {
         if (pos0 + T > opt_.max_ctx) throw std::runtime_error("context overflow");
         ensure_prefill_buffers();
         mtp_pf_ = opt_.mtp && mtp_on_ && !opt_.dump_hidden && (pos0 == 0 || pos0 == mtp_ready_);
+        if (mtp_pf_ && pos0 > 0 && T > 0) mtp_draft(1, tokens, hlast_, pos0 - 1, 1);
         mtp_ready_ = -1;
         mtp_pf_T_ = T;
         const int L = (int)layers_.size(), H = cfg_.hidden;
@@ -365,6 +367,77 @@ class CudaEngine final : public Engine {
         if (save_gdn_ && gdn_bytes_ > 0) QV_CUDA_CHECK(cudaMemcpyAsync(gdn_state_, save_gdn_, gdn_bytes_, cudaMemcpyDeviceToDevice, stream_));
         mtp_ready_ = -1;
         QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
+    }
+    bool has_checkpoint() const override { return true; }
+    bool save_checkpoint(std::vector<uint8_t>& out) override {
+        struct CkptHdr {
+            uint32_t magic = 0x51564331u;
+            int32_t mtp_ready = -1;
+            uint64_t conv_b = 0, gdn_b = 0, ring_b = 0, hlast_b = 0, logits_b = 0;
+        };
+        QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
+        CkptHdr h;
+        h.mtp_ready = mtp_ready_;
+        h.conv_b = conv_bytes_;
+        h.gdn_b = gdn_bytes_;
+        const size_t n_kv_layers = (size_t)n_attn_ + (opt_.mtp ? 1 : 0);
+        if (kv4_on_ && !kv4_.empty() && !kv4_[0].exact && kv4_ring_k_ && kv4_ring_v_) {
+            h.ring_b = n_kv_layers * (size_t)cfg_.n_kv_heads * (size_t)KV4_RING * (size_t)KV4_D * sizeof(__half);
+        }
+        h.hlast_b = (opt_.mtp && hlast_) ? (size_t)cfg_.hidden * sizeof(float) : 0;
+        h.logits_b = (size_t)cfg_.vocab * sizeof(float);
+        const size_t tot = sizeof(CkptHdr) + h.conv_b + h.gdn_b + 2 * h.ring_b + h.hlast_b + h.logits_b;
+        out.resize(tot);
+        uint8_t* p = out.data();
+        std::memcpy(p, &h, sizeof(h));
+        p += sizeof(h);
+        auto get = [&](const void* src, size_t b) {
+            if (b > 0) QV_CUDA_CHECK(cudaMemcpy(p, src, b, cudaMemcpyDeviceToHost));
+            p += b;
+        };
+        get(conv_state_, h.conv_b);
+        get(gdn_state_, h.gdn_b);
+        get(kv4_ring_k_, h.ring_b);
+        get(kv4_ring_v_, h.ring_b);
+        get(hlast_, h.hlast_b);
+        get(logits_, h.logits_b);
+        return true;
+    }
+    bool restore_checkpoint(const std::vector<uint8_t>& in) override {
+        struct CkptHdr {
+            uint32_t magic = 0x51564331u;
+            int32_t mtp_ready = -1;
+            uint64_t conv_b = 0, gdn_b = 0, ring_b = 0, hlast_b = 0, logits_b = 0;
+        };
+        if (in.size() < sizeof(CkptHdr)) return false;
+        CkptHdr h;
+        std::memcpy(&h, in.data(), sizeof(h));
+        if (h.magic != 0x51564331u) return false;
+        const size_t n_kv_layers = (size_t)n_attn_ + (opt_.mtp ? 1 : 0);
+        const size_t ring_b = (kv4_on_ && !kv4_.empty() && !kv4_[0].exact && kv4_ring_k_ && kv4_ring_v_)
+                                  ? n_kv_layers * (size_t)cfg_.n_kv_heads * (size_t)KV4_RING * (size_t)KV4_D * sizeof(__half)
+                                  : 0;
+        const size_t hlast_b = (opt_.mtp && hlast_) ? (size_t)cfg_.hidden * sizeof(float) : 0;
+        const size_t logits_b = (size_t)cfg_.vocab * sizeof(float);
+        if (h.conv_b != conv_bytes_ || h.gdn_b != gdn_bytes_ || h.ring_b != ring_b ||
+            h.hlast_b != hlast_b || h.logits_b != logits_b) return false;
+        const size_t tot = sizeof(CkptHdr) + conv_bytes_ + gdn_bytes_ + 2 * ring_b + hlast_b + logits_b;
+        if (in.size() != tot) return false;
+        QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
+        const uint8_t* p = in.data() + sizeof(CkptHdr);
+        auto put = [&](void* dst, size_t b) {
+            if (b > 0) QV_CUDA_CHECK(cudaMemcpy(dst, p, b, cudaMemcpyHostToDevice));
+            p += b;
+        };
+        put(conv_state_, conv_bytes_);
+        put(gdn_state_, gdn_bytes_);
+        put(kv4_ring_k_, ring_b);
+        put(kv4_ring_v_, ring_b);
+        put(hlast_, hlast_b);
+        put(logits_, logits_b);
+        mtp_ready_ = h.mtp_ready;
+        QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
+        return true;
     }
     void mtp_stats(MtpStats& s) const override { s = mtp_st_; }
     void set_mtp_enabled(bool on) override { mtp_on_ = on && opt_.mtp; mtp_ready_ = -1; }

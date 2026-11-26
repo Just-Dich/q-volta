@@ -222,6 +222,60 @@ class CpuEngine final : public Engine {
     bool has_state_save() const override { return true; }
     void state_save() override { conv_save_ = conv_state_; gdn_save_ = gdn_state_; }
     void state_restore() override { conv_state_ = conv_save_; gdn_state_ = gdn_save_; mtp_ready_ = -1; }
+    bool has_checkpoint() const override { return true; }
+    bool save_checkpoint(std::vector<uint8_t>& out) override {
+        struct CpuCkptHdr {
+            uint32_t magic = 0x43504331u;
+            int32_t mtp_ready = -1;
+            uint64_t conv_b = 0, gdn_b = 0, logits_b = 0, hlast_b = 0;
+        } h;
+        h.mtp_ready = mtp_ready_;
+        h.conv_b = conv_state_.size() * sizeof(float);
+        h.gdn_b = gdn_state_.size() * sizeof(float);
+        h.logits_b = logits_.size() * sizeof(float);
+        h.hlast_b = mtp_hid_last_.size() * sizeof(float);
+        out.resize(sizeof(CpuCkptHdr) + h.conv_b + h.gdn_b + h.logits_b + h.hlast_b);
+        uint8_t* p = out.data();
+        std::memcpy(p, &h, sizeof(h));
+        p += sizeof(h);
+        auto put = [&](const void* src, size_t b) {
+            if (b > 0) std::memcpy(p, src, b);
+            p += b;
+        };
+        put(conv_state_.data(), h.conv_b);
+        put(gdn_state_.data(), h.gdn_b);
+        put(logits_.data(), h.logits_b);
+        put(mtp_hid_last_.data(), h.hlast_b);
+        return true;
+    }
+    bool restore_checkpoint(const std::vector<uint8_t>& in) override {
+        struct CpuCkptHdr {
+            uint32_t magic = 0x43504331u;
+            int32_t mtp_ready = -1;
+            uint64_t conv_b = 0, gdn_b = 0, logits_b = 0, hlast_b = 0;
+        };
+        if (in.size() < sizeof(CpuCkptHdr)) return false;
+        CpuCkptHdr h;
+        std::memcpy(&h, in.data(), sizeof(h));
+        if (h.magic != 0x43504331u) return false;
+        const size_t conv_b = conv_state_.size() * sizeof(float);
+        const size_t gdn_b = gdn_state_.size() * sizeof(float);
+        const size_t logits_b = logits_.size() * sizeof(float);
+        const size_t hlast_b = mtp_hid_last_.size() * sizeof(float);
+        if (h.conv_b != conv_b || h.gdn_b != gdn_b || h.logits_b != logits_b || h.hlast_b != hlast_b) return false;
+        if (in.size() != sizeof(CpuCkptHdr) + conv_b + gdn_b + logits_b + hlast_b) return false;
+        const uint8_t* p = in.data() + sizeof(CpuCkptHdr);
+        auto get = [&](void* dst, size_t b) {
+            if (b > 0) std::memcpy(dst, p, b);
+            p += b;
+        };
+        get(conv_state_.data(), conv_b);
+        get(gdn_state_.data(), gdn_b);
+        get(logits_.data(), logits_b);
+        get(mtp_hid_last_.data(), hlast_b);
+        mtp_ready_ = h.mtp_ready;
+        return true;
+    }
     void set_sparse(const std::string& v) override {
         sp_ = SparseCfg();
         if (v == "off" || v.empty()) return;
