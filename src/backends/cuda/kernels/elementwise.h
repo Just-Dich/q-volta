@@ -18,4 +18,6 @@ struct CandMeta {
 };
 void extract_top_candidates(const float* x, int n, float margin, int max_cand,
                             int* cand_id, float* cand_val, CandMeta* meta, cudaStream_t s);
+void extract_top_candidates_batch(const float* x, int n, int n_rows, float margin, int max_cand,
+                                  int* cand_id, float* cand_val, CandMeta* meta, cudaStream_t s);
 }  // namespace qv::cuda

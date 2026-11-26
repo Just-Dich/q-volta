@@ -177,51 +177,115 @@ void argmax_advance(const float* x, int n, int* tok, int* pos, int* gen, cudaStr
 
 void argmax(const float* x, int n, int* out, cudaStream_t s) { argmax_advance(x, n, out, nullptr, nullptr, s); }
 
-__global__ void cand_max_final_kernel(const float* pv, const int* pi, int m, CandMeta* meta) {
+__global__ void argmax_partial_batch_kernel(const float* __restrict__ x, int n, float* pv, int* pi) {
+    const int row = blockIdx.y;
+    const float* xr = x + (size_t)row * n;
+    float* pvr = pv + (size_t)row * ARG_BLOCKS;
+    int* pir = pi + (size_t)row * ARG_BLOCKS;
     float best = -INFINITY;
     int bi = 0x7fffffff;
-    for (int i = threadIdx.x; i < m; i += blockDim.x) argmax_merge(best, bi, pv[i], pi[i]);
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) argmax_merge(best, bi, xr[i], i);
+    block_argmax(best, bi);
+    if (threadIdx.x == 0) { pvr[blockIdx.x] = best; pir[blockIdx.x] = bi; }
+}
+
+__global__ void cand_max_final_batch_kernel(const float* pv, const int* pi, int m, CandMeta* meta) {
+    const int row = blockIdx.y;
+    const float* pvr = pv + (size_t)row * m;
+    const int* pir = pi + (size_t)row * m;
+    float best = -INFINITY;
+    int bi = 0x7fffffff;
+    for (int i = threadIdx.x; i < m; i += blockDim.x) argmax_merge(best, bi, pvr[i], pir[i]);
     block_argmax(best, bi);
     if (threadIdx.x == 0) {
-        meta->mx = best;
-        meta->sum_exp = 0.0f;
-        meta->count = 0;
+        meta[row].mx = best;
+        meta[row].sum_exp = 0.0f;
+        meta[row].count = 0;
     }
 }
 
-__global__ void extract_cand_kernel(const float* __restrict__ x, int n, float margin, int max_cand,
-                                    int* __restrict__ cid, float* __restrict__ cval, CandMeta* meta) {
+__global__ void extract_cand_batch_kernel(const float* __restrict__ x, int n, float margin, int max_cand,
+                                          int* __restrict__ cid, float* __restrict__ cval, CandMeta* meta) {
+    constexpr int BBUF = 256;
     __shared__ float red[32];
-    const float mx = meta->mx;
+    __shared__ int s_id[BBUF];
+    __shared__ float s_val[BBUF];
+    __shared__ int s_cnt;
+    __shared__ int s_base;
+    if (threadIdx.x == 0) { s_cnt = 0; s_base = 0; }
+    __syncthreads();
+
+    const int row = blockIdx.y;
+    const float* xr = x + (size_t)row * n;
+    int* cidr = cid + (size_t)row * max_cand;
+    float* cvalr = cval + (size_t)row * max_cand;
+    CandMeta* mr = meta + row;
+
+    const float mx = mr->mx;
     const bool ok = isfinite(mx);
     const float thr = mx - margin;
     float local_sum = 0.0f;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
-        const float v = x[i];
+        const float v = xr[i];
         if (ok) {
             local_sum += expf(v - mx);
             if (v >= thr) {
-                const int idx = atomicAdd(&meta->count, 1);
-                if (idx < max_cand) {
-                    cid[idx] = i;
-                    cval[idx] = v;
+                const int loc = atomicAdd(&s_cnt, 1);
+                if (loc < BBUF) {
+                    s_id[loc] = i;
+                    s_val[loc] = v;
+                } else {
+                    const int gidx = atomicAdd(&mr->count, 1);
+                    if (gidx < max_cand) {
+                        cidr[gidx] = i;
+                        cvalr[gidx] = v;
+                    }
                 }
             }
         }
     }
+    __syncthreads();
+    if (threadIdx.x == 0 && ok && s_cnt > 0) {
+        const int n_loc = min(s_cnt, BBUF);
+        s_base = atomicAdd(&mr->count, n_loc);
+    }
+    __syncthreads();
+    if (ok) {
+        const int n_loc = min(s_cnt, BBUF);
+        if (threadIdx.x < n_loc) {
+            const int gidx = s_base + threadIdx.x;
+            if (gidx < max_cand) {
+                cidr[gidx] = s_id[threadIdx.x];
+                cvalr[gidx] = s_val[threadIdx.x];
+            }
+        }
+    }
     local_sum = block_sum(local_sum, red);
-    if (threadIdx.x == 0 && ok) atomicAdd(&meta->sum_exp, local_sum);
+    if (threadIdx.x == 0 && ok) atomicAdd(&mr->sum_exp, local_sum);
+}
+
+static float* g_pv_b = nullptr;
+static int* g_pi_b = nullptr;
+static int g_batch_cap = 0;
+
+void extract_top_candidates_batch(const float* x, int n, int n_rows, float margin, int max_cand,
+                                  int* cand_id, float* cand_val, CandMeta* meta, cudaStream_t s) {
+    if (n_rows <= 0) return;
+    if (n_rows > g_batch_cap) {
+        if (g_pv_b) cudaFree(g_pv_b);
+        if (g_pi_b) cudaFree(g_pi_b);
+        QV_CUDA_CHECK(cudaMalloc(&g_pv_b, (size_t)n_rows * ARG_BLOCKS * sizeof(float)));
+        QV_CUDA_CHECK(cudaMalloc(&g_pi_b, (size_t)n_rows * ARG_BLOCKS * sizeof(int)));
+        g_batch_cap = n_rows;
+    }
+    argmax_partial_batch_kernel<<<dim3(ARG_BLOCKS, n_rows), 256, 0, s>>>(x, n, g_pv_b, g_pi_b);
+    cand_max_final_batch_kernel<<<dim3(1, n_rows), 256, 0, s>>>(g_pv_b, g_pi_b, ARG_BLOCKS, meta);
+    extract_cand_batch_kernel<<<dim3(ARG_BLOCKS, n_rows), 256, 0, s>>>(x, n, margin, max_cand, cand_id, cand_val, meta);
 }
 
 void extract_top_candidates(const float* x, int n, float margin, int max_cand,
                             int* cand_id, float* cand_val, CandMeta* meta, cudaStream_t s) {
-    if (!g_pv) {
-        QV_CUDA_CHECK(cudaMalloc(&g_pv, ARG_BLOCKS * sizeof(float)));
-        QV_CUDA_CHECK(cudaMalloc(&g_pi, ARG_BLOCKS * sizeof(int)));
-    }
-    argmax_partial_kernel<<<ARG_BLOCKS, 256, 0, s>>>(x, n, g_pv, g_pi);
-    cand_max_final_kernel<<<1, 256, 0, s>>>(g_pv, g_pi, ARG_BLOCKS, meta);
-    extract_cand_kernel<<<ARG_BLOCKS, 256, 0, s>>>(x, n, margin, max_cand, cand_id, cand_val, meta);
+    extract_top_candidates_batch(x, n, 1, margin, max_cand, cand_id, cand_val, meta, s);
 }
 
 }  // namespace qv::cuda

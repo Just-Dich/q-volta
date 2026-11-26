@@ -63,9 +63,19 @@ class CudaEngine final : public Engine {
         graph_exec_ = nullptr;
         lp_.destroy();
         if (h_tp_) cudaFreeHost(h_tp_);
-        if (opt_.mtp) { cudaFreeHost(h_a_); cudaFreeHost(h_b_); cudaFreeHost(h_res_); }
+        if (opt_.mtp) {
+            if (h_a_) cudaFreeHost(h_a_);
+            if (h_b_) cudaFreeHost(h_b_);
+            if (h_res_) cudaFreeHost(h_res_);
+            if (h_smeta_) cudaFreeHost(h_smeta_);
+            if (h_scand_id_) cudaFreeHost(h_scand_id_);
+            if (h_scand_val_) cudaFreeHost(h_scand_val_);
+            if (h_sfull_p_) cudaFreeHost(h_sfull_p_);
+        }
         for (auto g : vgraph_) if (g) cudaGraphExecDestroy(g);
+        for (auto g : vgraph_spec_) if (g) cudaGraphExecDestroy(g);
         for (auto g : mgraph_) if (g) cudaGraphExecDestroy(g);
+        for (auto g : mgraph_spec_) if (g) cudaGraphExecDestroy(g);
         for (void* p : allocs_) cudaFree(p);
         cudaFree(weights_);
         cudaStreamDestroy(stream_);
@@ -476,13 +486,16 @@ class CudaEngine final : public Engine {
     int *d_v_, *d_m_, *d_draft_, *d_varg_, *h_a_, *h_b_, *h_res_;  // d_v_: [tok NTM | pos NTM]; d_m_: [tok | pos | chain pos]
     float *snap_gdn_ = nullptr, *snap_conv_ = nullptr;
     cudaGraphExec_t vgraph_[NTM_MAX + 1] = {};
+    cudaGraphExec_t vgraph_spec_[NTM_MAX + 1] = {};
     static constexpr int SPEC_MAX_CAND = 4096;
+    static constexpr int SPEC_FAST_SLICE = 256;
     int* d_scand_id_ = nullptr;
     float* d_scand_val_ = nullptr;
     CandMeta* d_smeta_ = nullptr;
-    std::vector<CandMeta> h_smeta_;
-    std::vector<int> h_scand_id_;
-    std::vector<float> h_scand_val_;
+    CandMeta* h_smeta_ = nullptr;
+    int* h_scand_id_ = nullptr;
+    float* h_scand_val_ = nullptr;
+    float* h_sfull_p_ = nullptr;
     std::vector<float> h_sfull_;
 
     void alloc_mtp() {
@@ -530,15 +543,16 @@ class CudaEngine final : public Engine {
         d_scand_id_ = dalloc<int>((size_t)N * SPEC_MAX_CAND);
         d_scand_val_ = dalloc<float>((size_t)N * SPEC_MAX_CAND);
         d_smeta_ = dalloc<CandMeta>(N);
-        h_smeta_.resize(N);
-        h_scand_id_.resize((size_t)N * SPEC_MAX_CAND);
-        h_scand_val_.resize((size_t)N * SPEC_MAX_CAND);
-        h_sfull_.resize(V);
+        QV_CUDA_CHECK(cudaMallocHost(&h_smeta_, N * sizeof(CandMeta)));
+        QV_CUDA_CHECK(cudaMallocHost(&h_scand_id_, (size_t)N * SPEC_MAX_CAND * sizeof(int)));
+        QV_CUDA_CHECK(cudaMallocHost(&h_scand_val_, (size_t)N * SPEC_MAX_CAND * sizeof(float)));
+        QV_CUDA_CHECK(cudaMallocHost(&h_sfull_p_, (size_t)V * sizeof(float)));
         const char* e = std::getenv("QV_MTP_PROF");
         mtp_prof_ = e && e[0] == '1';
         const char* g = std::getenv("QV_MTP_GRAPH");
         mtp_graph_ = !(g && g[0] == '0');
         argmax_advance(logits_, V, d_varg_, nullptr, nullptr, stream_);  // allocates the argmax scratch before any graph capture
+        extract_top_candidates_batch(vlogits_, V, N, 10.0f, SPEC_MAX_CAND, d_scand_id_, d_scand_val_, d_smeta_, stream_);
         QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
     }
 
@@ -609,7 +623,7 @@ class CudaEngine final : public Engine {
 
     // verify: tokens/positions already in d_v_ ([tok NT | pos NT]); logits rows -> vlogits_, per-row argmax -> d_varg_,
     // final-normed hidden rows -> vxn_, GDN/conv snapshots after tokens 0..NT-2 -> snap_*.
-    void verify_forward(int NT) {
+    void verify_forward(int NT, bool with_argmax = true) {
         const Config& c = cfg_;
         cudaStream_t s = stream_;
         const int H = c.hidden, V = c.vocab;
@@ -618,13 +632,13 @@ class CudaEngine final : public Engine {
         for (const Layer& L : layers_) layer_multi(L, NT, dpos, true);
         rmsnorm(vx_, final_norm_, vxn_, xs_, H, c.eps, s, &vxq_, NT);
         gemv_q8_multi(head_, vxq_, NT, vlogits_, nullptr, s);
-        for (int t = 0; t < NT; ++t) argmax_advance(vlogits_ + (size_t)t * V, V, d_varg_ + t, nullptr, nullptr, s);
+        if (with_argmax) for (int t = 0; t < NT; ++t) argmax_advance(vlogits_ + (size_t)t * V, V, d_varg_ + t, nullptr, nullptr, s);
     }
 
     // MTP head over nt rows: next tokens at dnext[0..nt) (device), main hidden rows hid (normed, stride H), RoPE/KV
     // positions dpos[0..nt). Writes the MTP KV of those positions; draft of the last row -> dout, its normed MTP output
     // -> mhid_ (input of a chained draft).
-    void mtp_run(int nt, const int* dnext, const float* hid, const int* dpos, int* dout) {
+    void mtp_run(int nt, const int* dnext, const float* hid, const int* dpos, int* dout, bool with_argmax = true) {
         const Config& c = cfg_;
         cudaStream_t s = stream_;
         const int H = c.hidden, V = c.vocab;
@@ -635,7 +649,7 @@ class CudaEngine final : public Engine {
         layer_multi(mtp_L_, nt, dpos, false);
         rmsnorm(vx_ + (size_t)(nt - 1) * H, mtp_norm_, mhid_, xs_, H, c.eps, s, &xq_);
         gemv_q8(head_, xq_, mlogits_, nullptr, s);
-        argmax_advance(mlogits_, V, dout, nullptr, nullptr, s);
+        if (with_argmax) argmax_advance(mlogits_, V, dout, nullptr, nullptr, s);
     }
 
     // update MTP KV for rows (positions q0..q0+nt-1, next tokens nxt[], hidden rows hid) and draft Dd tokens -> d_draft_
@@ -651,6 +665,7 @@ class CudaEngine final : public Engine {
     }
 
     cudaGraphExec_t mgraph_[2 * NTM_MAX + 2] = {};
+    cudaGraphExec_t mgraph_spec_[2 * NTM_MAX + 2] = {};
     template <class F>
     void graph_run(int id, F&& f) {
         if (!mtp_graph_) { f(); return; }
@@ -663,6 +678,19 @@ class CudaEngine final : public Engine {
             QV_CUDA_CHECK(cudaGraphDestroy(g));
         }
         QV_CUDA_CHECK(cudaGraphLaunch(mgraph_[id], stream_));
+    }
+    template <class F>
+    void graph_run_spec(int id, F&& f) {
+        if (!mtp_graph_) { f(); return; }
+        if (!mgraph_spec_[id]) {
+            QV_CUDA_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
+            f();
+            cudaGraph_t g;
+            QV_CUDA_CHECK(cudaStreamEndCapture(stream_, &g));
+            QV_CUDA_CHECK(cudaGraphInstantiate(&mgraph_spec_[id], g, 0));
+            QV_CUDA_CHECK(cudaGraphDestroy(g));
+        }
+        QV_CUDA_CHECK(cudaGraphLaunch(mgraph_spec_[id], stream_));
     }
 
     // after the final-norm rows of a prefill chunk: fill the MTP KV for the chunk's positions
@@ -684,14 +712,18 @@ class CudaEngine final : public Engine {
 
     int masked_argmax_from_gpu(const float* d_logits_row, TokenConstraint* tc) {
         const int V = cfg_.vocab;
-        if ((int)h_sfull_.size() < V) h_sfull_.resize(V);
-        QV_CUDA_CHECK(cudaMemcpyAsync(h_sfull_.data(), d_logits_row, (size_t)V * 4, cudaMemcpyDeviceToHost, stream_));
+        float* buf = h_sfull_p_;
+        if (!buf) {
+            if ((int)h_sfull_.size() < V) h_sfull_.resize(V);
+            buf = h_sfull_.data();
+        }
+        QV_CUDA_CHECK(cudaMemcpyAsync(buf, d_logits_row, (size_t)V * 4, cudaMemcpyDeviceToHost, stream_));
         QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
-        if (tc && !tc->awaiting()) tc->mask_logits(h_sfull_.data(), (size_t)V);
+        if (tc && !tc->awaiting()) tc->mask_logits(buf, (size_t)V);
         int best = 0;
-        float bv = h_sfull_[0];
+        float bv = buf[0];
         for (int i = 1; i < V; ++i) {
-            if (h_sfull_[i] > bv) { bv = h_sfull_[i]; best = i; }
+            if (buf[i] > bv) { bv = buf[i]; best = i; }
         }
         return best;
     }
@@ -785,28 +817,33 @@ class CudaEngine final : public Engine {
 
     void extract_gpu_rows(const float* d_logits_base, int n_rows, float margin) {
         const int V = cfg_.vocab;
+        extract_top_candidates_batch(d_logits_base, V, n_rows, margin, SPEC_MAX_CAND,
+                                     d_scand_id_, d_scand_val_, d_smeta_, stream_);
+        QV_CUDA_CHECK(cudaMemcpyAsync(h_smeta_, d_smeta_, (size_t)n_rows * sizeof(CandMeta), cudaMemcpyDeviceToHost, stream_));
         for (int t = 0; t < n_rows; ++t) {
-            extract_top_candidates(d_logits_base + (size_t)t * V, V, margin, SPEC_MAX_CAND,
-                                   d_scand_id_ + (size_t)t * SPEC_MAX_CAND,
-                                   d_scand_val_ + (size_t)t * SPEC_MAX_CAND,
-                                   d_smeta_ + t, stream_);
+            QV_CUDA_CHECK(cudaMemcpyAsync(h_scand_id_ + (size_t)t * SPEC_MAX_CAND,
+                                          d_scand_id_ + (size_t)t * SPEC_MAX_CAND,
+                                          (size_t)SPEC_FAST_SLICE * sizeof(int), cudaMemcpyDeviceToHost, stream_));
+            QV_CUDA_CHECK(cudaMemcpyAsync(h_scand_val_ + (size_t)t * SPEC_MAX_CAND,
+                                          d_scand_val_ + (size_t)t * SPEC_MAX_CAND,
+                                          (size_t)SPEC_FAST_SLICE * sizeof(float), cudaMemcpyDeviceToHost, stream_));
         }
-        QV_CUDA_CHECK(cudaMemcpyAsync(h_smeta_.data(), d_smeta_, (size_t)n_rows * sizeof(CandMeta), cudaMemcpyDeviceToHost, stream_));
         QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
-        bool any_copy = false;
+        bool any_tail = false;
         for (int t = 0; t < n_rows; ++t) {
             const int cnt = h_smeta_[t].count;
-            if (cnt > 0 && cnt <= SPEC_MAX_CAND) {
-                QV_CUDA_CHECK(cudaMemcpyAsync(h_scand_id_.data() + (size_t)t * SPEC_MAX_CAND,
-                                              d_scand_id_ + (size_t)t * SPEC_MAX_CAND,
-                                              (size_t)cnt * sizeof(int), cudaMemcpyDeviceToHost, stream_));
-                QV_CUDA_CHECK(cudaMemcpyAsync(h_scand_val_.data() + (size_t)t * SPEC_MAX_CAND,
-                                              d_scand_val_ + (size_t)t * SPEC_MAX_CAND,
-                                              (size_t)cnt * sizeof(float), cudaMemcpyDeviceToHost, stream_));
-                any_copy = true;
+            if (cnt > SPEC_FAST_SLICE && cnt <= SPEC_MAX_CAND) {
+                const int rem = cnt - SPEC_FAST_SLICE;
+                QV_CUDA_CHECK(cudaMemcpyAsync(h_scand_id_ + (size_t)t * SPEC_MAX_CAND + SPEC_FAST_SLICE,
+                                              d_scand_id_ + (size_t)t * SPEC_MAX_CAND + SPEC_FAST_SLICE,
+                                              (size_t)rem * sizeof(int), cudaMemcpyDeviceToHost, stream_));
+                QV_CUDA_CHECK(cudaMemcpyAsync(h_scand_val_ + (size_t)t * SPEC_MAX_CAND + SPEC_FAST_SLICE,
+                                              d_scand_val_ + (size_t)t * SPEC_MAX_CAND + SPEC_FAST_SLICE,
+                                              (size_t)rem * sizeof(float), cudaMemcpyDeviceToHost, stream_));
+                any_tail = true;
             }
         }
-        if (any_copy) QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
+        if (any_tail) QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
     }
 
     void build_dist_for_row(const float* d_logits_base, int row, float margin,
@@ -816,15 +853,19 @@ class CudaEngine final : public Engine {
         if (margin >= 0.0f) {
             const CandMeta& md = h_smeta_[row];
             ok = md.count > 0 && md.count <= SPEC_MAX_CAND &&
-                 build_dist_from_candidates(h_scand_id_.data() + (size_t)row * SPEC_MAX_CAND,
-                                            h_scand_val_.data() + (size_t)row * SPEC_MAX_CAND,
+                 build_dist_from_candidates(h_scand_id_ + (size_t)row * SPEC_MAX_CAND,
+                                            h_scand_val_ + (size_t)row * SPEC_MAX_CAND,
                                             md.count, md.mx, (double)md.sum_exp, sp, out_dist, tc);
         }
         if (!ok) {
-            if ((int)h_sfull_.size() < V) h_sfull_.resize(V);
-            QV_CUDA_CHECK(cudaMemcpyAsync(h_sfull_.data(), d_logits_base + (size_t)row * V, (size_t)V * 4, cudaMemcpyDeviceToHost, stream_));
+            float* buf = h_sfull_p_;
+            if (!buf) {
+                if ((int)h_sfull_.size() < V) h_sfull_.resize(V);
+                buf = h_sfull_.data();
+            }
+            QV_CUDA_CHECK(cudaMemcpyAsync(buf, d_logits_base + (size_t)row * V, (size_t)V * 4, cudaMemcpyDeviceToHost, stream_));
             QV_CUDA_CHECK(cudaStreamSynchronize(stream_));
-            build_dist_dense(h_sfull_.data(), V, sp, out_dist, tc);
+            build_dist_dense(buf, V, sp, out_dist, tc);
         }
     }
 
@@ -842,16 +883,16 @@ class CudaEngine final : public Engine {
         for (int j = 1; j < Dd; ++j) h_b_[2 * NTM_ + j - 1] = q0 + nt - 1 + j;
         QV_CUDA_CHECK(cudaMemcpyAsync(d_m_, h_b_, 3 * NTM_ * sizeof(int), cudaMemcpyHostToDevice, stream_));
         const int kind = hid == hlast_ ? 0 : nt;
-        graph_run(kind, [&] { mtp_run(nt, d_m_, hid, d_m_ + NTM_, d_draft_); });
+        graph_run_spec(kind, [&] { mtp_run(nt, d_m_, hid, d_m_ + NTM_, d_draft_, false); });
         build_dists_from_gpu(mlogits_, 1, sp, &q_out[0]);
         drafts_out[0] = sample_dist(q_out[0], rng);
         for (int j = 1; j < Dd; ++j) {
-            QV_CUDA_CHECK(cudaMemcpyAsync(d_draft_ + (j - 1), &drafts_out[j - 1], sizeof(int), cudaMemcpyHostToDevice, stream_));
-            graph_run(NTM_ + j, [&] { mtp_run(1, d_draft_ + j - 1, mhid_, d_m_ + 2 * NTM_ + j - 1, d_draft_ + j); });
+            h_res_[j - 1] = drafts_out[j - 1];
+            QV_CUDA_CHECK(cudaMemcpyAsync(d_draft_ + (j - 1), h_res_ + (j - 1), sizeof(int), cudaMemcpyHostToDevice, stream_));
+            graph_run_spec(NTM_ + j, [&] { mtp_run(1, d_draft_ + j - 1, mhid_, d_m_ + 2 * NTM_ + j - 1, d_draft_ + j, false); });
             build_dists_from_gpu(mlogits_, 1, sp, &q_out[j]);
             drafts_out[j] = sample_dist(q_out[j], rng);
         }
-        if (Dd > 0) QV_CUDA_CHECK(cudaMemcpyAsync(d_draft_, drafts_out, (size_t)Dd * sizeof(int), cudaMemcpyHostToDevice, stream_));
     }
 
     void decode_mtp_speculative(int first, int start_pos, int n, const SpecSamplingParams& sp, std::vector<int>& out,
@@ -891,11 +932,11 @@ class CudaEngine final : public Engine {
                 continue;
             }
             t0 = clk::now();
-            for (int t = 0; t < NTM_; ++t) h_a_[NTM_ + t] = p + t;
             h_a_[0] = cur;
+            for (int j = 0; j < NT - 1; ++j) h_a_[1 + j] = drafts[j];
+            for (int t = 0; t < NTM_; ++t) h_a_[NTM_ + t] = p + t;
             QV_CUDA_CHECK(cudaMemcpyAsync(d_v_, h_a_, 2 * NTM_ * sizeof(int), cudaMemcpyHostToDevice, stream_));
-            QV_CUDA_CHECK(cudaMemcpyAsync(d_v_ + 1, d_draft_, (NT - 1) * sizeof(int), cudaMemcpyDeviceToDevice, stream_));
-            run_verify(NT);
+            run_verify_spec(NT);
             if (margin >= 0.0f) extract_gpu_rows(vlogits_, NT, margin);
             auto t1 = clk::now();
             int m = 0;
@@ -1009,6 +1050,18 @@ class CudaEngine final : public Engine {
             QV_CUDA_CHECK(cudaGraphDestroy(g));
         }
         QV_CUDA_CHECK(cudaGraphLaunch(vgraph_[NT], stream_));
+    }
+    void run_verify_spec(int NT) {
+        if (!mtp_graph_) { verify_forward(NT, false); return; }
+        if (!vgraph_spec_[NT]) {
+            QV_CUDA_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
+            verify_forward(NT, false);
+            cudaGraph_t g;
+            QV_CUDA_CHECK(cudaStreamEndCapture(stream_, &g));
+            QV_CUDA_CHECK(cudaGraphInstantiate(&vgraph_spec_[NT], g, 0));
+            QV_CUDA_CHECK(cudaGraphDestroy(g));
+        }
+        QV_CUDA_CHECK(cudaGraphLaunch(vgraph_spec_[NT], stream_));
     }
 
     int n_seq() const override { return opt_.n_seq; }

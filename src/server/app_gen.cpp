@@ -733,7 +733,7 @@ GenResult App::generate(Task& t, const std::function<bool()>& alive, const std::
         }
         constexpr int kCkptTail = 16;
         constexpr int kCkptMinPrompt = 4096;
-        constexpr size_t kCkptMinDelta = 2048;
+        constexpr size_t kCkptMinDelta = 1024;
         const size_t max_ckpts = multi_seq ? 1u : 2u;
         size_t prev_ck_len = 0;
         for (const auto& c : ckpts_) prev_ck_len = std::max(prev_ck_len, c.tokens.size());

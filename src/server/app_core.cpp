@@ -845,7 +845,7 @@ void App::load_model(const Options& mo_in, const std::string& forced_id) {
         eo.threads = o.threads > 0 ? o.threads : (int)std::min(32u, std::max(1u, std::thread::hardware_concurrency()));
         chunk = o.prefill_chunk > 0 ? o.prefill_chunk : (o.ubatch > 0 ? o.ubatch : (backend == "cuda" ? 2048 : 256));
         eo.prefill_chunk = chunk;
-        mtp_chunk = 8;
+        mtp_chunk = (backend == "cuda") ? 16 : 8;
         if (const char* e = std::getenv("QV_MTP_CHUNK")) mtp_chunk = std::clamp(std::atoi(e), 2, 64);
         if (const char* e = std::getenv("QV_SHARED_CHUNK")) shared_chunk = std::max(1, std::atoi(e));
 

@@ -33,26 +33,29 @@ class GrammarTokenConstraint final : public qv::TokenConstraint {
     }
     bool probe_allowed(int tok) const override {
         if (st_.awaiting_trigger()) return true;
-        if (st_.is_dead()) return false;
-        GrammarState p = st_.fork();
-        return p.accept_token(tok);
+        if (st_.is_dead() || tok < 0) return false;
+        if (!cached_mask_) cached_mask_ = st_.allowed();
+        return cached_mask_->allowed((size_t)tok);
     }
     bool try_accept(int tok) override {
         if (st_.awaiting_trigger()) {
             (void)st_.accept_token(tok);
+            cached_mask_.reset();
             return true;
         }
         if (st_.is_dead()) return false;
         GrammarState next = st_.fork();
         if (!next.accept_token(tok)) return false;
         st_ = std::move(next);
+        cached_mask_.reset();
         return true;
     }
     void mask_logits(float* logits, size_t n) override { st_.mask_logits(logits, n); }
 
    private:
-    GrammarState st_;
+    mutable GrammarState st_;
     std::vector<int> stops_;
+    mutable std::shared_ptr<const TokenMask> cached_mask_;
 };
 
 // Pieces are the raw token bytes (special tokens: literal text). `eog_ids` are end-of-generation tokens (eos, <|im_end|>, ...).
